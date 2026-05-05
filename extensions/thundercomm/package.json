@@ -1,0 +1,14 @@
+{
+  "name": "@openclaw/thundercomm",
+  "version": "0.1.0",
+  "description": "ThunderComm — sovereign agent communication channel for ThunderGate",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "id": "thundercomm",
+  "channels": ["thundercomm"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "tts": {
+        "type": "boolean",
+        "description": "Enable TTS audio delivery to connected clients"
+      },
+      "agents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Agent IDs available in this ThunderComm instance"
+      },
+      "maxHistoryOnConnect": {
+        "type": "number",
+        "default": 50,
+        "description": "Messages to deliver on client connect (25/50/100)"
+      }
+    }
+  }
+}
