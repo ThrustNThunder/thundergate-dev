@@ -1,0 +1,374 @@
+/* ThunderComm Web UI
+   Design language: dark, sovereign, clean.
+   Same visual concept as iOS end-state — this is the prototype.
+*/
+
+:root {
+  --bg:          #0d0d0f;
+  --bg-sidebar:  #111113;
+  --bg-input:    #1a1a1e;
+  --bg-message:  #16161a;
+  --border:      #222228;
+  --accent:      #f59e0b;   /* amber — ThunderMind signature */
+  --accent-dim:  #78450a;
+  --text:        #e8e8ec;
+  --text-dim:    #888892;
+  --text-muted:  #44444e;
+  --online:      #22c55e;
+  --offline:     #6b7280;
+  --busy:        #f59e0b;
+  --error:       #ef4444;
+
+  /* Agent identity colours */
+  --jon:   #f59e0b;  /* amber  */
+  --sasha: #a78bfa;  /* violet */
+  --mack:  #38bdf8;  /* sky    */
+  --rex:   #4ade80;  /* green  */
+  --user:  #e8e8ec;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+
+body {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 100vh;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
+
+#sidebar {
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#tc-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 14px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+}
+
+#tc-logo { font-size: 18px; }
+#tc-title { flex: 1; }
+
+#conn-status {
+  font-size: 12px;
+  transition: color 0.3s;
+}
+#conn-status.online    { color: var(--online); }
+#conn-status.reconnecting { color: var(--busy); }
+#conn-status.offline   { color: var(--offline); }
+
+#channels {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 0;
+}
+
+.channel-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  padding: 8px 14px 4px;
+}
+
+.channel-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 14px;
+  padding: 5px 14px;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 0;
+  transition: background 0.15s, color 0.15s;
+}
+.channel-btn:hover { background: var(--bg-input); color: var(--text); }
+.channel-btn.active { background: rgba(245,158,11,0.12); color: var(--accent); font-weight: 600; }
+
+.agent-dot { font-size: 10px; color: var(--offline); }
+.agent-dot.online  { color: var(--online); }
+.agent-dot.offline { color: var(--offline); }
+.agent-dot.busy    { color: var(--busy); }
+
+/* ── Main chat ───────────────────────────────────────────────────────────── */
+
+#chat-area {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#chat-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 15px;
+  min-height: 48px;
+}
+
+#chat-title { flex: 1; }
+
+/* ── Thinking indicator ──────────────────────────────────────────────────── */
+
+#thinking-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+#thinking-indicator.hidden { display: none; }
+
+.dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: bounce 1.2s ease-in-out infinite;
+}
+.dot:nth-child(2) { animation-delay: 0.2s; }
+.dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+  30%           { transform: translateY(-5px); opacity: 1; }
+}
+
+/* ── Messages ────────────────────────────────────────────────────────────── */
+
+#messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  scroll-behavior: smooth;
+}
+
+#messages::-webkit-scrollbar { width: 6px; }
+#messages::-webkit-scrollbar-track { background: transparent; }
+#messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  max-width: 80%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 14px;
+  line-height: 1.5;
+  animation: fadeIn 0.15s ease;
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+
+/* Agent messages: left-aligned */
+.msg.agent {
+  align-self: flex-start;
+  background: var(--bg-message);
+  border: 1px solid var(--border);
+}
+
+/* User messages: right-aligned */
+.msg.user {
+  align-self: flex-end;
+  background: rgba(245,158,11,0.12);
+  border: 1px solid var(--accent-dim);
+}
+
+.msg-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.msg-author {
+  font-weight: 700;
+  font-size: 12px;
+}
+.msg-author.jon   { color: var(--jon); }
+.msg-author.sasha { color: var(--sasha); }
+.msg-author.mack  { color: var(--mack); }
+.msg-author.rex   { color: var(--rex); }
+.msg-author.user  { color: var(--user); }
+
+.msg-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* System messages */
+.msg.system {
+  align-self: center;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 2px 0;
+  font-style: italic;
+}
+
+/* Streaming cursor */
+.stream-cursor::after {
+  content: '▋';
+  animation: blink 0.8s step-end infinite;
+  color: var(--accent);
+}
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+/* ── Input area ──────────────────────────────────────────────────────────── */
+
+#input-area {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-sidebar);
+}
+
+#input-mode-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 18px;
+  width: 38px; height: 38px;
+  cursor: pointer;
+  color: var(--text-dim);
+  transition: border-color 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+#input-mode-toggle:hover { border-color: var(--accent); color: var(--accent); }
+#input-mode-toggle.ambient { border-color: var(--online); }
+#input-mode-toggle.ptt     { border-color: var(--accent); }
+#input-mode-toggle.silent  { border-color: var(--offline); }
+
+#text-input-wrap { flex: 1; }
+
+#text-input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  line-height: 1.5;
+  padding: 8px 12px;
+  resize: none;
+  outline: none;
+  max-height: 120px;
+  overflow-y: auto;
+  transition: border-color 0.15s;
+}
+#text-input:focus { border-color: var(--accent); }
+#text-input::placeholder { color: var(--text-muted); }
+
+#send-btn {
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: #000;
+  font-size: 16px;
+  width: 38px; height: 38px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+#send-btn:hover { opacity: 0.85; }
+#send-btn:disabled { opacity: 0.3; cursor: default; }
+
+/* ── Auth overlay ────────────────────────────────────────────────────────── */
+
+#auth-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  backdrop-filter: blur(4px);
+}
+
+#auth-box {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 32px;
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+#auth-logo {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+  margin-bottom: 4px;
+}
+
+#auth-box p { font-size: 14px; color: var(--text-dim); }
+
+#auth-box input {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  padding: 9px 12px;
+  outline: none;
+  width: 100%;
+  transition: border-color 0.15s;
+}
+#auth-box input:focus { border-color: var(--accent); }
+
+#connect-btn {
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: #000;
+  font-size: 15px;
+  font-weight: 700;
+  padding: 10px;
+  cursor: pointer;
+  width: 100%;
+  transition: opacity 0.15s;
+}
+#connect-btn:hover { opacity: 0.85; }
+
+#auth-error {
+  color: var(--error);
+  font-size: 13px;
+}
+#auth-error.hidden { display: none; }
