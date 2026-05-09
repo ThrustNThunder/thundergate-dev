@@ -1,6 +1,7 @@
 
     import Foundation
-    import Observation
+import SQLite3
+import Observation
 
     @Observable
     final class ThunderCommStore {
@@ -9,7 +10,6 @@
         private static let senderDefaultsKey = "ThunderComm.senderOverride"
         private static let routeDefaultsKey = "ThunderComm.route"
         private static let directAgentDefaultsKey = "ThunderComm.directAgent"
-        private static let persistedMessagesKey = "ThunderComm.persistedMessages.v4"
         private static let initialVisibleMessageCount = 20
         private static let historyPageSize = 20
         private static let maxPersistedMessages = 300
@@ -37,6 +37,7 @@
         private var streamByParticipantID: [String: ThunderCommStreamingPreview] = [:]
         private var knownParticipantIDs = Set<String>(["michael", "jon", "mack", "rex", "burt", "sasha"])
         private let client = ThunderCommWebSocketClient()
+        private let persistence = ThunderCommSQLiteStore()
         private let autoSendText = ProcessInfo.processInfo.environment["THUNDERCOMM_AUTOSEND_TEXT"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         private let autoSendDelaySeconds = Double(ProcessInfo.processInfo.environment["THUNDERCOMM_AUTOSEND_DELAY_SECONDS"] ?? "0") ?? 0
         private var didAutoSend = false
@@ -539,9 +540,8 @@
         }
 
         private func loadPersistedMessages() {
-            guard let data = UserDefaults.standard.data(forKey: Self.persistedMessagesKey) else { return }
             do {
-                let persisted = try JSONDecoder().decode([ThunderCommMessage].self, from: data)
+                let persisted = try persistence.loadMessages()
                     .map(normalize)
                     .sorted { lhs, rhs in
                         if lhs.timestamp == rhs.timestamp {
@@ -552,16 +552,15 @@
                 allMessages = Array(persisted.suffix(Self.maxPersistedMessages))
                 messageIDs = Set(allMessages.map(\.id))
             } catch {
-                debug("failed to decode persisted messages: \(error.localizedDescription)")
+                debug("failed to load persisted messages from sqlite: \(error.localizedDescription)")
             }
         }
 
         private func persistMessages() {
             do {
-                let data = try JSONEncoder().encode(Array(allMessages.suffix(Self.maxPersistedMessages)))
-                UserDefaults.standard.set(data, forKey: Self.persistedMessagesKey)
+                try persistence.replaceMessages(Array(allMessages.suffix(Self.maxPersistedMessages)))
             } catch {
-                debug("failed to persist messages: \(error.localizedDescription)")
+                debug("failed to persist messages to sqlite: \(error.localizedDescription)")
             }
         }
 
@@ -749,3 +748,185 @@
             Int64(Date().timeIntervalSince1970 * 1000)
         }
     }
+
+
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+private final class ThunderCommSQLiteStore {
+    private let db: OpaquePointer?
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    init() {
+        let fm = FileManager.default
+        let base = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let dir = (base ?? URL(fileURLWithPath: NSTemporaryDirectory())).appendingPathComponent("ThunderComm", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dbURL = dir.appendingPathComponent("ThunderComm.sqlite")
+
+        var handle: OpaquePointer?
+        if sqlite3_open(dbURL.path, &handle) != SQLITE_OK {
+            self.db = nil
+            if let handle {
+                sqlite3_close(handle)
+            }
+            return
+        }
+        self.db = handle
+
+        let createSQL = """
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY NOT NULL,
+            channel TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            sender_type TEXT NOT NULL,
+            agent_id TEXT,
+            text TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            origin_peer TEXT,
+            relayed_at INTEGER,
+            relayed_by TEXT,
+            content_kind TEXT,
+            attachment_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp, id);
+        """
+        _ = sqlite3_exec(handle, createSQL, nil, nil, nil)
+    }
+
+    deinit {
+        if let db {
+            sqlite3_close(db)
+        }
+    }
+
+    func loadMessages() throws -> [ThunderCommMessage] {
+        guard let db else { return [] }
+        let sql = "SELECT id, channel, sender, sender_type, agent_id, text, timestamp, origin_peer, relayed_at, relayed_by, content_kind, attachment_json FROM messages ORDER BY timestamp ASC, id ASC;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw sqliteError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var messages: [ThunderCommMessage] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = string(statement, 0) ?? UUID().uuidString
+            let channel = string(statement, 1) ?? "tnt"
+            let sender = string(statement, 2) ?? "Unknown"
+            let senderType = ThunderCommSenderType(rawValue: (string(statement, 3) ?? "human").lowercased()) ?? .human
+            let agentId = string(statement, 4)
+            let text = string(statement, 5) ?? ""
+            let timestamp = sqlite3_column_int64(statement, 6)
+            let originPeer = string(statement, 7)
+            let relayedAt = sqlite3_column_type(statement, 8) == SQLITE_NULL ? nil : sqlite3_column_int64(statement, 8)
+            let relayedBy = string(statement, 9)
+            let contentKind = string(statement, 10).flatMap { ThunderCommContentKind(rawValue: $0) }
+            let attachment: ThunderCommAttachmentMetadata?
+            if let attachmentJSON = string(statement, 11), let data = attachmentJSON.data(using: .utf8) {
+                attachment = try? decoder.decode(ThunderCommAttachmentMetadata.self, from: data)
+            } else {
+                attachment = nil
+            }
+
+            messages.append(
+                ThunderCommMessage(
+                    id: id,
+                    channel: channel,
+                    sender: sender,
+                    senderType: senderType,
+                    agentId: agentId,
+                    text: text,
+                    timestamp: timestamp,
+                    originPeer: originPeer,
+                    relayedAt: relayedAt,
+                    relayedBy: relayedBy,
+                    contentKind: contentKind,
+                    attachment: attachment
+                )
+            )
+        }
+
+        return messages
+    }
+
+    func replaceMessages(_ messages: [ThunderCommMessage]) throws {
+        guard let db else { return }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION", nil, nil, nil) == SQLITE_OK else {
+            throw sqliteError(db)
+        }
+
+        do {
+            try execute(db, sql: "DELETE FROM messages;")
+            let insertSQL = "INSERT INTO messages (id, channel, sender, sender_type, agent_id, text, timestamp, origin_peer, relayed_at, relayed_by, content_kind, attachment_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, insertSQL, -1, &statement, nil) == SQLITE_OK else {
+                throw sqliteError(db)
+            }
+            defer { sqlite3_finalize(statement) }
+
+            for message in messages {
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+
+                bind(statement, index: 1, text: message.id)
+                bind(statement, index: 2, text: message.channel)
+                bind(statement, index: 3, text: message.sender)
+                bind(statement, index: 4, text: message.senderType.rawValue)
+                bind(statement, index: 5, text: message.agentId)
+                bind(statement, index: 6, text: message.text)
+                sqlite3_bind_int64(statement, 7, message.timestamp)
+                bind(statement, index: 8, text: message.originPeer)
+                if let relayedAt = message.relayedAt {
+                    sqlite3_bind_int64(statement, 9, relayedAt)
+                } else {
+                    sqlite3_bind_null(statement, 9)
+                }
+                bind(statement, index: 10, text: message.relayedBy)
+                bind(statement, index: 11, text: message.contentKind?.rawValue)
+                if let attachment = message.attachment {
+                    let data = try encoder.encode(attachment)
+                    bind(statement, index: 12, text: String(decoding: data, as: UTF8.self))
+                } else {
+                    sqlite3_bind_null(statement, 12)
+                }
+
+                guard sqlite3_step(statement) == SQLITE_DONE else {
+                    throw sqliteError(db)
+                }
+            }
+
+            guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+                throw sqliteError(db)
+            }
+        } catch {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
+        }
+    }
+
+    private func execute(_ db: OpaquePointer, sql: String) throws {
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw sqliteError(db)
+        }
+    }
+
+    private func bind(_ statement: OpaquePointer?, index: Int32, text: String?) {
+        if let text {
+            sqlite3_bind_text(statement, index, text, -1, SQLITE_TRANSIENT)
+        } else {
+            sqlite3_bind_null(statement, index)
+        }
+    }
+
+    private func string(_ statement: OpaquePointer?, _ index: Int32) -> String? {
+        guard let cString = sqlite3_column_text(statement, index) else { return nil }
+        return String(cString: cString)
+    }
+
+    private func sqliteError(_ db: OpaquePointer?) -> NSError {
+        let code = Int(sqlite3_errcode(db))
+        let message = db.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "Unknown SQLite error"
+        return NSError(domain: "ThunderCommSQLiteStore", code: code, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
