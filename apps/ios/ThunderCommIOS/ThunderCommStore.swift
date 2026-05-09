@@ -35,6 +35,8 @@ import Observation
         private var allMessages: [ThunderCommMessage] = []
         private var activityByParticipantID: [String: ThunderCommActivityIndicator] = [:]
         private var streamByParticipantID: [String: ThunderCommStreamingPreview] = [:]
+        private var rosterByParticipantID: [String: ThunderCommParticipant] = [:]
+        private var rosterOrder: [String] = []
         private var knownParticipantIDs = Set<String>(["michael", "jon", "mack", "rex", "burt", "sasha"])
         private let client = ThunderCommWebSocketClient()
         private let persistence = ThunderCommSQLiteStore()
@@ -88,6 +90,10 @@ import Observation
 
         var composePlaceholder: String {
             "Message \(routeLabel)"
+        }
+
+        var onlineParticipantCount: Int {
+            orderedPeerIDs().filter { statusForParticipantID($0) != .offline }.count
         }
 
         func connectIfNeeded() {
@@ -218,7 +224,16 @@ import Observation
                 peers = payload.peers.sorted()
                 debug("peer roster: \(payload.peers.joined(separator: ", "))")
             case .roster(let payload):
-                peers = payload.agents.map(\.id).sorted()
+                var nextRoster: [String: ThunderCommParticipant] = [:]
+                var nextOrder: [String] = []
+                for agent in payload.agents {
+                    let participantID = normalizedRosterParticipantID(agent.id)
+                    nextRoster[participantID] = agent
+                    nextOrder.append(participantID)
+                    knownParticipantIDs.insert(participantID)
+                }
+                rosterByParticipantID = nextRoster
+                rosterOrder = nextOrder
                 debug("bridge roster: \(payload.agents.map(\.name).joined(separator: ", "))")
             case .history(let payload):
                 debug("history payload: \(payload.messages.count) message(s)")
@@ -403,6 +418,7 @@ import Observation
         }
 
         func orderedPeerIDs() -> [String] {
+            let rosterIDs = rosterOrder.filter { rosterByParticipantID[$0] != nil }
             let activePeerIDs = Set(peers.map { peerColorKey(for: $0) })
             let messagePeerIDs = Set(allMessages.map {
                 ThunderCommParticipantIdentity.canonicalID(
@@ -412,11 +428,20 @@ import Observation
                     senderType: $0.senderType
                 )
             })
-            return Array(knownParticipantIDs.union(activePeerIDs).union(messagePeerIDs)).sorted()
+            let fallbackIDs = knownParticipantIDs.union(activePeerIDs).union(messagePeerIDs)
+            let filteredFallback = fallbackIDs
+                .filter { !Self.placeholderParticipantIDs.contains($0) }
+                .sorted()
+            let extras = filteredFallback.filter { !rosterIDs.contains($0) }
+            return rosterIDs + extras
         }
 
         func displayName(forParticipantID participantID: String) -> String {
-            ThunderCommParticipantIdentity.displayName(sender: nil, agentId: participantID, participantId: participantID, senderType: senderType(forParticipantID: participantID))
+            let rosterName = rosterByParticipantID[participantID]?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !rosterName.isEmpty {
+                return rosterName
+            }
+            return ThunderCommParticipantIdentity.displayName(sender: nil, agentId: participantID, participantId: participantID, senderType: senderType(forParticipantID: participantID))
         }
 
         func senderType(forParticipantID participantID: String) -> ThunderCommSenderType {
@@ -427,11 +452,36 @@ import Observation
             if activityByParticipantID[participantID] != nil {
                 return .busy
             }
+            let rosterStatus = rosterByParticipantID[participantID]?.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            if !rosterStatus.isEmpty {
+                switch rosterStatus {
+                case "online":
+                    return .online
+                case "busy", "thinking", "typing":
+                    return .busy
+                default:
+                    return .offline
+                }
+            }
             let activePeerIDs = Set(peers.map { peerColorKey(for: $0) })
             if activePeerIDs.contains(participantID) || participantID == localParticipantID {
                 return .online
             }
             return .offline
+        }
+
+        private func normalizedRosterParticipantID(_ participantID: String) -> String {
+            let canonical = ThunderCommParticipantIdentity.canonicalID(
+                sender: nil,
+                agentId: participantID,
+                participantId: participantID,
+                senderType: nil
+            )
+            let raw = participantID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if Self.placeholderParticipantIDs.contains(canonical), !raw.isEmpty {
+                return raw.lowercased()
+            }
+            return canonical
         }
 
         private func merge(_ incomingMessages: [ThunderCommMessage]) {
@@ -747,6 +797,8 @@ import Observation
         private static var nowMs: Int64 {
             Int64(Date().timeIntervalSince1970 * 1000)
         }
+
+        private static let placeholderParticipantIDs = Set(["agent", "human"])
     }
 
 

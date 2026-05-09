@@ -165,7 +165,7 @@ struct ContentView: View {
                 Button {
                     showingOnlinePeers = true
                 } label: {
-                    Label("\(store.peers.count)", systemImage: "person.3.fill")
+                    Label("\(store.onlineParticipantCount)", systemImage: "person.3.fill")
                         .font(.headline)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
