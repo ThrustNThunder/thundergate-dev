@@ -2,6 +2,9 @@
 import SwiftUI
 
 struct MessageListView: View {
+    private static let bottomContextPadding: CGFloat = 96
+    private static let bottomContextSpacerID = "bottom-context-spacer"
+
     let messages: [ThunderCommMessage]
     let localSender: String
     let activeIndicators: [ThunderCommActivityIndicator]
@@ -41,6 +44,10 @@ struct MessageListView: View {
                             .padding(.top, 4)
                             .id("typing-indicators")
                     }
+
+                    Color.clear
+                        .frame(height: Self.bottomContextPadding)
+                        .id(Self.bottomContextSpacerID)
                 }
                 .padding(.vertical, 4)
             }
@@ -62,21 +69,8 @@ struct MessageListView: View {
     }
 
     private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-        if let lastPreview = streamingPreviews.last {
-            let action = {
-                proxy.scrollTo("stream-\(lastPreview.id)-\(lastPreview.updatedAt)", anchor: .bottom)
-            }
-            if animated {
-                withAnimation(.easeOut(duration: 0.2)) { action() }
-            } else {
-                action()
-            }
-            return
-        }
-
-        guard let lastID = messages.last?.id else { return }
         let action = {
-            proxy.scrollTo(lastID, anchor: .bottom)
+            proxy.scrollTo(Self.bottomContextSpacerID, anchor: .bottom)
         }
         if animated {
             withAnimation(.easeOut(duration: 0.2)) {
