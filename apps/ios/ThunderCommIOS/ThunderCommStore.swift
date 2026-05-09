@@ -29,7 +29,7 @@ import Observation
         var streamingPreviews: [ThunderCommStreamingPreview] = []
         var hasOlderMessages: Bool = false
 
-        let availableDirectAgents: [String] = ["jon", "mack", "rex", "burt", "sasha"]
+        let availableDirectAgents: [String] = ["jon", "mack", "rex", "burt"]
 
         private var messageIDs = Set<String>()
         private var allMessages: [ThunderCommMessage] = []
@@ -37,7 +37,7 @@ import Observation
         private var streamByParticipantID: [String: ThunderCommStreamingPreview] = [:]
         private var rosterByParticipantID: [String: ThunderCommParticipant] = [:]
         private var rosterOrder: [String] = []
-        private var knownParticipantIDs = Set<String>(["michael", "jon", "mack", "rex", "burt", "sasha"])
+        private var knownParticipantIDs = Set<String>(["michael", "jon", "mack", "rex", "burt"])
         private let client = ThunderCommWebSocketClient()
         private let persistence = ThunderCommSQLiteStore()
         private let autoSendText = ProcessInfo.processInfo.environment["THUNDERCOMM_AUTOSEND_TEXT"]?.trimmingCharacters(in: .whitespacesAndNewlines)
