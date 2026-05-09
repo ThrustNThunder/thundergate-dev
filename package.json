@@ -1,0 +1,15 @@
+{
+  "name": "thundergate",
+  "version": "0.1.0",
+  "description": "ThunderGate Runtime — Sovereign AI agent runtime for ThunderAI",
+  "main": "src/core/runtime.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/core/runtime.js",
+    "dev": "ts-node src/core/runtime.ts",
+    "test": "jest"
+  },
+  "author": "ThunderAI",
+  "license": "PROPRIETARY"
+}
