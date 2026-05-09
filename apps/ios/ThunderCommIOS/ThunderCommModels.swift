@@ -103,7 +103,7 @@ enum ThunderCommParticipantIdentity {
     private static func mappedCanonicalID(for value: String?) -> String? {
         guard let token = normalizedToken(value) else { return nil }
         switch token {
-        case "jon", "thunderbase":
+        case "jon", "thunderbase", "thunderbase-jon":
             return "jon"
         case "mack", "mac-mack", "macmack":
             return "mack"
@@ -121,6 +121,12 @@ enum ThunderCommParticipantIdentity {
             return "sasha"
         case "system":
             return "system"
+        case let token where token.hasPrefix("thunderbase-"):
+            return mappedCanonicalID(for: String(token.dropFirst("thunderbase-".count)))
+        case let token where token.hasPrefix("mac-"):
+            return mappedCanonicalID(for: String(token.dropFirst("mac-".count)))
+        case let token where token.hasPrefix("ios-"):
+            return mappedCanonicalID(for: String(token.dropFirst("ios-".count)))
         default:
             return nil
         }
