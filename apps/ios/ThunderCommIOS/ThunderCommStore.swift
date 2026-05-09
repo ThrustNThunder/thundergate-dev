@@ -10,8 +10,8 @@ import Observation
         private static let senderDefaultsKey = "ThunderComm.senderOverride"
         private static let routeDefaultsKey = "ThunderComm.route"
         private static let directAgentDefaultsKey = "ThunderComm.directAgent"
-        private static let initialVisibleMessageCount = 20
-        private static let historyPageSize = 20
+        private static let initialVisibleMessageCount = 100
+        private static let historyPageSize = 100
         private static let maxPersistedMessages = 300
         private static let activityExpiryMs: Int64 = 8_000
 
@@ -127,7 +127,7 @@ import Observation
             refreshVisibleMessages()
             refreshIndicators()
             refreshStreamingPreviews()
-            if case .connected = connectionState {
+            if case .connected = connectionState, route != .direct {
                 requestRecentHistoryIfAvailable()
             }
         }
@@ -622,6 +622,7 @@ import Observation
         }
 
         private func requestRecentHistoryIfAvailable() {
+            guard currentRoute != .direct else { return }
             client.sendHistoryRequest(channel: subscriptionChannel, limit: Self.initialVisibleMessageCount)
         }
 
@@ -679,15 +680,46 @@ import Observation
         }
 
         private func filteredMessages(from messages: [ThunderCommMessage]) -> [ThunderCommMessage] {
-            messages.filter { routeShows(channel: normalizeChannel($0.channel)) }
+            messages.filter { routeShows(message: $0) }
+        }
+
+        private func routeShows(message: ThunderCommMessage) -> Bool {
+            let channel = normalizeChannel(message.channel)
+            switch currentRoute {
+            case .tnt:
+                return channel == "tnt"
+            case .jmab:
+                return channel == "jmab"
+            case .direct:
+                let target = directAgentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard !target.isEmpty else { return channel == "direct" }
+                if channel == "direct:\(target)" {
+                    return true
+                }
+                guard channel == "direct" else { return false }
+                if message.agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target {
+                    return true
+                }
+                let participantID = ThunderCommParticipantIdentity.canonicalID(
+                    sender: message.sender,
+                    agentId: message.agentId,
+                    participantId: message.originPeer,
+                    senderType: message.senderType
+                )
+                return participantID == target
+            }
         }
 
         private func routeShows(channel: String) -> Bool {
             switch currentRoute {
+            case .tnt:
+                return channel == "tnt"
             case .jmab:
                 return channel == "jmab"
-            case .tnt, .direct:
-                return channel != "jmab"
+            case .direct:
+                let target = directAgentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard !target.isEmpty else { return channel == "direct" }
+                return channel == "direct" || channel == "direct:\(target)"
             }
         }
 

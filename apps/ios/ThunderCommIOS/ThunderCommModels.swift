@@ -54,7 +54,17 @@ enum ThunderCommParticipantIdentity {
     }
 
     static func canonicalID(sender: String? = nil, agentId: String? = nil, participantId: String? = nil, senderType: ThunderCommSenderType? = nil) -> String {
-        for candidate in [agentId, participantId, sender] {
+        let candidates: [String?]
+        switch senderType {
+        case .human:
+            candidates = [participantId, sender, agentId]
+        case .agent:
+            candidates = [agentId, participantId, sender]
+        case nil:
+            candidates = [agentId, participantId, sender]
+        }
+
+        for candidate in candidates {
             if let mapped = mappedCanonicalID(for: candidate) {
                 return mapped
             }

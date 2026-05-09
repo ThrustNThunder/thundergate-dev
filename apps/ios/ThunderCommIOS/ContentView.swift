@@ -31,10 +31,14 @@ struct ContentView: View {
                     hasOlderMessages: store.hasOlderMessages,
                     loadOlderMessages: store.loadOlderMessages
                 )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             ComposerBar(draft: $draft, placeholder: store.composePlaceholder) {
+                let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
                 store.sendDraft(&draft)
+                draft = ""
             }
         }
         .padding()
