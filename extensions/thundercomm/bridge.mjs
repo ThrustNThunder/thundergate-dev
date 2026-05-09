@@ -469,6 +469,16 @@ wss.on('connection', (ws, req) => {
           break;
         }
         
+        // Direct message to Jon — dispatch immediately, no mention required
+        if (channel === 'direct' && (!msg.agentId || msg.agentId === AGENT_ID_SELF)) {
+          broadcast({ type: 'thinking', agentId: AGENT_ID });
+          try {
+            await dispatchToAgent(text);
+          } catch (e) { /* error already broadcast */ }
+          ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.idempotencyKey, messageId: randomUUID() }));
+          break;
+        }
+
         // Always send TNT messages to federation relay so other agents can see them
         if (channel === 'tnt' && federationWs && federationWs.readyState === WebSocket.OPEN) {
           federationWs.send(JSON.stringify({
@@ -696,7 +706,6 @@ function buildRoster() {
   return [
     { id: 'jon',   name: 'Jon',   status: federationPeers.has('jon') || AGENT_ID_SELF === 'jon' ? 'online' : 'offline', role: 'Technical Director', model: currentModel },
     { id: 'mack',  name: 'Mack',  status: federationPeers.has('mack') ? 'online' : 'offline', role: 'Operations', model: getModelForPeer('mack') || 'openai/gpt-5.4-mini' },
-    { id: 'sasha', name: 'Sasha', status: federationPeers.has('sasha') ? 'online' : 'offline', role: 'Creative Director' },
     { id: 'rex',   name: 'Rex',   status: federationPeers.has('rex') ? 'online' : 'offline', role: 'AA Automation' },
   ];
 }
