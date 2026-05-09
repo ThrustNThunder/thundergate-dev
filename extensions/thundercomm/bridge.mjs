@@ -625,15 +625,18 @@ function connectToRelay() {
       
       // Forward federated messages to web clients
       if (msg.type === 'federation_message') {
-        // Broadcast to web clients
-        broadcast({
-          type: 'message',
-          agentId: msg.agentId || msg.originPeer,
-          sender: msg.senderType === 'human' ? msg.sender : null,
-          channel: msg.channel,
-          text: msg.text,
-          timestamp: msg.timestamp || Date.now(),
-        });
+        // Skip messages that originated from us — we already broadcast them directly
+        const fromSelf = msg.originPeer && msg.originPeer.includes('thunderbase');
+        if (!fromSelf) {
+          broadcast({
+            type: 'message',
+            agentId: msg.agentId || msg.originPeer,
+            sender: msg.senderType === 'human' ? msg.sender : null,
+            channel: msg.channel,
+            text: msg.text,
+            timestamp: msg.timestamp || Date.now(),
+          });
+        }
         
         // Check if Jon should respond (mentioned in the message)
         const text = msg.text || '';
