@@ -1,13 +1,14 @@
 /**
- * ThunderComm Web UI — app.js
+ * ThunderCommo Web UI — app.js
+ * Version: 0.5 (11)
  *
  * Wire protocol: per THUNDERCOMM_MASTER.md
  * Session model: one persistent session, all surfaces are windows
  * 
  * Input modes: Ambient 🎙️ | Push-to-talk 🎤 | Silent 🔇
- * UI: Streaming text, thinking indicator, connection status, agent roster
+ * UI: Streaming text, inline typing indicators, connection status, agent roster
  *
- * Jon | ThunderBase | 2026-05-06
+ * Jon | ThunderBase | 2026-05-07
  */
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -16,7 +17,7 @@ const state = {
   ws: null,
   token: null,
   host: null,
-  channel: 'team',
+  channel: 'tnt',
   agentId: null,          // null = team channel
   inputMode: 'silent',    // 'ambient' | 'ptt' | 'silent'
   streamBuffer: null,     // { msgEl, textEl, agentId } — current streaming message
@@ -24,6 +25,9 @@ const state = {
   reconnectAttempts: 0,
   agents: {},             // { id: { status, name } }
   pendingKey: null,       // idempotency key of in-flight send
+  sentKeys: new Set(),    // idempotency keys we already echo'd locally
+  allMessages: [],        // all messages across all channels, for filtering
+  typingIndicators: {},   // { participantId: timeoutId } — active typing indicators
 };
 
 const INPUT_MODES = ['ambient', 'ptt', 'silent'];
@@ -34,6 +38,7 @@ const MODE_ICONS  = { ambient: '🎙️', ptt: '🎤', silent: '🔇' };
 const $ = id => document.getElementById(id);
 const messagesEl    = $('messages');
 const thinkingEl    = $('thinking-indicator');
+const llmIndicator  = $('llm-indicator');
 const textInputEl   = $('text-input');
 const sendBtn       = $('send-btn');
 const connDot       = $('conn-status');
@@ -45,12 +50,95 @@ const hostInput     = $('host-input');
 const connectBtn    = $('connect-btn');
 const authError     = $('auth-error');
 
+// ── Channel helpers ───────────────────────────────────────────────────
+
+function normalizeChannel(channel) {
+  if (!channel) return 'tnt';
+  if (channel === 'team') return 'tnt';
+  if (channel.startsWith('#')) return channel.slice(1);
+  return channel;
+}
+
+// Check if a message channel should be visible in the current view
+// tnt + direct = same stream, jmab = separate
+function shouldShowInCurrentView(msgChannel) {
+  const current = state.channel;
+  
+  // JMAB is isolated — only show JMAB messages in JMAB view
+  if (current === 'jmab') return msgChannel === 'jmab';
+  if (msgChannel === 'jmab') return current === 'jmab';
+  
+  // Everything else (tnt, direct) shares the same stream
+  return true;
+}
+
+// ── Markdown renderer ───────────────────────────────────────────────────
+
+function renderMarkdown(text) {
+  // Escape HTML first
+  const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  // Split into code blocks and non-code blocks
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  let html = '';
+
+  for (const part of parts) {
+    if (part.startsWith('```')) {
+      // Code block
+      const lines = part.split('\n');
+      const lang = lines[0].replace('```','').trim();
+      const code = lines.slice(1, -1).join('\n');
+      html += `<div class="code-block"><div class="code-lang">${esc(lang) || 'code'}</div><pre><code>${esc(code)}</code></pre><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>`;
+    } else {
+      // Inline formatting
+      let p = esc(part);
+      // Inline code
+      p = p.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+      // Bold
+      p = p.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      // Bullet lists
+      p = p.replace(/^[ \t]*[-*] (.+)$/gm, '<li>$1</li>');
+      p = p.replace(/(<li>.*<\/li>\n?)+/g, s => `<ul>${s}</ul>`);
+      // Line breaks
+      p = p.replace(/\n/g, '<br>');
+      html += p;
+    }
+  }
+  return html;
+}
+
+function copyCode(btn) {
+  const code = btn.previousElementSibling.textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 2000);
+  });
+}
+
+// ── LLM Indicator ────────────────────────────────────────────────────
+
+function updateLlmIndicator(model, thinking) {
+  const m = model || 'unknown';
+  // Shorten model name for display
+  let label = m
+    .replace('anthropic/', '')
+    .replace('claude-sonnet-4-6', 'Sonnet 4.6')
+    .replace('claude-opus-4-5', 'Opus 4.5')
+    .replace('openai/', '')
+    .replace('gpt-5.4', 'GPT-5.4')
+    .replace('xai/', '')
+    .replace('grok-4', 'Grok-4');
+  const thinkingLabel = thinking && thinking !== 'off' ? ` ★${thinking}` : '';
+  llmIndicator.textContent = label + thinkingLabel;
+  llmIndicator.title = `Model: ${m}${thinking ? ' | Reasoning: ' + thinking : ''}`;
+}
+
 // ── Auth & connect ────────────────────────────────────────────────────────
 
 // Try to restore saved credentials
 const saved = {
-  token: localStorage.getItem('tc_token'),
-  host:  localStorage.getItem('tc_host'),
+  token: '4ca1100a180ad68a94b004056e56fd39c81bdccb742d2926',
+  host:  'commo.thunderai.us/ws',
 };
 if (saved.token && saved.host) {
   tokenInput.value = saved.token;
@@ -84,7 +172,8 @@ function showAuthError(msg) {
 
 function connect() {
   setConnStatus('reconnecting');
-  const url = `ws://${state.host}?token=${encodeURIComponent(state.token)}&deviceId=web-${fingerprint()}`;
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${proto}://${state.host}?token=${encodeURIComponent(state.token)}&deviceId=web-${fingerprint()}`;
   
   try {
     state.ws = new WebSocket(url);
@@ -100,7 +189,7 @@ function connect() {
     authOverlay.style.display = 'none';
     // Subscribe — request recent history + roster
     send({ type: 'subscribe', lastMessageId: null });
-    addSystemMsg('Connected to ThunderComm gateway ⚡');
+    addSystemMsg('Connected to ThunderCommo gateway ⚡');
   });
 
   state.ws.addEventListener('message', evt => {
@@ -147,6 +236,7 @@ function handleMessage(msg) {
 
     case 'status':
       setConnStatus(msg.gateway === 'connected' ? 'online' : 'reconnecting');
+      if (msg.model) updateLlmIndicator(msg.model, msg.thinking);
       break;
 
     case 'roster':
@@ -155,7 +245,13 @@ function handleMessage(msg) {
 
     case 'history':
       if (msg.messages && msg.messages.length) {
-        msg.messages.forEach(m => renderAgentMsg(m.agentId, m.text, m.channel, m.id, m.timestamp));
+        msg.messages.forEach(m => {
+          if (m.sender) {
+            renderHumanMsg(m.sender, m.text, m.channel, m.id, m.timestamp);
+          } else {
+            renderAgentMsg(m.agentId, m.text, m.channel, m.id, m.timestamp);
+          }
+        });
       }
       break;
 
@@ -163,14 +259,43 @@ function handleMessage(msg) {
       showThinking(msg.agentId);
       break;
 
+    case 'typing':
+      // Handle typing indicator for any participant (human or agent)
+      if (msg.participantId || msg.sender || msg.agentId) {
+        const id = msg.participantId || msg.sender || msg.agentId;
+        if (msg.typing === false) {
+          hideTypingIndicator(id);
+        } else {
+          showTypingIndicator(id, false);
+        }
+      }
+      break;
+
     case 'stream':
       appendStream(msg.agentId, msg.delta);
       break;
 
     case 'message':
-      hideThinking();
-      finalizeStream();
-      renderAgentMsg(msg.agentId, msg.text, msg.channel, msg.id, msg.timestamp);
+      if (msg.model) updateLlmIndicator(msg.model, msg.thinking);
+      // Small delay before hiding so indicator doesn't flash imperceptibly
+      setTimeout(() => {
+        hideThinking();
+        finalizeStream();
+        // Clear typing indicator for this sender
+        const senderId = msg.sender || msg.agentId;
+        if (senderId) hideTypingIndicator(senderId.toLowerCase());
+        // Check if it's a human message (has sender) or agent message (has agentId)
+        if (msg.sender) {
+          // Skip if we already echo'd this locally
+          if (msg.idempotencyKey && state.sentKeys.has(msg.idempotencyKey)) {
+            state.sentKeys.delete(msg.idempotencyKey);
+          } else {
+            renderHumanMsg(msg.sender, msg.text, msg.channel, msg.id, msg.timestamp);
+          }
+        } else {
+          renderAgentMsg(msg.agentId, msg.text, msg.channel, msg.id, msg.timestamp);
+        }
+      }, 100);
       break;
 
     case 'ack':
@@ -195,20 +320,74 @@ function handleMessage(msg) {
 
 // ── Rendering ─────────────────────────────────────────────────────────────
 
-function renderAgentMsg(agentId, text, channel, id, timestamp) {
+function storeMessage(msg) {
+  // Store message for channel filtering
+  state.allMessages.push(msg);
+  // Keep max 500 messages in memory
+  if (state.allMessages.length > 500) state.allMessages.shift();
+}
+
+function renderAgentMsg(agentId, text, channel, id, timestamp, skipStore = false) {
+  const msgChannel = normalizeChannel(channel);
+  
+  // Handle missing agentId — use 'agent' as fallback
+  const safeAgentId = agentId || 'agent';
+  
+  // Store for later filtering
+  if (!skipStore) {
+    storeMessage({ type: 'agent', agentId: safeAgentId, text, channel: msgChannel, id, timestamp: timestamp || Date.now() });
+  }
+  
+  // Skip rendering if message doesn't belong to current view
+  if (!shouldShowInCurrentView(msgChannel)) return;
+  
   const msgEl = document.createElement('div');
   msgEl.className = 'msg agent';
   if (id) msgEl.dataset.id = id;
+  msgEl.dataset.channel = msgChannel;
 
   const meta = document.createElement('div');
   meta.className = 'msg-meta';
 
   const author = document.createElement('span');
-  author.className = `msg-author ${agentId}`;
-  author.textContent = agentId.charAt(0).toUpperCase() + agentId.slice(1);
+  author.className = `msg-author ${safeAgentId}`;
+  author.textContent = safeAgentId.charAt(0).toUpperCase() + safeAgentId.slice(1);
 
   const time = document.createElement('span');
   time.textContent = formatTime(timestamp || Date.now());
+
+  meta.append(author, time);
+
+  const textEl = document.createElement('div');
+  textEl.className = 'msg-text';
+  textEl.innerHTML = renderMarkdown(text);
+
+  msgEl.append(meta, textEl);
+  messagesEl.appendChild(msgEl);
+  scrollBottom();
+}
+
+function renderUserMsg(text) {
+  // Local echo — show your own message immediately on send
+  const now = Date.now();
+  const msgChannel = normalizeChannel(state.channel);
+
+  // Store so message survives channel switches
+  storeMessage({ type: 'human', sender: 'Michael', text, channel: msgChannel, id: null, timestamp: now });
+
+  const msgEl = document.createElement('div');
+  msgEl.className = 'msg user';
+  msgEl.dataset.channel = msgChannel;
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+
+  const author = document.createElement('span');
+  author.className = 'msg-author human';
+  author.textContent = 'Michael';
+
+  const time = document.createElement('span');
+  time.textContent = formatTime(now);
 
   meta.append(author, time);
 
@@ -221,19 +400,31 @@ function renderAgentMsg(agentId, text, channel, id, timestamp) {
   scrollBottom();
 }
 
-function renderUserMsg(text) {
+function renderHumanMsg(sender, text, channel, id, timestamp, skipStore = false) {
+  const msgChannel = normalizeChannel(channel);
+  
+  // Store for later filtering
+  if (!skipStore) {
+    storeMessage({ type: 'human', sender, text, channel: msgChannel, id, timestamp: timestamp || Date.now() });
+  }
+  
+  // Skip rendering if message doesn't belong to current view
+  if (!shouldShowInCurrentView(msgChannel)) return;
+  
   const msgEl = document.createElement('div');
   msgEl.className = 'msg user';
+  if (id) msgEl.dataset.id = id;
+  msgEl.dataset.channel = msgChannel;
 
   const meta = document.createElement('div');
   meta.className = 'msg-meta';
 
   const author = document.createElement('span');
-  author.className = 'msg-author user';
-  author.textContent = 'You';
+  author.className = 'msg-author human';
+  author.textContent = sender;
 
   const time = document.createElement('span');
-  time.textContent = formatTime(Date.now());
+  time.textContent = formatTime(timestamp || Date.now());
 
   meta.append(author, time);
 
@@ -252,6 +443,22 @@ function addSystemMsg(text) {
   el.textContent = text;
   messagesEl.appendChild(el);
   scrollBottom();
+}
+
+function rerenderMessagesForChannel() {
+  // Clear current messages
+  messagesEl.innerHTML = '';
+  
+  // Re-render only messages for current view
+  for (const msg of state.allMessages) {
+    if (!shouldShowInCurrentView(msg.channel)) continue;
+    
+    if (msg.type === 'agent') {
+      renderAgentMsg(msg.agentId, msg.text, msg.channel, msg.id, msg.timestamp, true);
+    } else if (msg.type === 'human') {
+      renderHumanMsg(msg.sender, msg.text, msg.channel, msg.id, msg.timestamp, true);
+    }
+  }
 }
 
 // ── Streaming ─────────────────────────────────────────────────────────────
@@ -294,14 +501,81 @@ function finalizeStream() {
   }
 }
 
-// ── Thinking indicator ────────────────────────────────────────────────────
+// ── Typing/Thinking Indicators (inline) ──────────────────────────────────────
 
+const typingIndicatorsEl = document.createElement('div');
+typingIndicatorsEl.id = 'typing-indicators';
+
+function getParticipantColor(name) {
+  const lower = name?.toLowerCase() || '';
+  if (lower === 'jon') return 'var(--jon)';
+  if (lower === 'mack') return 'var(--mack)';
+  if (lower === 'michael') return 'var(--michael)';
+  if (lower === 'rex') return 'var(--rex)';
+  if (lower === 'burt' || lower === 'alex') return 'var(--text-dim)';
+  return 'var(--text-dim)';
+}
+
+function showTypingIndicator(participantId, isThinking = false) {
+  // Clear existing timeout for this participant
+  if (state.typingIndicators[participantId]) {
+    clearTimeout(state.typingIndicators[participantId]);
+  }
+  
+  // Create or update indicator element
+  let indicatorEl = document.getElementById(`typing-${participantId}`);
+  if (!indicatorEl) {
+    indicatorEl = document.createElement('div');
+    indicatorEl.id = `typing-${participantId}`;
+    indicatorEl.className = 'typing-indicator';
+    typingIndicatorsEl.appendChild(indicatorEl);
+  }
+  
+  const displayName = participantId.charAt(0).toUpperCase() + participantId.slice(1);
+  const color = getParticipantColor(participantId);
+  indicatorEl.innerHTML = `<span style="color: ${color}; font-weight: 600;">${displayName}</span> <span class="typing-dots">...</span>`;
+  
+  // Auto-hide after 10 seconds if no update
+  state.typingIndicators[participantId] = setTimeout(() => {
+    hideTypingIndicator(participantId);
+  }, 10000);
+  
+  // Ensure indicators container is in DOM
+  if (!typingIndicatorsEl.parentNode) {
+    const inputArea = document.getElementById('input-area');
+    inputArea.parentNode.insertBefore(typingIndicatorsEl, inputArea);
+  }
+  
+  scrollBottom();
+}
+
+function hideTypingIndicator(participantId) {
+  if (state.typingIndicators[participantId]) {
+    clearTimeout(state.typingIndicators[participantId]);
+    delete state.typingIndicators[participantId];
+  }
+  const indicatorEl = document.getElementById(`typing-${participantId}`);
+  if (indicatorEl) {
+    indicatorEl.remove();
+  }
+}
+
+function hideAllTypingIndicators() {
+  Object.keys(state.typingIndicators).forEach(id => hideTypingIndicator(id));
+}
+
+// Legacy functions for backwards compatibility
 function showThinking(agentId) {
-  thinkingEl.title = `${agentId} is thinking…`;
-  thinkingEl.classList.remove('hidden');
+  // Only show if we have a valid agentId - don't default to 'jon'
+  if (agentId) {
+    showTypingIndicator(agentId, true);
+  }
+  // Hide old top-right indicator
+  thinkingEl.classList.add('hidden');
 }
 
 function hideThinking() {
+  // Hide old top-right indicator (inline indicators clear on message receipt)
   thinkingEl.classList.add('hidden');
 }
 
@@ -319,11 +593,26 @@ function updateRoster(agents) {
   state.agents = {};
   agents.forEach(a => { state.agents[a.id] = a; });
   
-  // Update sidebar agent dots
+  // Update sidebar agent dots and model indicators
   document.querySelectorAll('.agent-dot[data-agent]').forEach(dot => {
     const agentId = dot.dataset.agent;
     const agent   = state.agents[agentId];
     dot.className = `agent-dot ${agent ? agent.status : 'offline'}`;
+    
+    // Update model indicator if present
+    const btn = dot.closest('.channel-btn');
+    if (btn && agent?.model) {
+      let modelEl = btn.querySelector('.agent-model');
+      if (!modelEl) {
+        modelEl = document.createElement('span');
+        modelEl.className = 'agent-model';
+        btn.appendChild(modelEl);
+      }
+      // Shorten model name
+      const shortModel = agent.model.split('/').pop().replace(/-/g, ' ');
+      modelEl.textContent = shortModel;
+      modelEl.title = agent.model;
+    }
   });
 }
 
@@ -336,8 +625,10 @@ document.querySelectorAll('.channel-btn').forEach(btn => {
     state.channel = btn.dataset.channel;
     state.agentId = btn.dataset.agent || null;
 
-    const label = state.channel === 'team'
-      ? '# team'
+    const label = state.channel === 'tnt'
+      ? '#TNT'
+      : state.channel === 'jmab'
+      ? '#JMAB'
       : `direct: ${state.agentId}`;
     chatTitle.textContent = label;
     textInputEl.placeholder = `Message ${label}…`;
@@ -345,6 +636,9 @@ document.querySelectorAll('.channel-btn').forEach(btn => {
     // Clear stream state on channel switch
     finalizeStream();
     hideThinking();
+    
+    // Re-render messages for this channel
+    rerenderMessagesForChannel();
   });
 });
 
@@ -392,9 +686,10 @@ function sendText() {
     msg.agentId = state.agentId;
   }
 
+  state.sentKeys.add(idempotencyKey);
   renderUserMsg(text);
   send(msg);
-  showThinking(state.agentId || 'agent');
+  showThinking(state.agentId || 'jon');
 
   textInputEl.value = '';
   autoResize();

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * ThunderComm Bridge — bridge.mjs
+ * ThunderCommo Bridge — bridge.mjs
  *
- * Standalone WebSocket server that bridges ThunderComm web clients
+ * Standalone WebSocket server that bridges ThunderCommo web clients
  * to the OpenClaw gateway. No TypeScript compilation required.
  *
  * Architecture:
- * - Listens on port 8765 for ThunderComm client connections
+ * - Listens on port 8765 for ThunderCommo client connections
  * - On inbound message: dispatches to OpenClaw via `openclaw gateway call chat.send`
  * - Watches session transcript file for new agent responses → broadcasts to clients
  *
@@ -29,11 +29,44 @@ const GATEWAY_TOKEN   = process.env.TC_GATEWAY_TOKEN || '4ca1100a180ad68a94b0040
 const GATEWAY_URL     = process.env.TC_GATEWAY_URL   || 'ws://localhost:18789';
 const SESSION_KEY     = process.env.TC_SESSION_KEY   || 'agent:main:slack:channel:c0anl10aamv';
 const SESSIONS_JSON   = process.env.TC_SESSIONS_JSON  || '/home/ubuntu/.openclaw/agents/main/sessions/sessions.json';
+const FEDERATION_RELAY = process.env.TC_FEDERATION_RELAY || 'ws://localhost:8767';
+const FEDERATION_TOKEN = process.env.TC_FEDERATION_TOKEN || 'jmab-federation-2026';
+const AGENT_ID_SELF    = process.env.TC_AGENT_ID || 'jon';
+
+// ── Model info ──────────────────────────────────────────────────────────────
+
+function resolveCurrentModel() {
+  try {
+    const sessions = JSON.parse(readFileSync(SESSIONS_JSON, 'utf8'));
+    const sess = sessions[SESSION_KEY];
+    if (sess) {
+      const model = sess.model || sess.modelId || resolveDefaultModel();
+      return {
+        model,
+        thinking: sess.thinkingLevel || 'off',
+      };
+    }
+  } catch {}
+  return { model: resolveDefaultModel(), thinking: 'off' };
+}
+
+function resolveDefaultModel() {
+  try {
+    const cfg = JSON.parse(readFileSync('/home/ubuntu/.openclaw/openclaw.json', 'utf8'));
+    return cfg?.agents?.defaults?.model?.primary || cfg?.agents?.main?.model || cfg?.model || 'anthropic/claude-sonnet-4-6';
+  } catch {}
+  return 'anthropic/claude-sonnet-4-6';
+}
+
+
 const AGENT_ID        = 'jon';
 
 // ── State ─────────────────────────────────────────────────────────────────
 
 const clients = new Map(); // clientId → { ws, deviceId, lastSeen }
+const recentMessages = []; // rolling buffer of recent messages for context
+const CONTEXT_BUFFER_SIZE = 3;
+const federationPeers = new Set(); // track online federation peers
 let transcriptPath = null;
 let transcriptSize  = 0;
 let lastMessageId   = null;
@@ -88,6 +121,19 @@ function extractAssistantText(line) {
   return null;
 }
 
+// Filter out internal/system messages that shouldn't display in UI
+function shouldDisplayMessage(text) {
+  if (!text) return false;
+  const t = text.trim();
+  // Skip heartbeat acks
+  if (t === 'HEARTBEAT_OK' || t === 'NO_REPLY') return false;
+  // Skip system completion notices
+  if (t.includes('System (untrusted):') && t.includes('Exec completed')) return false;
+  // Skip internal metadata
+  if (t.startsWith('System:') && t.includes('async command')) return false;
+  return true;
+}
+
 function checkTranscriptForNew() {
   if (!transcriptPath) return;
   
@@ -117,7 +163,10 @@ function checkTranscriptForNew() {
       
       if (broadcasting) {
         lastMessageId = result.id;
-        broadcastAgentMessage(result.id, result.text, new Date(result.timestamp).getTime());
+        // Filter out internal messages
+        if (shouldDisplayMessage(result.text)) {
+          broadcastAgentMessage(result.id, result.text, new Date(result.timestamp).getTime());
+        }
       }
     }
     
@@ -153,23 +202,81 @@ function broadcast(msg) {
 
 function broadcastAgentMessage(id, text, timestamp) {
   console.log(`[Bridge] Broadcasting agent message: ${text.slice(0, 60)}…`);
+  const msgTimestamp = timestamp || Date.now();
+  
+  // Broadcast to local web clients
   broadcast({
     type: 'message',
     id,
     agentId: AGENT_ID,
-    channel: 'team',
+    channel: 'tnt',
     text,
-    timestamp: timestamp || Date.now(),
+    timestamp: msgTimestamp,
   });
+  
+  // Also send to federation relay so other agents can see Jon's responses
+  if (federationWs && federationWs.readyState === WebSocket.OPEN) {
+    federationWs.send(JSON.stringify({
+      type: 'federation_message',
+      channel: 'tnt',
+      text,
+      sender: 'Jon',
+      senderType: 'agent',
+      agentId: AGENT_ID,
+      timestamp: msgTimestamp,
+    }));
+  }
+}
+
+// ── Context buffer ────────────────────────────────────────────────────────
+
+function stripContextEnvelope(text) {
+  // Remove "--- Recent context ---\n...\n---\n[Michael]: " wrapper
+  // and extract just the actual message
+  if (!text.includes('--- Recent context ---')) return text;
+  
+  const match = text.match(/---\n\[Michael\]:\s*(.+)$/s);
+  if (match) return match[1].trim();
+  
+  // Fallback: take everything after the last "---"
+  const parts = text.split('---');
+  if (parts.length >= 3) {
+    const lastPart = parts[parts.length - 1].trim();
+    // Strip leading "[Michael]: " if present
+    return lastPart.replace(/^\[Michael\]:\s*/, '').trim();
+  }
+  
+  return text;
+}
+
+function addToContextBuffer(sender, text) {
+  recentMessages.push({ sender, text, timestamp: Date.now() });
+  while (recentMessages.length > CONTEXT_BUFFER_SIZE) {
+    recentMessages.shift();
+  }
+}
+
+function buildContextString(currentText) {
+  // Build context from recent messages (excluding the current one)
+  if (recentMessages.length === 0) return currentText;
+  
+  const contextLines = recentMessages
+    .slice(0, -1) // exclude the message we just added
+    .map(m => `[${m.sender}]: ${m.text}`)
+    .join('\n');
+  
+  if (!contextLines) return currentText;
+  return `--- Recent context ---\n${contextLines}\n---\n[Michael]: ${currentText}`;
 }
 
 // ── Dispatch message to OpenClaw ──────────────────────────────────────────
 
 function dispatchToAgent(text) {
   const idempotencyKey = randomUUID();
+  const messageWithContext = buildContextString(text);
   const params = JSON.stringify({
     sessionKey: SESSION_KEY,
-    message: text,
+    message: messageWithContext,
     idempotencyKey,
   });
   
@@ -233,7 +340,11 @@ function loadHistory(limit = 20) {
             text = content.filter(c => c.type === 'text').map(c => c.text).join(' ').trim();
           }
           if (text) {
-            messages.push({ id: entry.id, text, timestamp: entry.timestamp, role: 'user' });
+            // Strip context envelope if present
+            text = stripContextEnvelope(text);
+            if (text) {
+              messages.push({ id: entry.id, text, timestamp: entry.timestamp, role: 'user' });
+            }
           }
         }
       } catch {}
@@ -247,14 +358,21 @@ function loadHistory(limit = 20) {
     const lastAssistant = [...recent].reverse().find(m => !m.role);
     if (lastAssistant) lastMessageId = lastAssistant.id;
     
-    return recent.map(m => ({
-      type: 'message',
-      id: m.id,
-      agentId: m.role === 'user' ? 'user' : AGENT_ID,
-      channel: 'team',
-      text: m.text,
-      timestamp: new Date(m.timestamp).getTime(),
-    }));
+    return recent.map(m => {
+      const msg = {
+        type: 'message',
+        id: m.id,
+        channel: 'tnt',
+        text: m.text,
+        timestamp: new Date(m.timestamp).getTime(),
+      };
+      if (m.role === 'user') {
+        msg.sender = 'Michael';
+      } else {
+        msg.agentId = AGENT_ID;
+      }
+      return msg;
+    });
   } catch (e) {
     console.error('[Bridge] History load error:', e.message);
     return [];
@@ -269,7 +387,9 @@ wss.on('connection', (ws, req) => {
   const url = new URL(req.url || '/', `http://localhost`);
   const token = url.searchParams.get('token');
   
-  if (token !== GATEWAY_TOKEN) {
+  // Accept "Michael" as shortcut for full token
+  const validTokens = [GATEWAY_TOKEN, 'Michael', 'michael'];
+  if (!validTokens.includes(token)) {
     console.warn('[Bridge] Connection rejected: bad token');
     ws.close(4001, 'Unauthorized');
     return;
@@ -282,18 +402,11 @@ wss.on('connection', (ws, req) => {
   console.log(`[Bridge] Client connected: ${deviceId} (${clients.size} total)`);
   
   // Send initial status
-  ws.send(JSON.stringify({ type: 'status', gateway: 'connected', sessionWarm: true }));
+  const modelInfo = resolveCurrentModel();
+  ws.send(JSON.stringify({ type: 'status', gateway: 'connected', sessionWarm: true, ...modelInfo }));
   
-  // Send roster
-  ws.send(JSON.stringify({
-    type: 'roster',
-    agents: [
-      { id: 'jon',   name: 'Jon',   status: 'online',  role: 'Technical Director' },
-      { id: 'sasha', name: 'Sasha', status: 'offline', role: 'Creative Director' },
-      { id: 'mack',  name: 'Mack',  status: 'offline', role: 'Operations' },
-      { id: 'rex',   name: 'Rex',   status: 'offline', role: 'AA Automation' },
-    ],
-  }));
+  // Send roster (dynamic based on federation peers)
+  ws.send(JSON.stringify({ type: 'roster', agents: buildRoster() }));
   
   ws.on('message', async (data) => {
     let msg;
@@ -316,6 +429,81 @@ wss.on('connection', (ws, req) => {
       case 'message': {
         const text = msg.text?.trim();
         if (!text) break;
+        
+        const channel = msg.channel || 'tnt';
+        
+        // Always add to context buffer
+        addToContextBuffer('Michael', text);
+        
+        // Direct messages to other agents go through federation relay
+        console.log(`[Bridge] Message received: channel=${channel}, agentId=${msg.agentId}, AGENT_ID_SELF=${AGENT_ID_SELF}`);
+        if (channel === 'direct' && msg.agentId && msg.agentId !== AGENT_ID_SELF) {
+          console.log(`[Bridge] Routing to federation: direct:${msg.agentId}`);
+          // Send thinking indicator for the target agent
+          broadcast({ type: 'thinking', agentId: msg.agentId });
+          
+          // Route through federation relay
+          if (federationWs && federationWs.readyState === WebSocket.OPEN) {
+            federationWs.send(JSON.stringify({
+              type: 'federation_message',
+              channel: `direct:${msg.agentId}`,
+              text,
+              sender: 'Michael',
+              timestamp: Date.now(),
+            }));
+            // Broadcast to local UI as well
+            broadcast({
+              type: 'message',
+              sender: 'Michael',
+              channel: `direct:${msg.agentId}`,
+              text,
+              timestamp: Date.now(),
+              idempotencyKey: msg.idempotencyKey,
+            });
+          }
+          ws.send(JSON.stringify({
+            type: 'ack',
+            idempotencyKey: msg.idempotencyKey,
+            messageId: randomUUID(),
+          }));
+          break;
+        }
+        
+        // Always send TNT messages to federation relay so other agents can see them
+        if (channel === 'tnt' && federationWs && federationWs.readyState === WebSocket.OPEN) {
+          federationWs.send(JSON.stringify({
+            type: 'federation_message',
+            channel: 'tnt',
+            text,
+            sender: 'Michael',
+            senderType: 'human',
+            timestamp: Date.now(),
+          }));
+        }
+        
+        // TNT channel requires mention for Jon — don't dispatch or show thinking without it
+        if (channel === 'tnt') {
+          const mentionPatterns = ['jon', '@jon', 'Jon', '@Jon'];
+          const hasMention = mentionPatterns.some(p => text.includes(p));
+          console.log(`[Bridge] TNT mention check: text="${text.slice(0,50)}", hasMention=${hasMention}`);
+          if (!hasMention) {
+            // Broadcast human message for display, but don't invoke Jon
+            broadcast({
+              type: 'message',
+              sender: 'Michael',
+              channel,
+              text,
+              timestamp: Date.now(),
+              idempotencyKey: msg.idempotencyKey,
+            });
+            ws.send(JSON.stringify({
+              type: 'ack',
+              idempotencyKey: msg.idempotencyKey,
+              messageId: randomUUID(),
+            }));
+            break;
+          }
+        }
         
         try {
           await dispatchToAgent(text);
@@ -347,9 +535,9 @@ wss.on('connection', (ws, req) => {
 });
 
 wss.on('listening', () => {
-  console.log(`[ThunderComm Bridge] WebSocket server on ws://0.0.0.0:${BRIDGE_PORT}`);
-  console.log(`[ThunderComm Bridge] Session: ${SESSION_KEY}`);
-  console.log(`[ThunderComm Bridge] Gateway: ${GATEWAY_URL}`);
+  console.log(`[ThunderCommo Bridge] WebSocket server on ws://0.0.0.0:${BRIDGE_PORT}`);
+  console.log(`[ThunderCommo Bridge] Session: ${SESSION_KEY}`);
+  console.log(`[ThunderCommo Bridge] Gateway: ${GATEWAY_URL}`);
 });
 
 wss.on('error', err => console.error('[Bridge] Server error:', err));
@@ -384,4 +572,155 @@ setInterval(() => {
   }
 }, 30000);
 
-console.log('[ThunderComm Bridge] Starting…');
+console.log('[ThunderCommo Bridge] Starting…');
+
+// ── Federation connection (for peer status) ──────────────────────────────
+
+let federationWs = null;
+
+function connectToRelay() {
+  if (federationWs && federationWs.readyState === WebSocket.OPEN) return;
+  
+  console.log(`[Federation] Connecting to relay: ${FEDERATION_RELAY}`);
+  
+  try {
+    federationWs = new WebSocket(FEDERATION_RELAY);
+  } catch (e) {
+    console.error(`[Federation] Connection error: ${e.message}`);
+    setTimeout(connectToRelay, 5000);
+    return;
+  }
+  
+  federationWs.on('open', () => {
+    console.log('[Federation] Connected to relay');
+    // Authenticate
+    federationWs.send(JSON.stringify({
+      type: 'federation_auth',
+      token: FEDERATION_TOKEN,
+      peerId: `thunderbase-${AGENT_ID_SELF}`,
+      channels: ['tnt', 'jmab'],
+      model: resolveCurrentModel().model,
+    }));
+  });
+  
+  federationWs.on('message', (data) => {
+    lastRelayActivity = Date.now();
+    try {
+      const msg = JSON.parse(data.toString());
+      
+      if (msg.type === 'federation_status') {
+        console.log(`[Federation] Status: ${msg.status}, peers: ${msg.peers?.join(', ')}`);
+        updatePeersFromRelay(msg.peers || [], msg.models || {});
+      }
+      
+      if (msg.type === 'federation_peers') {
+        console.log(`[Federation] Peers updated: ${msg.peers?.join(', ')}`);
+        updatePeersFromRelay(msg.peers || [], msg.models || {});
+      }
+      
+      // Forward typing/thinking to web clients
+      if (msg.type === 'typing' || msg.type === 'thinking') {
+        broadcast(msg);
+      }
+      
+      // Forward federated messages to web clients
+      if (msg.type === 'federation_message') {
+        // Broadcast to web clients
+        broadcast({
+          type: 'message',
+          agentId: msg.agentId || msg.originPeer,
+          sender: msg.senderType === 'human' ? msg.sender : null,
+          channel: msg.channel,
+          text: msg.text,
+          timestamp: msg.timestamp || Date.now(),
+        });
+        
+        // Check if Jon should respond (mentioned in the message)
+        const text = msg.text || '';
+        const mentionPatterns = ['jon', '@jon', 'Jon', '@Jon'];
+        const hasMention = mentionPatterns.some(p => text.includes(p));
+        
+        if (hasMention && msg.originPeer && !msg.originPeer.includes('thunderbase')) {
+          // Message from another agent/peer mentions Jon — dispatch to Jon
+          console.log(`[Federation] Jon mentioned by ${msg.sender || msg.originPeer}, dispatching`);
+          const envelope = `[${msg.sender || msg.originPeer}] [#${msg.channel}] [TO:jon]: ${text}`;
+          dispatchToAgent(envelope);
+        }
+      }
+    } catch {}
+  });
+  
+  federationWs.on('close', () => {
+    console.log('[Federation] Disconnected from relay');
+    federationPeers.clear();
+    broadcastRoster();
+    setTimeout(connectToRelay, 5000);
+  });
+  
+  federationWs.on('error', (e) => {
+    console.error(`[Federation] Error: ${e.message}`);
+  });
+}
+
+const federationPeerModels = {}; // peerId -> model
+
+function updatePeersFromRelay(peerList, models = {}) {
+  federationPeers.clear();
+  // Clear old models, then update
+  Object.keys(federationPeerModels).forEach(k => delete federationPeerModels[k]);
+  Object.assign(federationPeerModels, models);
+  
+  for (const peer of peerList) {
+    // peer format: "mac-mack", "thunderbase-jon", etc.
+    const agentMatch = peer.match(/-(\w+)$/);
+    if (agentMatch) {
+      federationPeers.add(agentMatch[1].toLowerCase());
+    }
+  }
+  broadcastRoster();
+}
+
+function getModelForPeer(peerId) {
+  // Look up model by full peer ID (e.g., "mac-mack")
+  for (const [key, model] of Object.entries(federationPeerModels)) {
+    if (key.endsWith(`-${peerId}`)) return model;
+  }
+  return null;
+}
+
+function buildRoster() {
+  const currentModel = resolveCurrentModel().model;
+  return [
+    { id: 'jon',   name: 'Jon',   status: federationPeers.has('jon') || AGENT_ID_SELF === 'jon' ? 'online' : 'offline', role: 'Technical Director', model: currentModel },
+    { id: 'mack',  name: 'Mack',  status: federationPeers.has('mack') ? 'online' : 'offline', role: 'Operations', model: getModelForPeer('mack') || 'openai/gpt-5.4-mini' },
+    { id: 'sasha', name: 'Sasha', status: federationPeers.has('sasha') ? 'online' : 'offline', role: 'Creative Director' },
+    { id: 'rex',   name: 'Rex',   status: federationPeers.has('rex') ? 'online' : 'offline', role: 'AA Automation' },
+  ];
+}
+
+function broadcastRoster() {
+  const roster = buildRoster();
+  broadcast({ type: 'roster', agents: roster });
+}
+
+// Connect to federation relay
+connectToRelay();
+
+// Federation keepalive — ping relay every 30s, force reconnect if stale
+let lastRelayActivity = Date.now();
+
+setInterval(() => {
+  if (federationWs && federationWs.readyState === WebSocket.OPEN) {
+    try {
+      federationWs.ping();
+      lastRelayActivity = Date.now();
+    } catch {}
+  } else if (Date.now() - lastRelayActivity > 45000) {
+    // Stale or dead — force reconnect
+    console.log('[Federation] Stale connection detected, reconnecting...');
+    if (federationWs) { try { federationWs.terminate(); } catch {} federationWs = null; }
+    connectToRelay();
+  }
+}, 30000);
+
+
