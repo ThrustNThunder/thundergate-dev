@@ -1,0 +1,155 @@
+
+import SwiftUI
+
+struct MessageListView: View {
+    let messages: [ThunderCommMessage]
+    let localSender: String
+    let activeIndicators: [ThunderCommActivityIndicator]
+    let streamingPreviews: [ThunderCommStreamingPreview]
+    let hasOlderMessages: Bool
+    let loadOlderMessages: () -> Void
+
+    @State private var didInitialScroll = false
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    if hasOlderMessages {
+                        ProgressView("Loading earlier messages…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 8)
+                            .onAppear {
+                                guard didInitialScroll else { return }
+                                loadOlderMessages()
+                            }
+                    }
+
+                    ForEach(messages) { message in
+                        MessageBubble(message: message, localSender: localSender)
+                            .id(message.id)
+                    }
+
+                    ForEach(streamingPreviews) { preview in
+                        StreamingPreviewBubble(preview: preview)
+                            .id("stream-\(preview.id)-\(preview.updatedAt)")
+                    }
+
+                    if !activeIndicators.isEmpty {
+                        TypingIndicatorsView(indicators: activeIndicators)
+                            .padding(.top, 4)
+                            .id("typing-indicators")
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .background(Color.clear)
+            .onAppear {
+                scrollToBottom(proxy: proxy, animated: false)
+                DispatchQueue.main.async {
+                    didInitialScroll = true
+                }
+            }
+            .onChange(of: messages.last?.id) { _, _ in
+                scrollToBottom(proxy: proxy, animated: true)
+            }
+            .onChange(of: streamingPreviews.map { "\($0.id)-\($0.updatedAt)" }.joined(separator: ",")) { _, _ in
+                scrollToBottom(proxy: proxy, animated: true)
+            }
+        }
+    }
+
+    private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        if let lastPreview = streamingPreviews.last {
+            let action = {
+                proxy.scrollTo("stream-\(lastPreview.id)-\(lastPreview.updatedAt)", anchor: .bottom)
+            }
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) { action() }
+            } else {
+                action()
+            }
+            return
+        }
+
+        guard let lastID = messages.last?.id else { return }
+        let action = {
+            proxy.scrollTo(lastID, anchor: .bottom)
+        }
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
+                action()
+            }
+        } else {
+            action()
+        }
+    }
+}
+
+private struct TypingIndicatorsView: View {
+    let indicators: [ThunderCommActivityIndicator]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(indicators) { indicator in
+                Text("\(indicator.displayName)...")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(color(for: indicator.id, senderType: indicator.senderType))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func color(for participantID: String, senderType: ThunderCommSenderType) -> Color {
+        switch participantID {
+        case "jon":
+            return Color(red: 0.96, green: 0.82, blue: 0.24)
+        case "michael":
+            return Color(red: 0.73, green: 0.58, blue: 0.98)
+        case "mack":
+            return Color(red: 0.47, green: 0.80, blue: 1.0)
+        default:
+            return senderType == .agent
+                ? Color(red: 0.80, green: 0.84, blue: 0.92)
+                : Color(red: 0.72, green: 0.72, blue: 0.80)
+        }
+    }
+}
+
+private struct StreamingPreviewBubble: View {
+    let preview: ThunderCommStreamingPreview
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(preview.displayName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(color)
+                Text(preview.text)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                    .italic()
+            }
+            .padding(12)
+            .background(color.opacity(0.14))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            Spacer(minLength: 36)
+        }
+    }
+
+    private var color: Color {
+        switch preview.id {
+        case "jon":
+            return Color(red: 0.96, green: 0.82, blue: 0.24)
+        case "mack":
+            return Color(red: 0.47, green: 0.80, blue: 1.0)
+        default:
+            return preview.senderType == .agent
+                ? Color(red: 0.80, green: 0.84, blue: 0.92)
+                : Color(red: 0.72, green: 0.72, blue: 0.80)
+        }
+    }
+}
