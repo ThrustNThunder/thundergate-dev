@@ -12,9 +12,13 @@
 
 import { Command } from 'commander';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
 import * as os from 'os';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const THUNDERGATE_DIR = join(os.homedir(), '.thundergate');
 const PID_FILE = join(THUNDERGATE_DIR, 'thundergate.pid');

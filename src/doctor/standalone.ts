@@ -9,7 +9,7 @@
  *   1 = issues detected
  */
 
-import { existsSync, statSync } from 'fs';
+import { existsSync, statSync, readFileSync } from 'fs';
 import { join } from 'path';
 import * as os from 'os';
 import { execSync } from 'child_process';
@@ -145,7 +145,7 @@ function checkRuntime(): HealthCheck {
   }
 
   try {
-    const pid = parseInt(require('fs').readFileSync(PID_FILE, 'utf-8').trim());
+    const pid = parseInt(readFileSync(PID_FILE, 'utf-8').trim());
     process.kill(pid, 0);
     return { name: 'Runtime', status: 'pass', detail: `Running (PID ${pid})` };
   } catch {

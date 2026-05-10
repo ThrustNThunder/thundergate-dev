@@ -13,8 +13,8 @@
  */
 
 import { SessionDB } from '../session/database.js';
-import { Checkpoint } from '../checkpoint/loader.js';
-import { LearningLoop } from '../learning/loop.js';
+import { CheckpointData, saveCheckpoint, loadCheckpoint } from '../checkpoint/save.js';
+import { TriggerEngine } from '../learning/triggers.js';
 import { Doctor } from '../doctor/monitor.js';
 import { Config, loadConfig } from '../config/loader.js';
 
@@ -30,10 +30,10 @@ interface RuntimeState {
 
 export class ThunderGateRuntime {
   private config: Config;
-  private db: SessionDB;
-  private checkpoint: Checkpoint;
-  private learning: LearningLoop;
-  private doctor: Doctor;
+  private db!: SessionDB;
+  private checkpoint!: CheckpointData;
+  private learning!: TriggerEngine;
+  private doctor!: Doctor;
   private state: RuntimeState;
 
   constructor(configPath?: string) {
@@ -64,24 +64,30 @@ export class ThunderGateRuntime {
     console.log('  ✓ Session database initialized');
 
     // Load checkpoint (hybrid adaptive)
-    this.checkpoint = new Checkpoint(this.db, this.config);
-    const context = await this.checkpoint.load();
-    this.state.contextTokens = context.tokenCount;
-    console.log(`  ✓ Checkpoint loaded (${context.tokenCount} tokens)`);
+    this.checkpoint = loadCheckpoint() ?? saveCheckpoint({});
+    this.state.contextTokens = this.checkpoint.contextTokenEstimate;
+    console.log(`  ✓ Checkpoint loaded (${this.checkpoint.contextTokenEstimate} tokens)`);
 
     // Start doctor monitoring
     this.doctor = new Doctor(this);
     this.doctor.startMonitoring();
     console.log('  ✓ Doctor mode active');
 
-    // Initialize learning loop
-    this.learning = new LearningLoop(this.db, this.config);
+    // Initialize learning trigger engine
+    this.learning = new TriggerEngine(this.db, this.config.learning.backstopTurns);
     console.log('  ✓ Learning loop ready');
 
     // Ready
     this.state.status = 'running';
-    this.state.sessionId = context.sessionId;
+    this.state.sessionId = this.checkpoint.sessionId;
     console.log('⚡ ThunderGate running');
+  }
+
+  /**
+   * Persist current checkpoint state
+   */
+  async saveCheckpoint(): Promise<void> {
+    this.checkpoint = saveCheckpoint(this.checkpoint);
   }
 
   /**
@@ -114,12 +120,8 @@ export class ThunderGateRuntime {
     // Process with LLM
     const response = await this.callLLM(message);
 
-    // Check learning triggers
-    await this.learning.checkTriggers({
-      type: 'message_processed',
-      message,
-      response
-    });
+    // Trigger engine: backstop check on each turn
+    await this.learning.onTurn(message.content, response.content);
 
     return response;
   }
@@ -213,7 +215,7 @@ export class ThunderGateRuntime {
     this.state.status = 'stopping';
 
     // Save checkpoint before stopping
-    await this.checkpoint.save();
+    await this.saveCheckpoint();
     console.log('  ✓ Checkpoint saved');
 
     // Stop doctor

@@ -234,7 +234,7 @@ export class Doctor {
 
     // Save checkpoint before any recovery action
     try {
-      await this.runtime.checkpoint.save();
+      await this.runtime.saveCheckpoint();
       console.log('  ✓ Checkpoint saved');
     } catch (error) {
       console.error('  ✗ Checkpoint save failed:', error);

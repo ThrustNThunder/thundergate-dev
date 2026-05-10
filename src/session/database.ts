@@ -8,7 +8,8 @@
  */
 
 import Database from 'better-sqlite3';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { mkdirSync } from 'fs';
 
 const SCHEMA_VERSION = 1;
 
@@ -124,7 +125,7 @@ END;
 `;
 
 export class SessionDB {
-  private db: Database.Database;
+  private db!: Database.Database;
   private dbPath: string;
 
   constructor(dbPath?: string) {
@@ -135,6 +136,7 @@ export class SessionDB {
    * Initialize database with schema
    */
   async initialize(): Promise<void> {
+    mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new Database(this.dbPath);
     
     // Enable WAL mode for concurrent access

@@ -4,6 +4,9 @@
   "description": "ThunderGate Runtime — Sovereign AI agent runtime for ThunderAI",
   "main": "src/core/runtime.ts",
   "type": "module",
+  "bin": {
+    "thundergate": "./src/cli/main.ts"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/core/runtime.js",
@@ -15,5 +18,10 @@
   "dependencies": {
     "better-sqlite3": "^12.9.0",
     "commander": "^14.0.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/better-sqlite3": "^7.0.0"
   }
 }
