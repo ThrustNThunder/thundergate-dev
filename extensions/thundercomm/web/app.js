@@ -233,6 +233,9 @@ function connect() {
     state.reconnectTimer = null;
     setConnStatus('online');
     authOverlay.style.display = 'none';
+    // Clear stale model indicator until server confirms current model
+    llmIndicator.style.display = 'none';
+    llmIndicator.textContent = '';
     updateSendBtn();
     // Subscribe — request recent history + roster.
     // Pass the last id we saw so the server can avoid resending old history.
@@ -244,6 +247,7 @@ function connect() {
       addSystemMsg('Reconnected ⚡');
     }
     state.hasConnected = true;
+
     // Keepalive ping every 30s to prevent idle disconnect
     state.pingInterval = setInterval(() => {
       if (state.ws && state.ws.readyState === WebSocket.OPEN) {
@@ -947,7 +951,7 @@ function autoResize() {
 
 function isNearBottom() {
   const distance = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
-  return distance < 80;
+  return distance < 200;
 }
 
 function scrollBottom(force) {
