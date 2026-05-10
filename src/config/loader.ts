@@ -25,7 +25,12 @@ export interface Config {
   // Phase 3: Ghost Jon shadow mode
   ghost: {
     enabled: boolean;
-    openclaw_session: string;
+    // Directory of OpenClaw session files — harness watches every *.jsonl
+    // inside, picks up new ones via periodic rescan.
+    sessions_dir: string;
+    // fs.watchFile polling interval (ms). Polling is required: fs.watch
+    // misses appends to JSONL on Linux.
+    watch_interval_ms: number;
     log_file: string;
     scores_file: string;
     // Phase 4: lightweight LLM used by the shadow harness
@@ -128,7 +133,8 @@ const DEFAULT_CONFIG: Config = {
 
   ghost: {
     enabled: false,
-    openclaw_session: '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
+    sessions_dir: '/home/ubuntu/.openclaw/agents/main/sessions/',
+    watch_interval_ms: 2000,
     log_file: join(process.env.HOME || '', '.thundergate', 'ghost-log.jsonl'),
     scores_file: join(process.env.HOME || '', '.thundergate', 'ghost-scores.json'),
     model: 'anthropic/claude-haiku-4-5-20251001',

@@ -40,8 +40,8 @@ const PHASE3_DEFAULT = {
   },
   ghost: {
     enabled: false,
-    openclaw_session:
-      '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
+    sessions_dir: '/home/ubuntu/.openclaw/agents/main/sessions/',
+    watch_interval_ms: 2000,
     log_file: join(THUNDERGATE_DIR, 'ghost-log.jsonl'),
     scores_file: join(THUNDERGATE_DIR, 'ghost-scores.json'),
     model: 'anthropic/claude-haiku-4-5-20251001',
@@ -128,8 +128,11 @@ export function validateConfig(cfg: Config): string[] {
   }
 
   if (cfg.ghost?.enabled) {
-    if (!cfg.ghost.openclaw_session) {
-      problems.push('ghost.openclaw_session missing');
+    if (!cfg.ghost.sessions_dir) {
+      problems.push('ghost.sessions_dir missing');
+    }
+    if (!cfg.ghost.watch_interval_ms || cfg.ghost.watch_interval_ms < 100) {
+      problems.push('ghost.watch_interval_ms missing or < 100ms');
     }
     if (!cfg.ghost.log_file) problems.push('ghost.log_file missing');
   }

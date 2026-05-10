@@ -206,7 +206,8 @@ ghost
       ? (cfg.openaiApiKey ? '✅ OpenAI key present' : '❌ OpenAI key missing')
       : (cfg.anthropicApiKey ? '✅ Anthropic key present' : '❌ Anthropic key missing');
     console.log(`  Provider auth:     ${provider}`);
-    console.log(`  OpenClaw session:  ${cfg.ghost.openclaw_session}`);
+    console.log(`  Sessions dir:      ${cfg.ghost.sessions_dir}`);
+    console.log(`  Watch interval:    ${cfg.ghost.watch_interval_ms}ms (poll)`);
     console.log(`  Log file:          ${cfg.ghost.log_file}`);
     if (existsSync(cfg.ghost.log_file)) {
       const size = statSync(cfg.ghost.log_file).size;

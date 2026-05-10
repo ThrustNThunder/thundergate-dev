@@ -7,10 +7,17 @@
  * flips the cutover.
  *
  * Constraints (locked principles):
- *   - READ ONLY against OpenClaw — never write back to its session file
+ *   - READ ONLY against OpenClaw — never write back to its session files
  *   - Never deliver responses anywhere
  *   - Never modify ThunderGate's primary state machine
  *   - Doctor mode must always tell the truth — no happy-path lying
+ *
+ * Watching strategy:
+ *   - fs.watchFile (polling) — reliable on Linux for append-only JSONL,
+ *     unlike fs.watch which often misses appends.
+ *   - Watch every *.jsonl in the OpenClaw sessions directory, not just
+ *     one — covers ThunderCommo, Slack, WhatsApp, cron, etc.
+ *   - Periodic rescan picks up newly created sessions.
  */
 
 import {
@@ -18,16 +25,18 @@ import {
   createReadStream,
   existsSync,
   mkdirSync,
+  readdirSync,
   statSync,
-  watch,
-  type FSWatcher
+  unwatchFile,
+  watchFile
 } from 'fs';
-import { dirname } from 'path';
+import { basename, dirname, join } from 'path';
 import { createInterface } from 'readline';
 import type { Config } from '../config/loader.js';
 
 export interface GhostEntry {
   timestamp: number;
+  session_id: string;
   input: string;
   openclaw_response: string | null;
   thundergate_response: string;
@@ -43,22 +52,33 @@ interface ParsedOpenclawLine {
   ts: number;
 }
 
+interface SessionState {
+  path: string;
+  sessionId: string;
+  offset: number;
+  pendingInput: { text: string; ts: number } | null;
+}
+
+const RESCAN_INTERVAL_MS = 30_000;
+
 export class GhostHarness {
   private config: Config;
   private logFile: string;
-  private sessionFile: string;
-  private watcher: FSWatcher | null = null;
+  private sessionsDir: string;
+  private watchIntervalMs: number;
   private respond: GhostResponder;
   private running = false;
-  private pendingInput: { text: string; ts: number } | null = null;
-  private fileOffset = 0;
+  private sessions = new Map<string, SessionState>();
+  private rescanTimer: NodeJS.Timeout | null = null;
   private processedCount = 0;
   private startedAt: number | null = null;
   private lastError: string | null = null;
+  private tgResponses = new Map<string, { response: string; latency_ms: number }>();
 
   constructor(config: Config, respond: GhostResponder) {
     this.config = config;
-    this.sessionFile = config.ghost.openclaw_session;
+    this.sessionsDir = config.ghost.sessions_dir;
+    this.watchIntervalMs = config.ghost.watch_interval_ms;
     this.logFile = config.ghost.log_file;
     this.respond = respond;
   }
@@ -68,27 +88,37 @@ export class GhostHarness {
 
     this.ensureLogDir();
 
-    if (!existsSync(this.sessionFile)) {
-      this.lastError = `OpenClaw session file not found: ${this.sessionFile}`;
+    if (!existsSync(this.sessionsDir)) {
+      this.lastError = `OpenClaw sessions dir not found: ${this.sessionsDir}`;
       console.warn(`  ⚠ Ghost: ${this.lastError}`);
-      // Still mark running so status reflects intent — fs.watch can't
-      // attach to a missing path, so we'll retry on each tick.
     } else {
-      // Start at end-of-file: we shadow new traffic, not history.
-      this.fileOffset = statSync(this.sessionFile).size;
-      this.attachWatcher();
+      this.scanAndAttach();
     }
+
+    this.rescanTimer = setInterval(() => {
+      this.scanAndAttach();
+    }, RESCAN_INTERVAL_MS);
+    this.rescanTimer.unref?.();
 
     this.running = true;
     this.startedAt = Date.now();
     console.log(`  ✓ Ghost harness running, log: ${this.logFile}`);
+    console.log(`  ✓ Watching ${this.sessions.size} session(s) in ${this.sessionsDir}`);
   }
 
   async stop(): Promise<void> {
-    if (this.watcher) {
-      this.watcher.close();
-      this.watcher = null;
+    if (this.rescanTimer) {
+      clearInterval(this.rescanTimer);
+      this.rescanTimer = null;
     }
+    for (const path of this.sessions.keys()) {
+      try {
+        unwatchFile(path);
+      } catch {
+        /* ignore */
+      }
+    }
+    this.sessions.clear();
     this.running = false;
     this.startedAt = null;
   }
@@ -101,7 +131,8 @@ export class GhostHarness {
     running: boolean;
     processed: number;
     startedAt: number | null;
-    sessionFile: string;
+    sessionsDir: string;
+    sessionCount: number;
     logFile: string;
     lastError: string | null;
   } {
@@ -109,45 +140,89 @@ export class GhostHarness {
       running: this.running,
       processed: this.processedCount,
       startedAt: this.startedAt,
-      sessionFile: this.sessionFile,
+      sessionsDir: this.sessionsDir,
+      sessionCount: this.sessions.size,
       logFile: this.logFile,
       lastError: this.lastError
     };
   }
 
-  // ── File watching ───────────────────────────────────────────────────────
+  // ── Session discovery & watching ──────────────────────────────────────────
 
-  private attachWatcher(): void {
+  /**
+   * Scan the sessions directory and start watching any *.jsonl file we
+   * haven't seen before. Newly discovered files start at end-of-file —
+   * we shadow new traffic, not history.
+   *
+   * Filenames like `<id>.jsonl.reset.<ts>` and `<id>.jsonl.deleted.<ts>`
+   * are intentionally skipped — they're frozen archives, not active.
+   */
+  private scanAndAttach(): void {
+    let entries: string[];
     try {
-      this.watcher = watch(this.sessionFile, { persistent: false }, (event) => {
-        if (event !== 'change') return;
-        this.drain().catch((err) => {
-          this.lastError = `drain failed: ${(err as Error).message}`;
-          console.error('  ✗ Ghost drain error:', err);
-        });
-      });
+      entries = readdirSync(this.sessionsDir);
     } catch (err) {
-      this.lastError = `watcher attach failed: ${(err as Error).message}`;
+      this.lastError = `sessions dir read failed: ${(err as Error).message}`;
+      return;
+    }
+
+    for (const name of entries) {
+      if (!name.endsWith('.jsonl')) continue;
+      const path = join(this.sessionsDir, name);
+      if (this.sessions.has(path)) continue;
+
+      let size = 0;
+      try {
+        size = statSync(path).size;
+      } catch {
+        continue;
+      }
+
+      const sessionId = basename(name, '.jsonl');
+      this.sessions.set(path, { path, sessionId, offset: size, pendingInput: null });
+      this.attachWatcher(path);
+    }
+  }
+
+  private attachWatcher(path: string): void {
+    try {
+      watchFile(
+        path,
+        { interval: this.watchIntervalMs, persistent: false },
+        (curr, prev) => {
+          if (curr.size === prev.size && curr.mtimeMs === prev.mtimeMs) return;
+          this.drain(path).catch((err) => {
+            this.lastError = `drain failed (${basename(path)}): ${(err as Error).message}`;
+            console.error('  ✗ Ghost drain error:', err);
+          });
+        }
+      );
+    } catch (err) {
+      this.lastError = `watcher attach failed (${basename(path)}): ${(err as Error).message}`;
       console.warn(`  ⚠ Ghost: ${this.lastError}`);
     }
   }
 
   /**
-   * Read everything new since fileOffset, parse JSONL, react to user
-   * messages by asking ThunderGate, react to assistant messages by
-   * pairing them with the most recent input and writing a ghost entry.
+   * Read everything appended to one session since its last offset, parse
+   * JSONL, react to human messages by asking ThunderGate, react to
+   * assistant messages by pairing them with the most recent input from
+   * this same session and writing a ghost entry.
    */
-  private async drain(): Promise<void> {
-    if (!existsSync(this.sessionFile)) return;
-    const size = statSync(this.sessionFile).size;
-    if (size <= this.fileOffset) {
+  private async drain(path: string): Promise<void> {
+    const session = this.sessions.get(path);
+    if (!session) return;
+    if (!existsSync(path)) return;
+
+    const size = statSync(path).size;
+    if (size <= session.offset) {
       // Truncation/rotation — reset to start.
-      if (size < this.fileOffset) this.fileOffset = 0;
+      if (size < session.offset) session.offset = 0;
       else return;
     }
 
-    const stream = createReadStream(this.sessionFile, {
-      start: this.fileOffset,
+    const stream = createReadStream(path, {
+      start: session.offset,
       end: size - 1
     });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
@@ -158,22 +233,25 @@ export class GhostHarness {
       if (!parsed) continue;
 
       if (parsed.role === 'user') {
-        this.pendingInput = { text: parsed.text, ts: parsed.ts };
+        session.pendingInput = { text: parsed.text, ts: parsed.ts };
         // Fire ThunderGate in parallel with OpenClaw — we still wait for
         // OpenClaw's response to arrive before logging the pair.
-        this.askThunderGate(parsed.text, parsed.ts).catch((err) => {
+        this.askThunderGate(session.sessionId, parsed.text, parsed.ts).catch((err) => {
           console.warn('  ⚠ Ghost ThunderGate response failed:', (err as Error).message);
         });
-      } else if (parsed.role === 'assistant' && this.pendingInput) {
-        this.pairWithOpenClaw(parsed.text);
+      } else if (parsed.role === 'assistant' && session.pendingInput) {
+        this.pairWithOpenClaw(session, parsed.text);
       }
+      // Skip system and tool messages — those are not human input.
     }
-    this.fileOffset = size;
+    session.offset = size;
   }
 
-  private tgResponses = new Map<string, { response: string; latency_ms: number }>();
-
-  private async askThunderGate(input: string, ts: number): Promise<void> {
+  private async askThunderGate(
+    sessionId: string,
+    input: string,
+    ts: number
+  ): Promise<void> {
     const started = Date.now();
     let response = '';
     try {
@@ -182,15 +260,15 @@ export class GhostHarness {
       response = `[ghost error: ${(err as Error).message}]`;
     }
     const latency_ms = Date.now() - started;
-    this.tgResponses.set(this.keyFor(input, ts), { response, latency_ms });
+    this.tgResponses.set(this.keyFor(sessionId, input, ts), { response, latency_ms });
   }
 
-  private pairWithOpenClaw(openclawResponse: string): void {
-    const pending = this.pendingInput;
+  private pairWithOpenClaw(session: SessionState, openclawResponse: string): void {
+    const pending = session.pendingInput;
     if (!pending) return;
-    this.pendingInput = null;
+    session.pendingInput = null;
 
-    const key = this.keyFor(pending.text, pending.ts);
+    const key = this.keyFor(session.sessionId, pending.text, pending.ts);
     const tg = this.tgResponses.get(key);
     this.tgResponses.delete(key);
 
@@ -199,6 +277,7 @@ export class GhostHarness {
     // dropping the pair. Doctor must tell the truth.
     const entry: GhostEntry = {
       timestamp: Date.now(),
+      session_id: session.sessionId,
       input: pending.text,
       openclaw_response: openclawResponse,
       thundergate_response: tg?.response ?? '[ghost: not yet ready]',
@@ -215,8 +294,8 @@ export class GhostHarness {
     }
   }
 
-  private keyFor(input: string, ts: number): string {
-    return `${ts}:${input.slice(0, 64)}`;
+  private keyFor(sessionId: string, input: string, ts: number): string {
+    return `${sessionId}:${ts}:${input.slice(0, 64)}`;
   }
 
   private ensureLogDir(): void {
@@ -230,6 +309,10 @@ export class GhostHarness {
 /**
  * OpenClaw session lines come in a few shapes. Be liberal in what we
  * accept — any object with a recognizable role + textual content works.
+ *
+ * OpenClaw v3 wraps the role under `message.role` and uses a top-level
+ * `type: "message"` envelope; older formats put role at the top level.
+ * We prefer the inner role and fall back to top-level.
  */
 function parseLine(line: string): ParsedOpenclawLine | null {
   let obj: any;
@@ -239,35 +322,58 @@ function parseLine(line: string): ParsedOpenclawLine | null {
     return null;
   }
 
-  const role = (obj.role || obj.type || obj.message?.role || '').toString();
+  let rawRole = '';
+  if (typeof obj.message?.role === 'string') rawRole = obj.message.role;
+  else if (typeof obj.role === 'string') rawRole = obj.role;
+  else if (typeof obj.sender_type === 'string') rawRole = obj.sender_type;
+  else if (typeof obj.type === 'string') {
+    const t = obj.type;
+    if (
+      t === 'user' ||
+      t === 'human' ||
+      t === 'assistant' ||
+      t === 'agent' ||
+      t === 'ai' ||
+      t === 'system' ||
+      t === 'tool' ||
+      t === 'tool_result'
+    ) {
+      rawRole = t;
+    }
+  }
+  rawRole = rawRole.toLowerCase();
+
   const ts = Number(obj.timestamp ?? obj.ts ?? Date.now());
 
   let text = '';
-  if (typeof obj.content === 'string') text = obj.content;
-  else if (typeof obj.text === 'string') text = obj.text;
-  else if (typeof obj.message?.content === 'string') text = obj.message.content;
-  else if (Array.isArray(obj.content)) {
-    text = obj.content
-      .filter((p: any) => typeof p?.text === 'string')
-      .map((p: any) => p.text)
-      .join('\n');
-  } else if (Array.isArray(obj.message?.content)) {
+  if (Array.isArray(obj.message?.content)) {
     text = obj.message.content
       .filter((p: any) => typeof p?.text === 'string')
       .map((p: any) => p.text)
       .join('\n');
+  } else if (typeof obj.message?.content === 'string') {
+    text = obj.message.content;
+  } else if (typeof obj.content === 'string') {
+    text = obj.content;
+  } else if (Array.isArray(obj.content)) {
+    text = obj.content
+      .filter((p: any) => typeof p?.text === 'string')
+      .map((p: any) => p.text)
+      .join('\n');
+  } else if (typeof obj.text === 'string') {
+    text = obj.text;
   }
 
   if (!text) return null;
 
-  if (role === 'user' || role === 'human') {
+  if (rawRole === 'user' || rawRole === 'human') {
     return { role: 'user', text, ts };
   }
-  if (role === 'assistant' || role === 'agent' || role === 'ai') {
+  if (rawRole === 'assistant' || rawRole === 'agent' || rawRole === 'ai') {
     return { role: 'assistant', text, ts };
   }
-  if (role === 'system') return { role: 'system', text, ts };
-  if (role === 'tool' || role === 'tool_result') return { role: 'tool', text, ts };
+  if (rawRole === 'system') return { role: 'system', text, ts };
+  if (rawRole === 'tool' || rawRole === 'tool_result') return { role: 'tool', text, ts };
   return null;
 }
 
