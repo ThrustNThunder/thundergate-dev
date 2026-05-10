@@ -9,10 +9,25 @@ import { join } from 'path';
 
 export interface Config {
   version: string;
-  
+
   // Database
   database: {
     path: string;
+  };
+
+  // Phase 3: Runtime — points at OpenClaw session + unified context file
+  runtime: {
+    openclaw_session_file: string;
+    context_file: string;
+    model: string;
+  };
+
+  // Phase 3: Ghost Jon shadow mode
+  ghost: {
+    enabled: boolean;
+    openclaw_session: string;
+    log_file: string;
+    scores_file: string;
   };
 
   // Model routing
@@ -55,7 +70,13 @@ export interface Config {
 
   // Channels
   channels: {
-    thundercommo: { enabled: boolean; relay: string; };
+    thundercommo: {
+      enabled: boolean;
+      relay: string;
+      port?: number;
+      relay_url?: string;
+      tokens?: Record<string, string>;
+    };
     slack: { enabled: boolean; token?: string; };
     whatsapp: { enabled: boolean; };
     telegram: { enabled: boolean; token?: string; };
@@ -89,6 +110,19 @@ const DEFAULT_CONFIG: Config = {
   
   database: {
     path: join(process.env.HOME || '', '.thundergate', 'context.db')
+  },
+
+  runtime: {
+    openclaw_session_file: '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
+    context_file: join(process.env.HOME || '', '.thundergate', 'context.jsonl'),
+    model: 'anthropic/claude-sonnet-4-6'
+  },
+
+  ghost: {
+    enabled: false,
+    openclaw_session: '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
+    log_file: join(process.env.HOME || '', '.thundergate', 'ghost-log.jsonl'),
+    scores_file: join(process.env.HOME || '', '.thundergate', 'ghost-scores.json')
   },
 
   model: {
@@ -126,7 +160,13 @@ const DEFAULT_CONFIG: Config = {
   },
 
   channels: {
-    thundercommo: { enabled: true, relay: 'wss://relay.thunderai.us' },
+    thundercommo: {
+      enabled: true,
+      relay: 'wss://relay.thunderai.us',
+      port: 8765,
+      relay_url: 'wss://relay.thunderai.us',
+      tokens: {}
+    },
     slack: { enabled: true },
     whatsapp: { enabled: true },
     telegram: { enabled: true },

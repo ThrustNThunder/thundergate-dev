@@ -14,6 +14,8 @@ import { join } from 'path';
 import * as os from 'os';
 import { execSync } from 'child_process';
 import { loadCheckpoint } from '../checkpoint/save.js';
+import { ensureConfig } from '../config/index.js';
+import { GhostEvaluator } from '../ghost/evaluator.js';
 
 const THUNDERGATE_DIR = join(os.homedir(), '.thundergate');
 const PID_FILE = join(THUNDERGATE_DIR, 'thundergate.pid');
@@ -66,6 +68,12 @@ export function runHealthCheck(): HealthReport {
 
   // 8. Node version
   checks.push(checkNodeVersion());
+
+  // 9. ThunderCommo channel
+  checks.push(checkThunderCommo());
+
+  // 10. Ghost mode (truth-telling — never fakes a green when missing data)
+  checks.push(checkGhost());
 
   // Calculate overall status
   const hasFailures = checks.some(c => c.status === 'fail');
@@ -248,6 +256,64 @@ function checkNodeVersion(): HealthCheck {
     return { name: 'Node.js', status: 'fail', detail: `${process.version} — Need 18+`, fix: 'nvm install 20' };
   }
   return { name: 'Node.js', status: 'pass', detail: process.version };
+}
+
+function checkThunderCommo(): HealthCheck {
+  let port: number | null = null;
+  try {
+    const cfg = ensureConfig();
+    if (!cfg.channels.thundercommo.enabled) {
+      return { name: 'ThunderCommo', status: 'pass', detail: 'disabled in config' };
+    }
+    port = cfg.channels.thundercommo.port ?? 8765;
+  } catch (err) {
+    return { name: 'ThunderCommo', status: 'warn', detail: `config error: ${(err as Error).message}` };
+  }
+
+  const open = portOpen(port);
+  if (!open) {
+    return {
+      name: 'ThunderCommo',
+      status: existsSync(PID_FILE) ? 'fail' : 'warn',
+      detail: `port ${port} not listening`,
+      fix: 'thundergate start'
+    };
+  }
+  return { name: 'ThunderCommo', status: 'pass', detail: `listening on ${port}` };
+}
+
+function checkGhost(): HealthCheck {
+  let cfg;
+  try {
+    cfg = ensureConfig();
+  } catch (err) {
+    return { name: 'Ghost mode', status: 'warn', detail: `config error: ${(err as Error).message}` };
+  }
+  if (!cfg.ghost.enabled) {
+    return { name: 'Ghost mode', status: 'pass', detail: 'stopped (ghost.enabled=false)' };
+  }
+  const evaluator = new GhostEvaluator(cfg);
+  const scores = evaluator.loadScores();
+  const days = scores?.consecutive_clean_days ?? 0;
+  const detail = `running, ${days} clean days${days >= 7 ? ' — CUTOVER READY' : ''}`;
+  // Truthful: ghost log missing while enabled = warn, not pass.
+  if (!existsSync(cfg.ghost.log_file)) {
+    return { name: 'Ghost mode', status: 'warn', detail: `${detail} (no log yet)` };
+  }
+  return { name: 'Ghost mode', status: days >= 7 ? 'pass' : 'pass', detail };
+}
+
+function portOpen(port: number): boolean {
+  try {
+    const data = readFileSync('/proc/net/tcp', 'utf-8');
+    const hex = port.toString(16).toUpperCase().padStart(4, '0');
+    return data.split('\n').some((line) => {
+      const cols = line.trim().split(/\s+/);
+      return cols.length > 3 && cols[1]?.endsWith(`:${hex}`) && cols[3] === '0A';
+    });
+  } catch {
+    return false;
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

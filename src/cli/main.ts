@@ -11,11 +11,14 @@
  */
 
 import { Command } from 'commander';
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, createReadStream, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
+import { createInterface } from 'readline';
 import * as os from 'os';
+import { ensureConfig, validateConfig, getConfigPath } from '../config/index.js';
+import { GhostEvaluator } from '../ghost/evaluator.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -23,6 +26,7 @@ const __dirname = dirname(__filename);
 const THUNDERGATE_DIR = join(os.homedir(), '.thundergate');
 const PID_FILE = join(THUNDERGATE_DIR, 'thundergate.pid');
 const STATE_FILE = join(THUNDERGATE_DIR, 'state.json');
+const GHOST_FLAG_FILE = join(THUNDERGATE_DIR, 'ghost.enabled');
 
 const program = new Command();
 
@@ -155,6 +159,128 @@ program
     }
   });
 
+// ── ghost ──────────────────────────────────────────────────────────────────
+
+const ghost = program.command('ghost').description('Ghost Jon shadow-mode controls');
+
+ghost
+  .command('start')
+  .description('Enable shadow mode (takes effect at next thundergate start)')
+  .action(() => {
+    const cfg = ensureConfig();
+    const raw = JSON.parse(readFileSync(getConfigPath(), 'utf-8'));
+    raw.ghost = { ...(raw.ghost || {}), enabled: true };
+    writeFileSync(getConfigPath(), JSON.stringify(raw, null, 2));
+    writeFileSync(GHOST_FLAG_FILE, String(Date.now()));
+    console.log('  ✓ Ghost mode enabled in config');
+    if (isRunning()) {
+      console.log('  ↻ Restart ThunderGate to pick it up: thundergate stop && thundergate start');
+    }
+    void cfg;
+  });
+
+ghost
+  .command('stop')
+  .description('Disable shadow mode (takes effect at next thundergate start)')
+  .action(() => {
+    ensureConfig();
+    const raw = JSON.parse(readFileSync(getConfigPath(), 'utf-8'));
+    raw.ghost = { ...(raw.ghost || {}), enabled: false };
+    writeFileSync(getConfigPath(), JSON.stringify(raw, null, 2));
+    if (existsSync(GHOST_FLAG_FILE)) unlinkSync(GHOST_FLAG_FILE);
+    console.log('  ✓ Ghost mode disabled in config');
+  });
+
+ghost
+  .command('status')
+  .description('Show shadow-mode state and recent scores')
+  .action(async () => {
+    const cfg = ensureConfig();
+    console.log('⚡ Ghost Jon Status');
+    console.log('═══════════════════════════════════════');
+    console.log(`  Enabled (config):  ${cfg.ghost.enabled ? '✅ yes' : '❌ no'}`);
+    console.log(`  OpenClaw session:  ${cfg.ghost.openclaw_session}`);
+    console.log(`  Log file:          ${cfg.ghost.log_file}`);
+    if (existsSync(cfg.ghost.log_file)) {
+      const size = statSync(cfg.ghost.log_file).size;
+      console.log(`  Log size:          ${(size / 1024).toFixed(1)} KB`);
+    } else {
+      console.log('  Log size:          (no log yet)');
+    }
+
+    const evaluator = new GhostEvaluator(cfg);
+    const scores = await evaluator.computeScores();
+    console.log('');
+    console.log(`  Consecutive clean days: ${scores.consecutive_clean_days}`);
+    console.log(`  Cutover ready: ${scores.consecutive_clean_days >= 7 ? '🏆 YES' : `${7 - scores.consecutive_clean_days} more clean days needed`}`);
+    console.log('');
+    console.log('  Recent days (newest first):');
+    if (scores.days.length === 0) {
+      console.log('    (no data)');
+    } else {
+      for (const day of scores.days.slice(0, 7)) {
+        const icon = day.status === 'green' ? '✅' : day.status === 'yellow' ? '⚠️ ' : '❌';
+        console.log(`    ${icon} ${day.date}  samples=${day.samples}  match=${(day.match_rate * 100).toFixed(0)}%  err=${(day.error_rate * 100).toFixed(0)}%  med_lat=${day.median_latency_ms}ms`);
+      }
+    }
+  });
+
+ghost
+  .command('log')
+  .description('Tail the ghost log')
+  .option('--last <n>', 'Show last N entries', '20')
+  .action(async (opts) => {
+    const cfg = ensureConfig();
+    if (!existsSync(cfg.ghost.log_file)) {
+      console.log('No ghost log yet — start ghost mode and wait for traffic.');
+      return;
+    }
+    const n = parseInt(opts.last, 10) || 20;
+    const lines: string[] = [];
+    const stream = createReadStream(cfg.ghost.log_file);
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      lines.push(line);
+      if (lines.length > n * 4) lines.splice(0, lines.length - n * 4);
+    }
+    const tail = lines.slice(-n);
+    for (const line of tail) {
+      try {
+        const e = JSON.parse(line);
+        const ts = new Date(e.timestamp).toLocaleString();
+        const m = e.match ? '✓' : '✗';
+        console.log(`[${ts}] ${m} lat=${e.latency_ms}ms`);
+        console.log(`  in : ${truncate(e.input)}`);
+        console.log(`  oc : ${truncate(e.openclaw_response ?? '')}`);
+        console.log(`  tg : ${truncate(e.thundergate_response)}`);
+      } catch {
+        console.log(line);
+      }
+    }
+  });
+
+ghost
+  .command('promote')
+  .description('Promote ThunderGate to primary (requires 7+ clean ghost days)')
+  .action(async () => {
+    const cfg = ensureConfig();
+    const evaluator = new GhostEvaluator(cfg);
+    const scores = await evaluator.computeScores();
+    if (scores.consecutive_clean_days < 7) {
+      console.log(`❌ Not ready: ${scores.consecutive_clean_days}/7 consecutive clean days`);
+      console.log('   Cutover blocked — Doctor must tell the truth.');
+      process.exit(1);
+    }
+    console.log('🏆 Cutover criteria met. Promote logic is intentionally manual for now.');
+    console.log('   Edit ~/.thundergate/config.json to disable ghost and enable primary delivery.');
+  });
+
+function truncate(s: string, n: number = 120): string {
+  const flat = s.replace(/\s+/g, ' ').trim();
+  return flat.length > n ? flat.slice(0, n) + '…' : flat;
+}
+
 // ── Helper functions ───────────────────────────────────────────────────────
 
 function isRunning(): boolean {
@@ -216,6 +342,32 @@ function getCpuUsage(): string {
 function getMemoryUsage(): string {
   const used = (os.totalmem() - os.freemem()) / (1024 * 1024);
   return used.toFixed(0);
+}
+
+function readPort(): number | null {
+  try {
+    const cfg = ensureConfig();
+    return cfg.channels.thundercommo.port ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cheap "is this port open" check via /proc/net/tcp. We don't open a
+ * socket because that would fight the running ThunderCommo server.
+ */
+function portOpen(port: number): boolean {
+  try {
+    const data = readFileSync('/proc/net/tcp', 'utf-8');
+    const hex = port.toString(16).toUpperCase().padStart(4, '0');
+    return data.split('\n').some((line) => {
+      const cols = line.trim().split(/\s+/);
+      return cols.length > 3 && cols[1]?.endsWith(`:${hex}`) && cols[3] === '0A';
+    });
+  } catch {
+    return false;
+  }
 }
 
 function runDiagnostic(autoFix: boolean = false): void {
@@ -282,6 +434,46 @@ function runDiagnostic(autoFix: boolean = false): void {
     pass: cliPresent,
     detail: cliPresent ? 'Installed ✅' : 'Not installed — run: npm install -g @anthropic-ai/claude-code'
   });
+
+  // Check 8: ThunderCommo channel reachable (only if runtime is running)
+  if (running) {
+    const port = readPort();
+    const tcUp = port ? portOpen(port) : false;
+    checks.push({
+      name: 'ThunderCommo',
+      pass: tcUp,
+      detail: tcUp ? `Listening on ws://0.0.0.0:${port}` : `Not listening${port ? ` on ${port}` : ''}`
+    });
+  }
+
+  // Check 9: Ghost mode (truthful — never fakes a green when there's no data)
+  try {
+    const cfg = ensureConfig();
+    const ghostEnabled = !!cfg.ghost?.enabled;
+    if (ghostEnabled) {
+      // Compute synchronously is awkward — use cached scores file.
+      const evaluator = new GhostEvaluator(cfg);
+      const cached = evaluator.loadScores();
+      const days = cached?.consecutive_clean_days ?? 0;
+      checks.push({
+        name: 'Ghost mode',
+        pass: existsSync(cfg.ghost.log_file),
+        detail: `running, ${days} clean days${days >= 7 ? ' — CUTOVER READY' : ''}`
+      });
+    } else {
+      checks.push({
+        name: 'Ghost mode',
+        pass: true,
+        detail: 'stopped (config: ghost.enabled = false)'
+      });
+    }
+  } catch (err) {
+    checks.push({
+      name: 'Ghost mode',
+      pass: false,
+      detail: `unknown: ${(err as Error).message}`
+    });
+  }
 
   // Display results
   let allPass = true;

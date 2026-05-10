@@ -17,6 +17,11 @@ import { CheckpointData, saveCheckpoint, loadCheckpoint } from '../checkpoint/sa
 import { TriggerEngine } from '../learning/triggers.js';
 import { Doctor } from '../doctor/monitor.js';
 import { Config, loadConfig } from '../config/loader.js';
+import { ensureConfig } from '../config/index.js';
+import { ChannelRegistry, type ContextEntry, type OutboundDelivery } from '../channels/index.js';
+import { ThunderCommoChannel, newMessageId } from '../channels/thundercommo.js';
+import { GhostHarness } from '../ghost/harness.js';
+import { randomUUID } from 'crypto';
 
 // Runtime state
 interface RuntimeState {
@@ -34,10 +39,15 @@ export class ThunderGateRuntime {
   private checkpoint!: CheckpointData;
   private learning!: TriggerEngine;
   private doctor!: Doctor;
+  private channels: ChannelRegistry;
+  private ghost: GhostHarness | null = null;
   private state: RuntimeState;
 
   constructor(configPath?: string) {
-    this.config = loadConfig(configPath);
+    // Phase 3: ensureConfig writes the default config.json on first run
+    // and then loads it. configPath override still honored for tests.
+    this.config = configPath ? loadConfig(configPath) : ensureConfig();
+    this.channels = new ChannelRegistry();
     this.state = {
       status: 'starting',
       sessionId: '',
@@ -46,6 +56,19 @@ export class ThunderGateRuntime {
       surfaceLayerActive: false,
       lastActivity: new Date()
     };
+  }
+
+  /** Public accessor — used by Doctor and CLI ghost commands. */
+  getConfig(): Config {
+    return this.config;
+  }
+
+  getChannels(): ChannelRegistry {
+    return this.channels;
+  }
+
+  getGhost(): GhostHarness | null {
+    return this.ghost;
   }
 
   /**
@@ -77,10 +100,89 @@ export class ThunderGateRuntime {
     this.learning = new TriggerEngine(this.db, this.config.learning.backstopTurns);
     console.log('  ✓ Learning loop ready');
 
+    // Phase 3: register and start native channels.
+    if (this.config.channels.thundercommo.enabled) {
+      this.channels.register(new ThunderCommoChannel({
+        config: this.config,
+        db: this.db,
+        contextFile: this.config.runtime.context_file,
+        onInbound: (entry) => this.handleChannelInbound(entry)
+      }));
+    }
+    await this.channels.startAll();
+
+    // Phase 3: start Ghost harness if configured. Failure is non-fatal.
+    if (this.config.ghost.enabled) {
+      try {
+        this.ghost = new GhostHarness(this.config, (input) => this.shadowResponse(input));
+        await this.ghost.start();
+      } catch (err) {
+        console.warn('  ⚠ Ghost harness failed to start:', err);
+        this.ghost = null;
+      }
+    }
+
     // Ready
     this.state.status = 'running';
     this.state.sessionId = this.checkpoint.sessionId;
     console.log('⚡ ThunderGate running');
+  }
+
+  /**
+   * Channel inbound hook. Routes to runtime, then broadcasts the runtime's
+   * response back through every running channel that subscribed to the
+   * same channel id.
+   */
+  private async handleChannelInbound(entry: ContextEntry): Promise<void> {
+    const channelId = entry.channel.replace(/^thundercommo:/, '');
+    const message: Message = {
+      id: entry.id,
+      channel: channelId,
+      content: entry.text,
+      sender: entry.sender,
+      timestamp: new Date(entry.timestamp)
+    };
+
+    let response: Response;
+    try {
+      response = await this.processMessage(message);
+    } catch (err) {
+      console.error('  ✗ runtime.processMessage threw:', err);
+      response = {
+        content: `[runtime error: ${(err as Error).message}]`,
+        type: 'normal'
+      };
+    }
+
+    if (!response?.content) return;
+
+    const delivery: OutboundDelivery = {
+      id: newMessageId(),
+      agentId: 'jon',
+      sender: 'Jon',
+      channel: channelId,
+      text: response.content,
+      timestamp: Date.now(),
+      model: this.config.runtime.model
+    };
+    this.channels.broadcast(delivery);
+  }
+
+  /**
+   * Ghost shadow path. Same processMessage pipeline as the live one but
+   * the result never reaches a channel — it is returned to the harness
+   * to be logged.
+   */
+  private async shadowResponse(input: string): Promise<string> {
+    const message: Message = {
+      id: randomUUID(),
+      channel: 'ghost',
+      content: input,
+      sender: 'openclaw-shadow',
+      timestamp: new Date()
+    };
+    const response = await this.processMessage(message);
+    return response?.content ?? '';
   }
 
   /**
@@ -213,6 +315,16 @@ export class ThunderGateRuntime {
   async stop(): Promise<void> {
     console.log('⚡ ThunderGate stopping...');
     this.state.status = 'stopping';
+
+    // Stop ghost first (read-only, but cleanly close watchers).
+    if (this.ghost) {
+      try { await this.ghost.stop(); } catch { /* ignore */ }
+      this.ghost = null;
+    }
+
+    // Stop channels — drain client connections.
+    try { await this.channels.stopAll(); } catch { /* ignore */ }
+    console.log('  ✓ Channels stopped');
 
     // Save checkpoint before stopping
     await this.saveCheckpoint();
