@@ -109,7 +109,12 @@ export class ThunderGateRuntime {
         onInbound: (entry) => this.handleChannelInbound(entry)
       }));
     }
-    await this.channels.startAll();
+    // Channel startup is non-fatal — bridge.mjs may already hold port 8765
+    try {
+      await this.channels.startAll();
+    } catch (err) {
+      console.warn('  ⚠ Channel startup error (non-fatal):', (err as Error).message);
+    }
 
     // Phase 3: start Ghost harness if configured. Failure is non-fatal.
     if (this.config.ghost.enabled) {
