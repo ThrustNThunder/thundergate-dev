@@ -50,7 +50,25 @@
         <span class="agent-dot" data-agent="alex" aria-hidden="true">●</span> Alex
       </button>
     </nav>
+
+    <div id="sidebar-footer">
+      <button class="sidebar-add-btn agent" id="add-agent-btn" type="button" title="Add agent">+ Agent</button>
+      <button class="sidebar-add-btn human" id="add-human-btn" type="button" title="Invite a human by phone number">+ Human</button>
+    </div>
   </aside>
+
+  <!-- Add Human modal -->
+  <div id="add-human-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="add-human-title">
+    <div id="add-human-box">
+      <h3 id="add-human-title">👤 Invite a Human</h3>
+      <p>Enter their phone number. They'll be invited to join ThunderCommo. (Integration coming — KYABYOAA onboarding flow.)</p>
+      <input id="add-human-phone" type="tel" placeholder="+1 (555) 867-5309" autocomplete="tel" inputmode="tel" />
+      <div class="add-human-actions">
+        <button id="add-human-cancel" type="button">Cancel</button>
+        <button id="add-human-confirm" type="button" class="primary">Add</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Main chat area -->
   <main id="chat-area">
@@ -61,6 +79,7 @@
       <span id="thinking-indicator" class="hidden" aria-hidden="true">
         <span class="dot"></span><span class="dot"></span><span class="dot"></span>
       </span>
+      <button id="header-collapse-btn" type="button" title="Collapse header" aria-label="Collapse header">▲</button>
     </header>
 
     <div id="messages" role="log" aria-live="polite" aria-relevant="additions"></div>

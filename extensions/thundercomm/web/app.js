@@ -1015,6 +1015,59 @@ function setupMobileSidebar() {
   });
 }
 
+// ── Header collapse toggle ───────────────────────────────────────────────
+
+function setupHeaderCollapse() {
+  const btn = document.getElementById('header-collapse-btn');
+  const header = document.getElementById('chat-header');
+  if (!btn || !header) return;
+  btn.addEventListener('click', () => {
+    const collapsed = header.classList.toggle('collapsed');
+    btn.textContent = collapsed ? '▼' : '▲';
+    btn.title = collapsed ? 'Expand header' : 'Collapse header';
+  });
+}
+
+// ── Add Human modal ───────────────────────────────────────────────────────
+
+function setupAddHuman() {
+  const openBtn   = document.getElementById('add-human-btn');
+  const modal     = document.getElementById('add-human-modal');
+  const cancelBtn = document.getElementById('add-human-cancel');
+  const confirmBtn= document.getElementById('add-human-confirm');
+  const phoneInput= document.getElementById('add-human-phone');
+  if (!openBtn || !modal) return;
+
+  openBtn.addEventListener('click', () => {
+    modal.classList.remove('hidden');
+    phoneInput && phoneInput.focus();
+  });
+
+  const closeModal = () => modal.classList.add('hidden');
+
+  cancelBtn && cancelBtn.addEventListener('click', closeModal);
+
+  confirmBtn && confirmBtn.addEventListener('click', () => {
+    const phone = phoneInput ? phoneInput.value.trim() : '';
+    if (!phone) { phoneInput && phoneInput.focus(); return; }
+    // Placeholder: log intent. Real invite flow wires in here when backend supports it.
+    console.log('[ThunderCommo] Add human invite intent:', phone);
+    addSystemMsg(`📱 Human invite queued for ${phone} — KYABYOAA onboarding coming soon.`);
+    phoneInput.value = '';
+    closeModal();
+  });
+
+  // Close on backdrop click
+  modal.addEventListener('click', e => {
+    if (e.target === modal) closeModal();
+  });
+
+  phoneInput && phoneInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') confirmBtn && confirmBtn.click();
+    if (e.key === 'Escape') closeModal();
+  });
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────
 
 (function init() {
@@ -1035,6 +1088,8 @@ function setupMobileSidebar() {
   updateSendBtn();
   autoResize();
   setupMobileSidebar();
+  setupHeaderCollapse();
+  setupAddHuman();
   // Focus token input if visible (no saved creds)
   if (!tokenInput.value) tokenInput.focus();
 })();
