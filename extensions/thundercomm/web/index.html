@@ -2,37 +2,52 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ThunderComm</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d0d0f" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="format-detection" content="telephone=no" />
+  <title>ThunderCommo</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- Mobile sidebar backdrop (tap to close) -->
+  <div id="sidebar-backdrop" aria-hidden="true"></div>
+
   <!-- Sidebar: agent roster + channel list -->
-  <aside id="sidebar">
+  <aside id="sidebar" aria-label="Channels">
     <div id="tc-header">
-      <span id="tc-logo">⚡</span>
-      <span id="tc-title">ThunderComm</span>
-      <span id="conn-status" class="status-dot offline" title="Offline">●</span>
+      <span id="tc-logo" aria-hidden="true">⚡</span>
+      <span id="tc-title">ThunderCommo</span>
+      <span id="conn-status" class="status-dot offline" title="Offline" aria-label="Offline" role="status">●</span>
     </div>
 
-    <nav id="channels">
+    <nav id="channels" role="tablist" aria-label="Channels">
       <div class="channel-section-label">CHANNELS</div>
-      <button class="channel-btn active" data-channel="team" data-agent="">
-        # team
+      <button class="channel-btn active" data-channel="tnt" data-agent="" role="tab" aria-selected="true">
+        # TNT
+      </button>
+      <button class="channel-btn" data-channel="jmab" data-agent="" role="tab" aria-selected="false">
+        # team JMAB
       </button>
 
       <div class="channel-section-label">DIRECT</div>
-      <button class="channel-btn" data-channel="direct" data-agent="jon">
-        <span class="agent-dot" data-agent="jon">●</span> Jon
+      <button class="channel-btn" data-channel="direct" data-agent="jon" role="tab" aria-selected="false">
+        <span class="agent-dot" data-agent="jon" aria-hidden="true">●</span> Jon
       </button>
-      <button class="channel-btn" data-channel="direct" data-agent="sasha">
-        <span class="agent-dot" data-agent="sasha">●</span> Sasha
+      <button class="channel-btn" data-channel="direct" data-agent="mack" role="tab" aria-selected="false">
+        <span class="agent-dot" data-agent="mack" aria-hidden="true">●</span> Mack
       </button>
-      <button class="channel-btn" data-channel="direct" data-agent="mack">
-        <span class="agent-dot" data-agent="mack">●</span> Mack
+      <button class="channel-btn" data-channel="direct" data-agent="rex" role="tab" aria-selected="false">
+        <span class="agent-dot" data-agent="rex" aria-hidden="true">●</span> Rex
       </button>
-      <button class="channel-btn" data-channel="direct" data-agent="rex">
-        <span class="agent-dot" data-agent="rex">●</span> Rex
+
+      <div class="channel-section-label">TEAM JMAB</div>
+      <button class="channel-btn" data-channel="direct" data-agent="burt" role="tab" aria-selected="false">
+        <span class="agent-dot" data-agent="burt" aria-hidden="true">●</span> Burt
+      </button>
+      <button class="channel-btn" data-channel="direct" data-agent="alex" role="tab" aria-selected="false">
+        <span class="agent-dot" data-agent="alex" aria-hidden="true">●</span> Alex
       </button>
     </nav>
   </aside>
@@ -40,38 +55,45 @@
   <!-- Main chat area -->
   <main id="chat-area">
     <header id="chat-header">
-      <span id="chat-title"># team</span>
-      <span id="thinking-indicator" class="hidden">
+      <button id="sidebar-toggle" type="button" aria-label="Toggle channels" title="Channels">☰</button>
+      <span id="chat-title">#TNT</span>
+      <span id="llm-indicator" title="Active model" style="display:none;"></span>
+      <span id="thinking-indicator" class="hidden" aria-hidden="true">
         <span class="dot"></span><span class="dot"></span><span class="dot"></span>
       </span>
     </header>
 
-    <div id="messages" role="log" aria-live="polite"></div>
+    <div id="messages" role="log" aria-live="polite" aria-relevant="additions"></div>
 
     <footer id="input-area">
-      <button id="input-mode-toggle" title="Input mode">🎙️</button>
+      <button id="input-mode-toggle" type="button" title="Input mode" aria-label="Input mode">🎙️</button>
       <div id="text-input-wrap">
+        <label for="text-input" class="sr-only">Message</label>
         <textarea
           id="text-input"
-          placeholder="Message # team..."
+          placeholder="Message #TNT…"
           rows="1"
           autocomplete="off"
+          autocapitalize="sentences"
           spellcheck="true"
+          enterkeyhint="send"
+          aria-label="Message"
         ></textarea>
       </div>
-      <button id="send-btn" title="Send (Enter)">➤</button>
+      <button id="send-btn" type="button" title="Send (Enter)" aria-label="Send">➤</button>
     </footer>
   </main>
 
   <!-- Auth overlay (shown before connection) -->
-  <div id="auth-overlay">
+  <div id="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-logo">
     <div id="auth-box">
-      <div id="auth-logo">⚡ ThunderComm</div>
+      <div id="auth-logo">⚡ ThunderCommo</div>
       <p>Enter your gateway token to connect.</p>
+      <label for="token-input" class="sr-only">Gateway token</label>
       <input id="token-input" type="password" placeholder="Gateway token" autocomplete="current-password" />
-      <input id="host-input" type="text" placeholder="Gateway host (e.g. localhost:8765)" value="localhost:8765" />
-      <button id="connect-btn">Connect</button>
-      <p id="auth-error" class="hidden"></p>
+      <input id="host-input" type="hidden" value="commo.thunderai.us/ws" />
+      <button id="connect-btn" type="button">Connect</button>
+      <p id="auth-error" class="hidden" role="alert"></p>
     </div>
   </div>
 
