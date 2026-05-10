@@ -199,6 +199,13 @@ ghost
     console.log('⚡ Ghost Jon Status');
     console.log('═══════════════════════════════════════');
     console.log(`  Enabled (config):  ${cfg.ghost.enabled ? '✅ yes' : '❌ no'}`);
+    console.log(`  Model:             ${cfg.ghost.model}`);
+    console.log(`  Max tokens:        ${cfg.ghost.maxTokens}`);
+    console.log(`  Temperature:       ${cfg.ghost.temperature}`);
+    const provider = cfg.ghost.model.startsWith('openai/') || cfg.ghost.model.startsWith('gpt-')
+      ? (cfg.openaiApiKey ? '✅ OpenAI key present' : '❌ OpenAI key missing')
+      : (cfg.anthropicApiKey ? '✅ Anthropic key present' : '❌ Anthropic key missing');
+    console.log(`  Provider auth:     ${provider}`);
     console.log(`  OpenClaw session:  ${cfg.ghost.openclaw_session}`);
     console.log(`  Log file:          ${cfg.ghost.log_file}`);
     if (existsSync(cfg.ghost.log_file)) {

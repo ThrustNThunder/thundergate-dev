@@ -28,7 +28,15 @@ export interface Config {
     openclaw_session: string;
     log_file: string;
     scores_file: string;
+    // Phase 4: lightweight LLM used by the shadow harness
+    model: string;       // e.g. 'openai/gpt-4o-mini' or 'anthropic/claude-haiku-4-5-20251001'
+    maxTokens: number;
+    temperature: number;
   };
+
+  // Phase 4: provider credentials. Populated from env or OpenClaw auth.
+  openaiApiKey?: string;
+  anthropicApiKey?: string;
 
   // Model routing
   model: {
@@ -122,8 +130,14 @@ const DEFAULT_CONFIG: Config = {
     enabled: false,
     openclaw_session: '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
     log_file: join(process.env.HOME || '', '.thundergate', 'ghost-log.jsonl'),
-    scores_file: join(process.env.HOME || '', '.thundergate', 'ghost-scores.json')
+    scores_file: join(process.env.HOME || '', '.thundergate', 'ghost-scores.json'),
+    model: 'anthropic/claude-haiku-4-5-20251001',
+    maxTokens: 512,
+    temperature: 0.3
   },
+
+  openaiApiKey: process.env.OPENAI_API_KEY ?? '',
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
 
   model: {
     mode: 'auto',

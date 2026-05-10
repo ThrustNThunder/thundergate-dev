@@ -43,9 +43,33 @@ const PHASE3_DEFAULT = {
     openclaw_session:
       '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
     log_file: join(THUNDERGATE_DIR, 'ghost-log.jsonl'),
-    scores_file: join(THUNDERGATE_DIR, 'ghost-scores.json')
+    scores_file: join(THUNDERGATE_DIR, 'ghost-scores.json'),
+    model: 'anthropic/claude-haiku-4-5-20251001',
+    maxTokens: 512,
+    temperature: 0.3
   }
 };
+
+const OPENCLAW_AUTH_FILE = join(
+  os.homedir(),
+  '.openclaw/agents/main/agent/auth-profiles.json'
+);
+
+/**
+ * Best-effort: pull the Anthropic API key out of OpenClaw's auth-profiles
+ * so ThunderGate can talk to Claude without requiring the operator to
+ * also export ANTHROPIC_API_KEY. Silent on failure — caller falls back
+ * to env var or empty string.
+ */
+function readOpenclawAnthropicKey(): string | null {
+  try {
+    const raw = JSON.parse(readFileSync(OPENCLAW_AUTH_FILE, 'utf-8'));
+    const key = raw?.profiles?.['anthropic:default']?.key;
+    return typeof key === 'string' && key.length > 0 ? key : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Write the Phase 3 default config to disk if no config file exists yet.
@@ -56,7 +80,16 @@ export function ensureConfig(): Config {
     mkdirSync(dirname(CONFIG_FILE), { recursive: true });
     writeFileSync(CONFIG_FILE, JSON.stringify(PHASE3_DEFAULT, null, 2));
   }
-  return loadConfig(CONFIG_FILE);
+  const cfg = loadConfig(CONFIG_FILE);
+
+  // Phase 4: if no Anthropic key was supplied via env or config.json,
+  // borrow the one OpenClaw is already using.
+  if (!cfg.anthropicApiKey) {
+    const fromOpenclaw = readOpenclawAnthropicKey();
+    if (fromOpenclaw) cfg.anthropicApiKey = fromOpenclaw;
+  }
+
+  return cfg;
 }
 
 export function getConfigPath(): string {

@@ -220,7 +220,8 @@ export class ThunderGateRuntime {
     }
 
     // Process with LLM
-    const response = await this.callLLM(message);
+    const text = await this.callLLM([{ role: 'user', content: message.content }]);
+    const response: Response = { content: text, type: 'normal' };
 
     // Trigger engine: backstop check on each turn
     await this.learning.onTurn(message.content, response.content);
@@ -292,14 +293,102 @@ export class ThunderGateRuntime {
   }
 
   /**
-   * Call LLM with appropriate model based on routing config
+   * Call the configured ghost LLM with a chat-style message array.
+   *
+   * Routing is driven by `config.ghost.model`:
+   *   - `openai/...` or `gpt-...`  → OpenAI Chat Completions
+   *   - `anthropic/...` or `claude-...` → Anthropic Messages API
+   *
+   * Anthropic does not accept inline `system` messages, so any system
+   * roles are concatenated into a single top-level `system` field.
+   * Returns an empty string on transport failure rather than throwing —
+   * Ghost mode logs failures via the harness; deep routing isn't wired yet.
    */
-  private async callLLM(message: Message): Promise<Response> {
-    // TODO: Implement LLM routing
-    // - Check config.model.mode (auto/manual/supersaver)
-    // - Route to appropriate model
-    // - Handle "go big", "go fast", "ask grok" commands
-    return { content: '', type: 'normal' };
+  async callLLM(
+    messages: Array<{ role: string; content: string }>
+  ): Promise<string> {
+    const model = this.config.ghost.model;
+    const maxTokens = this.config.ghost.maxTokens;
+    const temperature = this.config.ghost.temperature;
+
+    try {
+      if (model.startsWith('openai/') || model.startsWith('gpt-')) {
+        const apiKey = this.config.openaiApiKey;
+        if (!apiKey) {
+          console.warn('  ⚠ callLLM: OPENAI_API_KEY not set');
+          return '';
+        }
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model: model.replace(/^openai\//, ''),
+            messages,
+            max_tokens: maxTokens,
+            temperature
+          })
+        });
+        if (!response.ok) {
+          console.warn(`  ⚠ OpenAI API ${response.status}: ${await response.text()}`);
+          return '';
+        }
+        const data: any = await response.json();
+        return data.choices?.[0]?.message?.content ?? '';
+      }
+
+      if (model.startsWith('anthropic/') || model.startsWith('claude-')) {
+        const apiKey = this.config.anthropicApiKey;
+        if (!apiKey) {
+          console.warn('  ⚠ callLLM: anthropicApiKey not set');
+          return '';
+        }
+        const anthropicModel = model.replace(/^anthropic\//, '');
+
+        // Split out system messages — Anthropic wants a top-level system field.
+        const systemParts: string[] = [];
+        const chat: Array<{ role: string; content: string }> = [];
+        for (const m of messages) {
+          if (m.role === 'system') systemParts.push(m.content);
+          else chat.push(m);
+        }
+
+        const body: Record<string, unknown> = {
+          model: anthropicModel,
+          max_tokens: maxTokens,
+          temperature,
+          messages: chat
+        };
+        if (systemParts.length > 0) body.system = systemParts.join('\n\n');
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01'
+          },
+          body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+          console.warn(`  ⚠ Anthropic API ${response.status}: ${await response.text()}`);
+          return '';
+        }
+        const data: any = await response.json();
+        const block = Array.isArray(data.content)
+          ? data.content.find((b: any) => b?.type === 'text')
+          : null;
+        return block?.text ?? '';
+      }
+
+      console.warn(`  ⚠ callLLM: unrecognized model ${model}`);
+      return '';
+    } catch (err) {
+      console.warn('  ⚠ callLLM transport error:', (err as Error).message);
+      return '';
+    }
   }
 
   /**
