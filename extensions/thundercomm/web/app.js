@@ -1,6 +1,6 @@
 /**
  * ThunderCommo Web UI — app.js
- * Version: 0.5 (11)
+ * Version: 0.5 (12)
  *
  * Wire protocol: per THUNDERCOMM_MASTER.md
  * Session model: one persistent session, all surfaces are windows
@@ -404,10 +404,12 @@ function handleMessage(msg) {
           state.sentKeys.delete(msg.idempotencyKey);
           if (msg.id) state.seenIds.add(msg.id);
         } else {
-          renderHumanMsg(msg.sender, msg.text, msg.channel, msg.id, msg.timestamp);
+          // Live arrival via websocket — force scroll so Michael always sees new messages.
+          renderHumanMsg(msg.sender, msg.text, msg.channel, msg.id, msg.timestamp, false, true);
         }
       } else {
-        renderAgentMsg(msg.agentId, msg.text, msg.channel, msg.id, msg.timestamp);
+        // Live arrival via websocket — force scroll so Michael always sees new messages.
+        renderAgentMsg(msg.agentId, msg.text, msg.channel, msg.id, msg.timestamp, false, true);
       }
       break;
     }
@@ -461,7 +463,7 @@ function storeMessage(msg) {
   return true;
 }
 
-function renderAgentMsg(agentId, text, channel, id, timestamp, skipStore = false) {
+function renderAgentMsg(agentId, text, channel, id, timestamp, skipStore = false, forceScroll = false) {
   const msgChannel = normalizeChannel(channel);
   const safeAgentId = (agentId || 'agent').toLowerCase();
 
@@ -473,7 +475,7 @@ function renderAgentMsg(agentId, text, channel, id, timestamp, skipStore = false
 
   // Skip rendering if message doesn't belong to current view
   if (!shouldShowInCurrentView(msgChannel)) return;
-  
+
   const msgEl = document.createElement('div');
   msgEl.className = 'msg agent';
   if (id) msgEl.dataset.id = id;
@@ -497,7 +499,10 @@ function renderAgentMsg(agentId, text, channel, id, timestamp, skipStore = false
 
   msgEl.append(meta, textEl);
   messagesEl.appendChild(msgEl);
-  scrollBottom();
+  // Defer one frame so the new node's height is included in scrollHeight
+  // before we measure / set scrollTop — otherwise we land short.
+  if (forceScroll) requestAnimationFrame(() => scrollBottom(true));
+  else scrollBottom();
 }
 
 function renderUserMsg(text) {
@@ -533,7 +538,7 @@ function renderUserMsg(text) {
   scrollBottom(true);
 }
 
-function renderHumanMsg(sender, text, channel, id, timestamp, skipStore = false) {
+function renderHumanMsg(sender, text, channel, id, timestamp, skipStore = false, forceScroll = false) {
   const msgChannel = normalizeChannel(channel);
 
   if (!skipStore) {
@@ -542,7 +547,7 @@ function renderHumanMsg(sender, text, channel, id, timestamp, skipStore = false)
   }
 
   if (!shouldShowInCurrentView(msgChannel)) return;
-  
+
   const msgEl = document.createElement('div');
   msgEl.className = 'msg user';
   if (id) msgEl.dataset.id = id;
@@ -566,7 +571,8 @@ function renderHumanMsg(sender, text, channel, id, timestamp, skipStore = false)
 
   msgEl.append(meta, textEl);
   messagesEl.appendChild(msgEl);
-  scrollBottom();
+  if (forceScroll) requestAnimationFrame(() => scrollBottom(true));
+  else scrollBottom();
 }
 
 function addSystemMsg(text) {
@@ -962,7 +968,7 @@ function autoResize() {
 
 function isNearBottom() {
   const distance = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
-  return distance < 200;
+  return distance < 300;
 }
 
 function scrollBottom(force) {
