@@ -149,14 +149,22 @@ document.addEventListener('click', e => {
 });
 
 // ── LLM Indicator ────────────────────────────────────────────────────
+// Only visible while an agent is actively processing. We never persist a
+// "last seen" model — a stale label is worse than no label.
 
-function updateLlmIndicator(model, thinking) {
-  const m = model || 'unknown';
-  const label = shortenModelName(m) || m;
-  const thinkingLabel = thinking && thinking !== 'off' ? ` ★${thinking}` : '';
-  llmIndicator.textContent = label + thinkingLabel;
-  llmIndicator.title = `Model: ${m}${thinking ? ' | Reasoning: ' + thinking : ''}`;
+function showLlmIndicator(agentId) {
+  const id = (agentId || '').toLowerCase();
+  const model = id && state.agents[id] && state.agents[id].model;
+  if (!model) { hideLlmIndicator(); return; }
+  llmIndicator.textContent = shortenModelName(model) || model;
+  llmIndicator.title = `Model: ${model}`;
   llmIndicator.style.display = '';
+}
+
+function hideLlmIndicator() {
+  llmIndicator.textContent = '';
+  llmIndicator.title = '';
+  llmIndicator.style.display = 'none';
 }
 
 // ── Auth & connect ────────────────────────────────────────────────────────
@@ -233,9 +241,7 @@ function connect() {
     state.reconnectTimer = null;
     setConnStatus('online');
     authOverlay.style.display = 'none';
-    // Clear stale model indicator until server confirms current model
-    llmIndicator.style.display = 'none';
-    llmIndicator.textContent = '';
+    hideLlmIndicator();
     updateSendBtn();
     // Subscribe — request recent history + roster.
     // Pass the last id we saw so the server can avoid resending old history.
@@ -335,7 +341,7 @@ function handleMessage(msg) {
 
     case 'status':
       setConnStatus(msg.gateway === 'connected' ? 'online' : 'reconnecting');
-      if (msg.model) updateLlmIndicator(msg.model, msg.thinking);
+      // Don't surface msg.model here — the gateway reports last-known, not live.
       break;
 
     case 'roster':
@@ -376,7 +382,8 @@ function handleMessage(msg) {
       break;
 
     case 'message': {
-      if (msg.model) updateLlmIndicator(msg.model, msg.thinking);
+      // Message arrival = processing complete for this agent.
+      hideLlmIndicator();
       hideThinking();
       const senderId = (msg.sender || msg.agentId || '').toLowerCase();
       if (senderId) hideTypingIndicator(senderId);
@@ -626,6 +633,7 @@ function appendStream(agentId, delta, channel) {
       state.streamBuffer.textEl = textEl;
     }
     hideThinking();
+    showLlmIndicator(safeAgentId);
   }
 
   state.streamBuffer.text += delta;
@@ -645,6 +653,7 @@ function finalizeStream() {
     // Render any markdown / code blocks that streamed in.
     if (buf.text) buf.textEl.innerHTML = renderMarkdown(buf.text);
   }
+  hideLlmIndicator();
 }
 
 // ── Typing/Thinking Indicators (inline) ──────────────────────────────────────
@@ -726,6 +735,7 @@ function showThinking(agentId) {
   // Only show if we have a valid agentId - don't default to 'jon'
   if (agentId) {
     showTypingIndicator(agentId, true);
+    showLlmIndicator(agentId);
   }
   // Hide old top-right indicator
   thinkingEl.classList.add('hidden');
@@ -734,6 +744,7 @@ function showThinking(agentId) {
 function hideThinking() {
   // Hide old top-right indicator (inline indicators clear on message receipt)
   thinkingEl.classList.add('hidden');
+  hideLlmIndicator();
 }
 
 // ── Connection status ─────────────────────────────────────────────────────
