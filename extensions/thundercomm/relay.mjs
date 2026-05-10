@@ -27,9 +27,23 @@ const peers = new Map(); // peerId → { ws, channels, connectedAt, model }
 
 const wss = new WebSocketServer({ port: RELAY_PORT });
 
+// Ping all clients every 30s. Allow 2 missed pings before terminating (60s grace).
+const PING_INTERVAL = 30000;
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.missedPings >= 2) { ws.terminate(); return; }
+    ws.missedPings = (ws.missedPings || 0) + 1;
+    try { ws.ping(); } catch {}
+  });
+}, PING_INTERVAL);
+
 wss.on('connection', (ws, req) => {
   let peerId = null;
   let authenticated = false;
+  ws.missedPings = 0;
+  ws.on('pong', () => { ws.missedPings = 0; });
+  // Also reset on any message activity
+  ws.on('message', () => { ws.missedPings = 0; });
 
   ws.on('message', (data) => {
     let msg;

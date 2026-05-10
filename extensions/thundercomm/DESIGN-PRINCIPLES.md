@@ -111,6 +111,34 @@ Every piece of state has exactly one owner. No exceptions.
 
 ---
 
+## 7. Relay process management — run node directly under systemd
+
+`bin/run-relay.sh` (and its sibling `bin/run-bridge.sh`) wrap `node relay.mjs` with a
+"kill any process holding the port, then exec node" preflight. In practice this turns
+into a self-killing race when the wrapper runs under systemd and a stale or competing
+unit also exists: the preflight kills the running relay, the new node binds the port,
+and the next restart loop kills *that* one. Cycle repeats. The same pattern bit a
+parallel user-level unit at `~/.config/systemd/user/thundercomm-relay.service` whose
+`ExecStartPre=fuser -k 8767/tcp` was murdering the system-level relay every 10s.
+
+**Rules:**
+- Systemd units MUST invoke `node relay.mjs` (and `node bridge.mjs`) directly, with
+  absolute paths. Do NOT use `bin/run-relay.sh` or `bin/run-bridge.sh` from any unit.
+- Run the relay under exactly one supervisor. The canonical unit lives at
+  `extensions/thundercomm/systemd/thundercomm-relay.service` and is installed at
+  `/etc/systemd/system/thundercomm-relay.service`. Disable any user-level duplicates.
+- Verify with `systemctl status thundercomm-relay` — uptime should grow monotonically
+  without "Scheduled restart job" lines accumulating.
+- The wrapper scripts are kept around for manual one-off launches only. They are not
+  a deployment surface.
+
+**Code implication:** Any future change to relay/bridge process management must keep
+the systemd unit as the single ExecStart entry point. If you find yourself wanting a
+preflight `kill`/`fuser` step, the right answer is to remove the second supervisor,
+not to add a kill step.
+
+---
+
 ## What NOT to build in Phase 1
 
 - Presence/typing indicators (nice, not critical — after transcript correctness is solid)

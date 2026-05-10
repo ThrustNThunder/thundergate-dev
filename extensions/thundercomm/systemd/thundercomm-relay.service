@@ -1,0 +1,20 @@
+[Unit]
+Description=ThunderComm Federation Relay
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/thundergate/extensions/thundercomm
+# IMPORTANT: invoke node directly, NOT bin/run-relay.sh.
+# The wrapper has a self-killing race condition (see DESIGN-PRINCIPLES.md §7).
+ExecStart=/home/linuxbrew/.linuxbrew/bin/node /home/ubuntu/thundergate/extensions/thundercomm/relay.mjs
+Restart=on-failure
+RestartSec=5
+Environment=TC_FEDERATION_TOKEN=jmab-federation-2026
+Environment=TC_GATEWAY_TOKEN=4ca1100a180ad68a94b004056e56fd39c81bdccb742d2926
+Environment=TC_RELAY_PORT=8767
+Environment=TC_FEDERATED_CHANNELS=jmab,tnt
+
+[Install]
+WantedBy=multi-user.target

@@ -33,6 +33,21 @@ const FEDERATION_RELAY = process.env.TC_FEDERATION_RELAY || 'ws://localhost:8767
 const FEDERATION_TOKEN = process.env.TC_FEDERATION_TOKEN || 'jmab-federation-2026';
 const AGENT_ID_SELF    = process.env.TC_AGENT_ID || 'jon';
 
+// External user tokens — add new testers here
+// Format: token → display name
+const EXTERNAL_USERS = {
+  'alex-thundercommo-4a365924ea69066effbb9ed88fead6c7': 'Alex',
+  'burt-thundercommo-placeholder': 'Burt',
+};
+
+// Agents that participate via OpenClaw/Slack and never connect directly to the
+// federation relay. They show as online whenever the OpenClaw gateway is healthy,
+// so iOS rosters don't render them as offline just because they aren't on the relay.
+const OPENCLAW_AGENTS = new Set(
+  (process.env.TC_OPENCLAW_AGENTS || 'mack,rex')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
+
 // ── Model info ──────────────────────────────────────────────────────────────
 
 function resolveCurrentModel() {
@@ -70,6 +85,16 @@ const federationPeers = new Set(); // track online federation peers
 let transcriptPath = null;
 let transcriptSize  = 0;
 let lastMessageId   = null;
+
+// Optimistic gateway health — flipped to false on chat.send failure, back to true on
+// the next success. Drives "online" status for OPENCLAW_AGENTS in the roster.
+let gatewayHealthy = true;
+function setGatewayHealthy(healthy) {
+  if (gatewayHealthy === healthy) return;
+  gatewayHealthy = healthy;
+  console.log(`[Bridge] Gateway health changed → ${healthy ? 'healthy' : 'unhealthy'}`);
+  broadcastRoster();
+}
 
 // ── Find current session transcript ───────────────────────────────────────
 
@@ -200,7 +225,22 @@ function broadcast(msg) {
   }
 }
 
+// Track recently broadcast message IDs to prevent duplicates
+const recentlyBroadcast = new Set();
+
 function broadcastAgentMessage(id, text, timestamp) {
+  // Dedupe: skip if we already broadcast this exact message ID
+  if (recentlyBroadcast.has(id)) {
+    console.log(`[Bridge] Skipping duplicate broadcast: ${id}`);
+    return;
+  }
+  recentlyBroadcast.add(id);
+  // Keep set small — clear old IDs after 100 entries
+  if (recentlyBroadcast.size > 100) {
+    const firstId = recentlyBroadcast.values().next().value;
+    recentlyBroadcast.delete(firstId);
+  }
+  
   console.log(`[Bridge] Broadcasting agent message: ${text.slice(0, 60)}…`);
   const msgTimestamp = timestamp || Date.now();
   
@@ -300,6 +340,7 @@ function dispatchToAgent(text) {
     child.on('close', code => {
       if (code !== 0) {
         console.error('[Bridge] chat.send failed:', stderr);
+        setGatewayHealthy(false);
         broadcast({
           type: 'error',
           code: 'INVALID_MESSAGE',
@@ -308,6 +349,7 @@ function dispatchToAgent(text) {
         reject(new Error(stderr));
       } else {
         console.log('[Bridge] chat.send dispatched:', stdout.trim().slice(0, 80));
+        setGatewayHealthy(true);
         resolve(JSON.parse(stdout || '{}'));
       }
     });
@@ -388,17 +430,20 @@ wss.on('connection', (ws, req) => {
   const token = url.searchParams.get('token');
   
   // Accept "Michael" as shortcut for full token
-  const validTokens = [GATEWAY_TOKEN, 'Michael', 'michael'];
+  const validTokens = [GATEWAY_TOKEN, 'Michael', 'michael', ...Object.keys(EXTERNAL_USERS)];
   if (!validTokens.includes(token)) {
     console.warn('[Bridge] Connection rejected: bad token');
     ws.close(4001, 'Unauthorized');
     return;
   }
   
+  // Determine sender name from token
+  const senderName = EXTERNAL_USERS[token] || 'Michael';
+  
   const clientId  = randomUUID();
   const deviceId  = url.searchParams.get('deviceId') || clientId.slice(0, 8);
   
-  clients.set(clientId, { ws, deviceId, lastSeen: Date.now() });
+  clients.set(clientId, { ws, deviceId, lastSeen: Date.now(), senderName });
   console.log(`[Bridge] Client connected: ${deviceId} (${clients.size} total)`);
   
   // Send initial status
@@ -418,6 +463,11 @@ wss.on('connection', (ws, req) => {
     clients.get(clientId).lastSeen = Date.now();
     
     switch (msg.type) {
+      case 'ping':
+        // Keepalive ping — respond with pong, nothing else
+        ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+        return;
+
       case 'subscribe': {
         // Send recent history
         const history = loadHistory(30);
@@ -491,12 +541,13 @@ wss.on('connection', (ws, req) => {
           }));
         }
         
-        // TNT channel requires mention for Jon — don't dispatch or show thinking without it
+        // TNT channel requires mention for Jon — or agentId targeting Jon
         if (channel === 'tnt') {
           const mentionPatterns = ['jon', '@jon', 'Jon', '@Jon'];
           const hasMention = mentionPatterns.some(p => text.includes(p));
-          console.log(`[Bridge] TNT mention check: text="${text.slice(0,50)}", hasMention=${hasMention}`);
-          if (!hasMention) {
+          const hasAgentId = msg.agentId && msg.agentId.toLowerCase() === 'jon';
+          console.log(`[Bridge] TNT mention check: text="${text.slice(0,50)}", hasMention=${hasMention}, agentId=${msg.agentId}`);
+          if (!hasMention && !hasAgentId) {
             // Broadcast human message for display, but don't invoke Jon
             broadcast({
               type: 'message',
@@ -608,7 +659,7 @@ function connectToRelay() {
       type: 'federation_auth',
       token: FEDERATION_TOKEN,
       peerId: `thunderbase-${AGENT_ID_SELF}`,
-      channels: ['tnt', 'jmab'],
+      channels: ['tnt', 'jmab', 'direct:jon', 'direct:michael'],
       model: resolveCurrentModel().model,
     }));
   });
@@ -648,14 +699,19 @@ function connectToRelay() {
           });
         }
         
-        // Check if Jon should respond (mentioned in the message)
+        // Check if Jon should respond
         const text = msg.text || '';
         const mentionPatterns = ['jon', '@jon', 'Jon', '@Jon'];
         const hasMention = mentionPatterns.some(p => text.includes(p));
-        
-        if (hasMention && msg.originPeer && !msg.originPeer.includes('thunderbase')) {
-          // Message from another agent/peer mentions Jon — dispatch to Jon
-          console.log(`[Federation] Jon mentioned by ${msg.sender || msg.originPeer}, dispatching`);
+        const targetedAgent = msg.agentId ? String(msg.agentId).toLowerCase() : null;
+        const normalizedChannel = String(msg.channel || '').toLowerCase();
+        const isDirect = normalizedChannel === 'direct:jon' || (normalizedChannel === 'direct' && targetedAgent === 'jon');
+        const isTargetedTnt = (normalizedChannel === 'tnt' || normalizedChannel === 'team') && targetedAgent === 'jon';
+
+        if ((hasMention || isDirect || isTargetedTnt) && msg.originPeer && !msg.originPeer.includes('thunderbase')) {
+          // Message from another agent/peer mentions Jon, targets him in #tnt, or is a direct DM
+          const reason = isDirect ? 'DM' : isTargetedTnt ? 'targeted #tnt' : 'mention';
+          console.log(`[Federation] ${reason} from ${msg.sender || msg.originPeer}, dispatching`);
           const envelope = `[${msg.sender || msg.originPeer}] [#${msg.channel}] [TO:jon]: ${text}`;
           dispatchToAgent(envelope);
         }
@@ -703,10 +759,15 @@ function getModelForPeer(peerId) {
 
 function buildRoster() {
   const currentModel = resolveCurrentModel().model;
+  // Federation relay = strongest signal. OpenClaw-known agents (Mack/Rex) reach us
+  // through the OpenClaw gateway / Slack — never the relay — so absence from the
+  // federation peer list does NOT mean they're offline.
+  const isOnline = (id) =>
+    federationPeers.has(id) || (gatewayHealthy && OPENCLAW_AGENTS.has(id));
   return [
     { id: 'jon',   name: 'Jon',   status: federationPeers.has('jon') || AGENT_ID_SELF === 'jon' ? 'online' : 'offline', role: 'Technical Director', model: currentModel },
-    { id: 'mack',  name: 'Mack',  status: federationPeers.has('mack') ? 'online' : 'offline', role: 'Operations', model: getModelForPeer('mack') || 'openai/gpt-5.4-mini' },
-    { id: 'rex',   name: 'Rex',   status: federationPeers.has('rex') ? 'online' : 'offline', role: 'AA Automation' },
+    { id: 'mack',  name: 'Mack',  status: isOnline('mack') ? 'online' : 'offline', role: 'Operations', model: getModelForPeer('mack') || 'openai/gpt-5.4-mini' },
+    { id: 'rex',   name: 'Rex',   status: isOnline('rex') ? 'online' : 'offline', role: 'AA Automation' },
   ];
 }
 
