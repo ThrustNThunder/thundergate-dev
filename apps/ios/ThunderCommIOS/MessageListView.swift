@@ -2,9 +2,6 @@
 import SwiftUI
 
 struct MessageListView: View {
-    private static let bottomContextPadding: CGFloat = 96
-    private static let bottomContextSpacerID = "bottom-context-spacer"
-
     let messages: [ThunderCommMessage]
     let localSender: String
     let activeIndicators: [ThunderCommActivityIndicator]
@@ -44,10 +41,6 @@ struct MessageListView: View {
                             .padding(.top, 4)
                             .id("typing-indicators")
                     }
-
-                    Color.clear
-                        .frame(height: Self.bottomContextPadding)
-                        .id(Self.bottomContextSpacerID)
                 }
                 .padding(.vertical, 4)
             }
@@ -69,8 +62,21 @@ struct MessageListView: View {
     }
 
     private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        if let lastPreview = streamingPreviews.last {
+            let action = {
+                proxy.scrollTo("stream-\(lastPreview.id)-\(lastPreview.updatedAt)", anchor: .bottom)
+            }
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) { action() }
+            } else {
+                action()
+            }
+            return
+        }
+
+        guard let lastID = messages.last?.id else { return }
         let action = {
-            proxy.scrollTo(Self.bottomContextSpacerID, anchor: .bottom)
+            proxy.scrollTo(lastID, anchor: .bottom)
         }
         if animated {
             withAnimation(.easeOut(duration: 0.2)) {
@@ -88,10 +94,13 @@ private struct TypingIndicatorsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(indicators) { indicator in
-                Text("\(indicator.displayName)...")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(color(for: indicator.id, senderType: indicator.senderType))
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 8) {
+                    Text(indicator.displayName)
+                        .font(.caption.weight(.semibold))
+                    ThinkingDotsView(color: color(for: indicator.id, senderType: indicator.senderType))
+                }
+                .foregroundStyle(color(for: indicator.id, senderType: indicator.senderType))
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -109,6 +118,33 @@ private struct TypingIndicatorsView: View {
             return senderType == .agent
                 ? Color(red: 0.80, green: 0.84, blue: 0.92)
                 : Color(red: 0.72, green: 0.72, blue: 0.80)
+        }
+    }
+}
+
+private struct ThinkingDotsView: View {
+    let color: Color
+
+    @State private var phase = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<3, id: \.self) { index in
+                Circle()
+                    .fill(color)
+                    .frame(width: 6, height: 6)
+                    .scaleEffect(phase ? 1.0 : 0.55)
+                    .opacity(phase ? 1.0 : 0.35)
+                    .animation(
+                        .easeInOut(duration: 0.6)
+                            .repeatForever()
+                            .delay(Double(index) * 0.16),
+                        value: phase
+                    )
+            }
+        }
+        .onAppear {
+            phase = true
         }
     }
 }

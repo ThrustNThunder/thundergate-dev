@@ -5,6 +5,7 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var store = ThunderCommStore()
     @State private var draft = ""
+    @State private var composerResetID = UUID()
     @State private var showingConnectionSettings = false
     @State private var showingOnlinePeers = false
     @State private var endpointDraft = ""
@@ -39,7 +40,9 @@ struct ContentView: View {
                 guard !trimmed.isEmpty else { return }
                 store.sendDraft(&draft)
                 draft = ""
+                composerResetID = UUID()
             }
+            .id(composerResetID)
         }
         .padding()
         .task {
@@ -125,6 +128,15 @@ struct ContentView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
+                            Spacer()
+                            HStack(spacing: 6) {
+                                Text(store.roleLabel(forParticipantID: participantID))
+                                if let model = store.modelForParticipantID(participantID) {
+                                    Text(model)
+                                }
+                            }
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
                         }
                     }
                 }

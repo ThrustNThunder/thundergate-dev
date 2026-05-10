@@ -160,6 +160,11 @@ import Observation
         func sendDraft(_ draft: inout String) {
             let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
+
+            if let inferredAgentId = inferDirectAgentIDIfNeeded(for: trimmed) {
+                setRoute(.direct, agentId: inferredAgentId)
+            }
+
             let message = ThunderCommMessage(
                 id: UUID().uuidString,
                 channel: outboundChannel,
@@ -444,8 +449,27 @@ import Observation
             return ThunderCommParticipantIdentity.displayName(sender: nil, agentId: participantID, participantId: participantID, senderType: senderType(forParticipantID: participantID))
         }
 
+        func roleLabel(forParticipantID participantID: String) -> String {
+            senderType(forParticipantID: participantID) == .agent ? "agent" : "human"
+        }
+
+        func modelForParticipantID(_ participantID: String) -> String? {
+            guard senderType(forParticipantID: participantID) == .agent else { return nil }
+            let trimmed = rosterByParticipantID[participantID]?.model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
         func senderType(forParticipantID participantID: String) -> ThunderCommSenderType {
-            ThunderCommParticipantIdentity.senderType(sender: nil, agentId: participantID, participantId: participantID, explicitRawValue: nil)
+            let rosterRole = rosterByParticipantID[participantID]?.role?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if rosterRole == "agent" {
+                return .agent
+            }
+            if rosterRole == "human" {
+                return .human
+            }
+            return ThunderCommParticipantIdentity.senderType(sender: nil, agentId: participantID, participantId: participantID, explicitRawValue: nil)
         }
 
         func statusForParticipantID(_ participantID: String) -> ThunderCommPresenceStatus {
@@ -587,6 +611,32 @@ import Observation
             streamByParticipantID.removeValue(forKey: participantID)
             refreshIndicators()
             refreshStreamingPreviews()
+        }
+
+        private func inferDirectAgentIDIfNeeded(for text: String) -> String? {
+            guard currentRoute == .tnt else { return nil }
+            guard outboundAgentId == nil else { return nil }
+
+            let normalizedTokens = Set(
+                text.lowercased()
+                    .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                    .filter { !$0.isEmpty }
+            )
+            if availableDirectAgents.contains(where: { normalizedTokens.contains($0.lowercased()) }) {
+                return nil
+            }
+
+            guard let priorMessage = messages.last else { return nil }
+            guard priorMessage.senderType == .agent else { return nil }
+
+            let participantID = ThunderCommParticipantIdentity.canonicalID(
+                sender: priorMessage.sender,
+                agentId: priorMessage.agentId,
+                participantId: priorMessage.originPeer,
+                senderType: priorMessage.senderType
+            )
+            guard availableDirectAgents.contains(participantID) else { return nil }
+            return participantID
         }
 
         private func loadPersistedMessages() {
