@@ -110,10 +110,20 @@ export class ThunderGateRuntime {
       }));
     }
     // Channel startup is non-fatal — bridge.mjs may already hold port 8765
+    // in parallel-deployment mode. Surface the reason so `thundergate doctor`
+    // output explains why ThunderCommo shows ❌ instead of silently swallowing it.
     try {
       await this.channels.startAll();
     } catch (err) {
-      console.warn('  ⚠ Channel startup error (non-fatal):', (err as Error).message);
+      const msg = (err as Error).message;
+      const isPortConflict = /EADDRINUSE|address already in use/i.test(msg);
+      if (isPortConflict) {
+        console.log(
+          '  ℹ ThunderCommo channel deferred (bridge.mjs owns port 8765 — this is expected in parallel mode)'
+        );
+      } else {
+        console.warn('  ⚠ Channel startup error (non-fatal):', msg);
+      }
     }
 
     // Phase 3: start Ghost harness if configured. Failure is non-fatal.
@@ -176,7 +186,8 @@ export class ThunderGateRuntime {
   /**
    * Ghost shadow path. Same processMessage pipeline as the live one but
    * the result never reaches a channel — it is returned to the harness
-   * to be logged.
+   * to be logged. `ghost: true` keeps shadow traffic out of the session
+   * DB (no parent session row exists for it, so FK writes would fail).
    */
   private async shadowResponse(input: string): Promise<string> {
     const message: Message = {
@@ -184,7 +195,8 @@ export class ThunderGateRuntime {
       channel: 'ghost',
       content: input,
       sender: 'openclaw-shadow',
-      timestamp: new Date()
+      timestamp: new Date(),
+      ghost: true
     };
     const response = await this.processMessage(message);
     return response?.content ?? '';
@@ -228,8 +240,17 @@ export class ThunderGateRuntime {
     const text = await this.callLLM([{ role: 'user', content: message.content }]);
     const response: Response = { content: text, type: 'normal' };
 
-    // Trigger engine: backstop check on each turn
-    await this.learning.onTurn(message.content, response.content);
+    // Trigger engine: backstop check on each turn. Skip for ghost shadow
+    // traffic — those messages have no real session row in the DB, so the
+    // FK-constrained insert would throw. The JSONL ghost log is the truth
+    // seam for shadow runs.
+    if (!message.ghost) {
+      try {
+        await this.learning.onTurn(message.content, response.content);
+      } catch (err) {
+        console.warn('  ⚠ learning.onTurn skipped:', (err as Error).message);
+      }
+    }
 
     return response;
   }
@@ -444,6 +465,9 @@ interface Message {
   content: string;
   sender: string;
   timestamp: Date;
+  // Marks a shadow/Ghost Jon message. Shadow traffic must not touch the
+  // session DB — there is no parent session row to satisfy the FK.
+  ghost?: boolean;
 }
 
 interface Response {

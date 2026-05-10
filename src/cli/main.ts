@@ -11,7 +11,7 @@
  */
 
 import { Command } from 'commander';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, createReadStream, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, createReadStream, readdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
@@ -206,7 +206,23 @@ ghost
       ? (cfg.openaiApiKey ? '✅ OpenAI key present' : '❌ OpenAI key missing')
       : (cfg.anthropicApiKey ? '✅ Anthropic key present' : '❌ Anthropic key missing');
     console.log(`  Provider auth:     ${provider}`);
+    // Watches the *whole* sessions directory, not a single legacy file. Show
+    // the dir plus the count of active *.jsonl sessions so operators can
+    // confirm the harness is attached to everything OpenClaw is writing.
     console.log(`  Sessions dir:      ${cfg.ghost.sessions_dir}`);
+    let watchedCount: number | null = null;
+    try {
+      if (existsSync(cfg.ghost.sessions_dir)) {
+        watchedCount = readdirSync(cfg.ghost.sessions_dir).filter((f) =>
+          f.endsWith('.jsonl')
+        ).length;
+      }
+    } catch {
+      watchedCount = null;
+    }
+    console.log(
+      `  Watching:          ${watchedCount === null ? '(dir unavailable)' : `${watchedCount} session file(s)`}`
+    );
     console.log(`  Watch interval:    ${cfg.ghost.watch_interval_ms}ms (poll)`);
     console.log(`  Log file:          ${cfg.ghost.log_file}`);
     if (existsSync(cfg.ghost.log_file)) {

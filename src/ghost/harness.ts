@@ -240,7 +240,9 @@ export class GhostHarness {
           console.warn('  ⚠ Ghost ThunderGate response failed:', (err as Error).message);
         });
       } else if (parsed.role === 'assistant' && session.pendingInput) {
-        this.pairWithOpenClaw(session, parsed.text);
+        this.pairWithOpenClaw(session, parsed.text).catch((err) => {
+          console.error('  ✗ Ghost pair error:', err);
+        });
       }
       // Skip system and tool messages — those are not human input.
     }
@@ -263,18 +265,34 @@ export class GhostHarness {
     this.tgResponses.set(this.keyFor(sessionId, input, ts), { response, latency_ms });
   }
 
-  private pairWithOpenClaw(session: SessionState, openclawResponse: string): void {
+  /**
+   * Pair OpenClaw's response with ThunderGate's shadow response. The LLM
+   * call is async and can outlast OpenClaw's reply (Haiku currently ~2-3s,
+   * but tail can be longer). If the shadow response hasn't landed yet,
+   * poll for up to 30s before giving up. Doctor must tell the truth — a
+   * `[ghost: not yet ready]` after waiting is honest; a premature one
+   * masks working pairs as failures and tanks the match rate.
+   */
+  private async pairWithOpenClaw(
+    session: SessionState,
+    openclawResponse: string
+  ): Promise<void> {
     const pending = session.pendingInput;
     if (!pending) return;
     session.pendingInput = null;
 
     const key = this.keyFor(session.sessionId, pending.text, pending.ts);
-    const tg = this.tgResponses.get(key);
+
+    const maxWaitMs = 30_000;
+    const pollMs = 100;
+    const deadline = Date.now() + maxWaitMs;
+    let tg = this.tgResponses.get(key);
+    while (!tg && Date.now() < deadline) {
+      await sleep(pollMs);
+      tg = this.tgResponses.get(key);
+    }
     this.tgResponses.delete(key);
 
-    // If TG hasn't completed yet, log what we have and mark latency=-1
-    // so the evaluator can see the slowness rather than us silently
-    // dropping the pair. Doctor must tell the truth.
     const entry: GhostEntry = {
       timestamp: Date.now(),
       session_id: session.sessionId,
@@ -305,6 +323,10 @@ export class GhostHarness {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * OpenClaw session lines come in a few shapes. Be liberal in what we
