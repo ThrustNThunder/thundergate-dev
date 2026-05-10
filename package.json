@@ -11,5 +11,9 @@
     "test": "jest"
   },
   "author": "ThunderAI",
-  "license": "PROPRIETARY"
+  "license": "PROPRIETARY",
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "commander": "^14.0.3"
+  }
 }
