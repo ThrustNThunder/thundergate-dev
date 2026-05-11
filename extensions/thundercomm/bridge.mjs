@@ -472,9 +472,14 @@ wss.on('connection', (ws, req) => {
         return;
 
       case 'subscribe': {
-        // Send recent history
-        const history = loadHistory(30);
-        ws.send(JSON.stringify({ type: 'history', messages: history, hasMore: false }));
+        // If client sends afterTimestamp, only deliver messages newer than that.
+        // This prevents replay storms on reconnect / force-quit relaunch.
+        const afterTs = msg.afterTimestamp ? Number(msg.afterTimestamp) : 0;
+        const history = loadHistory(50);
+        const filtered = afterTs > 0
+          ? history.filter(m => (m.timestamp || 0) > afterTs)
+          : history.slice(-30); // fresh launch: last 30 messages only
+        ws.send(JSON.stringify({ type: 'history', messages: filtered, hasMore: false }));
         ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.lastMessageId || 'init', messageId: 'history-sent' }));
         break;
       }
