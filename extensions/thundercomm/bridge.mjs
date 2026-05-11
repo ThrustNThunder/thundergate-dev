@@ -521,11 +521,10 @@ wss.on('connection', (ws, req) => {
         
         // Direct message to Jon — dispatch immediately, no mention required
         if (channel === 'direct' && (!msg.agentId || msg.agentId === AGENT_ID_SELF)) {
-          broadcast({ type: 'thinking', agentId: AGENT_ID });
-          try {
-            await dispatchToAgent(text);
-          } catch (e) { /* error already broadcast */ }
+          // Ack immediately before dispatching
           ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.idempotencyKey, messageId: randomUUID() }));
+          broadcast({ type: 'thinking', agentId: AGENT_ID });
+          dispatchToAgent(text).catch(() => { /* error already broadcast */ });
           break;
         }
 
@@ -566,16 +565,14 @@ wss.on('connection', (ws, req) => {
           }
         }
         
-        try {
-          await dispatchToAgent(text);
-          ws.send(JSON.stringify({
-            type: 'ack',
-            idempotencyKey: msg.idempotencyKey,
-            messageId: randomUUID(),
-          }));
-        } catch (e) {
-          // Error already broadcast above
-        }
+        // Ack immediately — iOS ack means "received", not "agent replied".
+        // Dispatch async so the ack is never delayed by gateway processing time.
+        ws.send(JSON.stringify({
+          type: 'ack',
+          idempotencyKey: msg.idempotencyKey,
+          messageId: randomUUID(),
+        }));
+        dispatchToAgent(text).catch(() => { /* error already broadcast */ });
         break;
       }
       
