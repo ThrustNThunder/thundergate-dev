@@ -85,6 +85,7 @@ const federationPeers = new Set(); // track online federation peers
 let transcriptPath = null;
 let transcriptSize  = 0;
 let lastMessageId   = null;
+let lastDispatchChannel = 'tnt'; // track which channel triggered the last dispatch — used for reply routing
 
 // Optimistic gateway health — flipped to false on chat.send failure, back to true on
 // the next success. Drives "online" status for OPENCLAW_AGENTS in the roster.
@@ -241,7 +242,9 @@ function broadcastAgentMessage(id, text, timestamp) {
     recentlyBroadcast.delete(firstId);
   }
   
-  console.log(`[Bridge] Broadcasting agent message: ${text.slice(0, 60)}…`);
+  // Reply on the same channel that triggered the dispatch (DM vs #tnt)
+  const replyChannel = lastDispatchChannel || 'tnt';
+  console.log(`[Bridge] Broadcasting agent message on ${replyChannel}: ${text.slice(0, 60)}…`);
   const msgTimestamp = timestamp || Date.now();
   
   // Broadcast to local web clients
@@ -249,16 +252,16 @@ function broadcastAgentMessage(id, text, timestamp) {
     type: 'message',
     id,
     agentId: AGENT_ID,
-    channel: 'tnt',
+    channel: replyChannel,
     text,
     timestamp: msgTimestamp,
   });
   
-  // Also send to federation relay so other agents can see Jon's responses
+  // Federation relay — use tnt for channel messages, direct channel for DMs
   if (federationWs && federationWs.readyState === WebSocket.OPEN) {
     federationWs.send(JSON.stringify({
       type: 'federation_message',
-      channel: 'tnt',
+      channel: replyChannel,
       text,
       sender: 'Jon',
       senderType: 'agent',
@@ -521,6 +524,8 @@ wss.on('connection', (ws, req) => {
         
         // Direct message to Jon — dispatch immediately, no mention required
         if (channel === 'direct' && (!msg.agentId || msg.agentId === AGENT_ID_SELF)) {
+          // Track channel so reply routes back to the DM thread
+          lastDispatchChannel = `direct:${AGENT_ID}`;
           // Ack immediately before dispatching
           ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.idempotencyKey, messageId: randomUUID() }));
           broadcast({ type: 'thinking', agentId: AGENT_ID });
@@ -565,6 +570,8 @@ wss.on('connection', (ws, req) => {
           }
         }
         
+        // Track channel so reply routes back to #tnt
+        lastDispatchChannel = 'tnt';
         // Ack immediately — iOS ack means "received", not "agent replied".
         // Dispatch async so the ack is never delayed by gateway processing time.
         ws.send(JSON.stringify({
