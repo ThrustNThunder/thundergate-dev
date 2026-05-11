@@ -168,6 +168,11 @@ export class GhostHarness {
 
     for (const name of entries) {
       if (!name.endsWith('.jsonl')) continue;
+      // Skip synthetic pressure-test sessions — they carry no real OpenClaw
+      // counterpart so their fuzzy-match rate is always 0 and would tank
+      // the daily score (and the 7-day clean clock) for whatever day the
+      // test ran.
+      if (name.startsWith('ghost-test-')) continue;
       const path = join(this.sessionsDir, name);
       if (this.sessions.has(path)) continue;
 

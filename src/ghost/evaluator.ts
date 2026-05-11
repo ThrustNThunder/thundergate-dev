@@ -77,6 +77,10 @@ export class GhostEvaluator {
     const entries = await this.readEntries();
     const byDay = new Map<string, GhostEntry[]>();
     for (const e of entries) {
+      // Pressure-test sessions are synthetic — they have no real OpenClaw
+      // reply to compare against, so they always score match=0. Exclude
+      // them from daily scoring or they corrupt the 7-day clean clock.
+      if (typeof e.session_id === 'string' && e.session_id.startsWith('ghost-test-')) continue;
       const d = isoDate(e.timestamp);
       if (!byDay.has(d)) byDay.set(d, []);
       byDay.get(d)!.push(e);
