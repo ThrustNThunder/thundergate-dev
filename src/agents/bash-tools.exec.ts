@@ -1289,10 +1289,22 @@ export function createExecTool(
     120_000,
   );
   const allowBackground = defaults?.allowBackground ?? true;
+  // Fork change (ThunderBase): raise the default exec timeout so long-running
+  // commands launched without an explicit timeout (e.g. `nohup setsid claude
+  // … &` triggered from a Slack message) survive the agent turn. Upstream
+  // ships 1800s; we default to 24h here. The runtime can still pin a smaller
+  // value via OPENCLAW_EXEC_DEFAULT_TIMEOUT_SEC env or the per-tool config.
+  // Note: this only governs the *default*. Process-group SIGKILL on explicit
+  // timeout/cancel still applies — agents that need a process to survive
+  // beyond the turn should detach via `setsid` (not just `nohup &`) so the
+  // child escapes the supervised process group.
+  const envExecDefaultTimeoutSec = readEnvInt("OPENCLAW_EXEC_DEFAULT_TIMEOUT_SEC");
   const defaultTimeoutSec =
     typeof defaults?.timeoutSec === "number" && defaults.timeoutSec > 0
       ? defaults.timeoutSec
-      : 1800;
+      : typeof envExecDefaultTimeoutSec === "number" && envExecDefaultTimeoutSec > 0
+        ? envExecDefaultTimeoutSec
+        : 86400;
   const defaultPathPrepend = normalizePathPrepend(defaults?.pathPrepend);
   const {
     safeBins,
