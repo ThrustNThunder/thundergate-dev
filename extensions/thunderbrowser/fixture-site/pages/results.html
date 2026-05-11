@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>AA — Results (fixture)</title>
+<link rel="stylesheet" href="/pages/_shared.css">
+</head>
+<body data-aa-state="aa.results">
+<header class="aa-bar">
+  <div class="brand">AA Fixture Portal</div>
+  <nav>
+    <a href="/dashboard">Dashboard</a>
+    <a href="/travel-planner">Travel Planner</a>
+    <a href="/results">Results</a>
+    <a href="/">Sign out</a>
+  </nav>
+</header>
+<div class="state-strip">State: aa.results</div>
+<main>
+  <h1>DFW → LAX · Jun 15</h1>
+  <div data-aa-list="fares">
+    <div class="fare-card" data-aa-fare="basic">
+      <div>
+        <div><strong>AA 1422</strong> · 7:15a → 8:39a · Nonstop</div>
+        <div style="color:#7b7d82; font-size:12px;">Basic Economy · 25k miles</div>
+      </div>
+      <div style="text-align:right;">
+        <div class="price">$298</div>
+        <button type="button" data-aa-action="select-fare" onclick="location.href='/confirm'">Select fare</button>
+      </div>
+    </div>
+    <div class="fare-card" data-aa-fare="main">
+      <div>
+        <div><strong>AA 1488</strong> · 11:05a → 12:30p · Nonstop</div>
+        <div style="color:#7b7d82; font-size:12px;">Main Cabin · 30k miles</div>
+      </div>
+      <div style="text-align:right;">
+        <div class="price">$348</div>
+        <button type="button" data-aa-action="select-fare" onclick="location.href='/confirm'">Select fare</button>
+      </div>
+    </div>
+    <div class="fare-card" data-aa-fare="first">
+      <div>
+        <div><strong>AA 2200</strong> · 3:40p → 5:08p · Nonstop</div>
+        <div style="color:#7b7d82; font-size:12px;">First · 65k miles</div>
+      </div>
+      <div style="text-align:right;">
+        <div class="price">$812</div>
+        <button type="button" data-aa-action="select-fare" onclick="location.href='/confirm'">Select fare</button>
+      </div>
+    </div>
+  </div>
+</main>
+<footer>Fixture site — not real AA.</footer>
+</body>
+</html>

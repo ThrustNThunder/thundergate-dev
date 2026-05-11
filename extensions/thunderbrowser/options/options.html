@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ThunderBrowser — Options</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #1a1d21;
+      color: #d1d2d3;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 0 24px;
+    }
+    h1 { font-size: 18px; margin: 0 0 20px 0; }
+    section { margin-bottom: 28px; }
+    h2 {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #7b7d82;
+      margin: 0 0 10px 0;
+    }
+    .row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; font-size: 13px; }
+    code { background: #27242c; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+    .placeholder {
+      padding: 14px 16px;
+      border: 1px dashed #3a3640;
+      border-radius: 6px;
+      color: #7b7d82;
+      font-size: 13px;
+    }
+    .card {
+      padding: 16px;
+      border: 1px solid #2a2d31;
+      border-radius: 8px;
+      background: #1d2024;
+      font-size: 13px;
+    }
+    button {
+      background: #2bac76;
+      color: #0c0f12;
+      border: 0;
+      padding: 8px 14px;
+      border-radius: 4px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover { filter: brightness(1.05); }
+    button.secondary { background: #3a3640; color: #d1d2d3; }
+    .pairing-grid { display: grid; grid-template-columns: 220px 1fr; gap: 18px; align-items: start; }
+    .qr-host {
+      width: 220px; height: 220px;
+      background: #ffffff; border-radius: 4px;
+      display: flex; align-items: center; justify-content: center;
+      color: #7b7d82; font-size: 12px;
+    }
+    .qr-host svg { display: block; max-width: 100%; height: auto; }
+    .pair-code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 24px;
+      letter-spacing: 0.08em;
+      color: #d1d2d3;
+      background: #27242c;
+      padding: 8px 12px;
+      border-radius: 4px;
+      display: inline-block;
+      margin: 8px 0;
+    }
+    .paired-pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 4px 10px; border-radius: 999px;
+      background: #1b2e25; color: #2bac76;
+      font-size: 12px; font-weight: 500;
+    }
+    .label { color: #7b7d82; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .kv { margin: 6px 0; font-size: 13px; }
+    .kv code { display: inline-block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+    .muted { color: #7b7d82; }
+    .actions { margin-top: 12px; display: flex; gap: 8px; }
+  </style>
+</head>
+<body>
+  <h1>ThunderBrowser Options</h1>
+
+  <section>
+    <h2>Pairing</h2>
+    <div id="pairing" class="card">
+      <div id="pairing-idle">
+        <div class="muted" style="margin-bottom: 10px;">
+          Generate a one-time pairing code to bind this extension to a ThunderGate instance.
+          The device key fingerprint identifies this browser; the 6-digit code expires in 5
+          minutes.
+        </div>
+        <div class="actions">
+          <button id="btn-pair">Pair with ThunderGate</button>
+        </div>
+      </div>
+
+      <div id="pairing-pending" style="display:none;">
+        <div class="pairing-grid">
+          <div class="qr-host" id="qr-host">Generating QR…</div>
+          <div>
+            <div class="label">Pairing code</div>
+            <div class="pair-code" id="pair-code">—</div>
+            <div class="kv"><span class="muted">Extension ID:</span> <code id="ext-id">—</code></div>
+            <div class="kv"><span class="muted">Device fingerprint:</span> <code id="dev-fp">—</code></div>
+            <div class="kv"><span class="muted">Started:</span> <span id="pair-started">—</span></div>
+            <div class="actions">
+              <button id="btn-cancel" class="secondary">Cancel</button>
+              <button id="btn-simulate" class="secondary" title="Dev-only: mark as paired without a live mock TG">Simulate confirm (dev)</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="pairing-paired" style="display:none;">
+        <span class="paired-pill">Paired ✓</span>
+        <div class="kv" style="margin-top: 12px;"><span class="muted">Endpoint:</span> <code id="paired-endpoint">—</code></div>
+        <div class="kv"><span class="muted">Device fingerprint:</span> <code id="paired-fp">—</code></div>
+        <div class="kv"><span class="muted">Paired at:</span> <span id="paired-at">—</span></div>
+        <div class="actions">
+          <button id="btn-unpair" class="secondary">Unpair (dev)</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Device Key</h2>
+    <div id="device-key" class="placeholder">
+      Phase 0 scaffold. Device keypair generation lands in TB-0-7.
+    </div>
+  </section>
+
+  <section>
+    <h2>Storage</h2>
+    <div id="storage" class="placeholder">
+      Loading...
+    </div>
+  </section>
+
+  <script src="options.js" type="module"></script>
+</body>
+</html>

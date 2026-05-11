@@ -20,8 +20,9 @@ import { Config, loadConfig } from '../config/loader.js';
 import { ensureConfig } from '../config/index.js';
 import { ChannelRegistry, type ContextEntry, type OutboundDelivery } from '../channels/index.js';
 import { ThunderCommoChannel, newMessageId } from '../channels/thundercommo.js';
+import { BrowserBridgeChannel } from '../channels/browser.js';
 import { GhostHarness } from '../ghost/harness.js';
-import { randomUUID } from 'crypto';
+import { getGhostSystemPrompt, setGhostContextDB } from '../ghost/context.js';
 
 // Runtime state
 interface RuntimeState {
@@ -84,6 +85,11 @@ export class ThunderGateRuntime {
     // Initialize session database
     this.db = new SessionDB(this.config.database.path);
     await this.db.initialize();
+    // Wire the DB into the Ghost context loader so recent memories
+    // (corrections, preferences, facts written by the learning loop)
+    // land in the next shadow turn's system prompt. Without this the
+    // learning loop is write-only.
+    setGhostContextDB(this.db);
     console.log('  ✓ Session database initialized');
 
     // Load checkpoint (hybrid adaptive)
@@ -109,18 +115,40 @@ export class ThunderGateRuntime {
         onInbound: (entry) => this.handleChannelInbound(entry)
       }));
     }
+    // TB-0-6: ThunderBrowser bridge. Runs on its own port (default 9876)
+    // and only talks to the extension SW — runtime-level integration with
+    // an action executor lands in TB-1-3+ once the inbound `cmd_result`
+    // path is plumbed back into a request/response map.
+    if (this.config.channels.browser?.enabled) {
+      const b = this.config.channels.browser;
+      const opts: Record<string, unknown> = {
+        port: b.port ?? 9876,
+        maxQueuePerClient: b.max_queue_per_client ?? 256,
+        acceptUnverifiedPairing: b.accept_unverified_pairing ?? true
+      };
+      if (b.audit_file) opts.auditFile = b.audit_file;
+      this.channels.register(new BrowserBridgeChannel(
+        {
+          config: this.config,
+          db: this.db,
+          contextFile: this.config.runtime.context_file,
+          onInbound: (entry) => this.handleChannelInbound(entry)
+        },
+        opts
+      ));
+    }
     // Channel startup is non-fatal — bridge.mjs may already hold port 8765
     // in parallel-deployment mode. Surface the reason so `thundergate doctor`
-    // output explains why ThunderCommo shows ❌ instead of silently swallowing it.
+    // output explains why the channel shows ❌ instead of silently swallowing
+    // it. Per-channel failures are isolated by ChannelRegistry.startAll() so
+    // a port conflict on one channel doesn't block the others.
     try {
       await this.channels.startAll();
     } catch (err) {
       const msg = (err as Error).message;
       const isPortConflict = /EADDRINUSE|address already in use/i.test(msg);
       if (isPortConflict) {
-        console.log(
-          '  ℹ ThunderCommo channel deferred (bridge.mjs owns port 8765 — this is expected in parallel mode)'
-        );
+        console.log(`  ℹ Channel startup deferred: ${msg} (parallel-deployment mode)`);
       } else {
         console.warn('  ⚠ Channel startup error (non-fatal):', msg);
       }
@@ -184,22 +212,98 @@ export class ThunderGateRuntime {
   }
 
   /**
-   * Ghost shadow path. Same processMessage pipeline as the live one but
-   * the result never reaches a channel — it is returned to the harness
-   * to be logged. `ghost: true` keeps shadow traffic out of the session
-   * DB (no parent session row exists for it, so FK writes would fail).
+   * Ghost shadow path. Routes around the live `callLLM` so cache discipline
+   * and identity-framing for Ghost can evolve independently of the primary
+   * runtime — mixing the two regressed Ghost previously (no system prompt,
+   * stock-Haiku behavior, 0% match rate).
+   *
+   * Pipeline:
+   *   1. Pull Ghost's assembled system prompt from `ghost/context.ts`
+   *      (SOUL + USER + IDENTITY + GHOST_ADDENDUM, hot-reloaded on file change).
+   *   2. Call Anthropic Messages with the system block marked
+   *      `cache_control: { type: "ephemeral" }` so the ~15K-token frame
+   *      is amortized across the day's shadow calls. Only the current
+   *      user input goes in the messages array — no prior turns, no
+   *      runtime context leakage.
+   *   3. Return the text response to the harness for logging. We never
+   *      deliver this to a channel and never write it to the session DB.
    */
   private async shadowResponse(input: string): Promise<string> {
-    const message: Message = {
-      id: randomUUID(),
-      channel: 'ghost',
-      content: input,
-      sender: 'openclaw-shadow',
-      timestamp: new Date(),
-      ghost: true
+    const system = getGhostSystemPrompt();
+    return this.callGhostLLM(system, input);
+  }
+
+  /**
+   * Anthropic-only LLM path used exclusively by Ghost Jon. Kept separate
+   * from `callLLM` so:
+   *   - Cache discipline on the system block stays clean (one static
+   *     block, ephemeral cache_control, no interleaved per-call context).
+   *   - Tweaks to the live runtime's prompt assembly can't silently
+   *     regress shadow scoring, and vice versa.
+   *
+   * Returns an empty string on transport failure rather than throwing —
+   * the harness logs absent responses as `[ghost: not yet ready]` and
+   * Doctor surfaces that as an error-rate signal.
+   */
+  private async callGhostLLM(system: string, userInput: string): Promise<string> {
+    const model = this.config.ghost.model;
+    const maxTokens = this.config.ghost.maxTokens;
+    const temperature = this.config.ghost.temperature;
+
+    if (!(model.startsWith('anthropic/') || model.startsWith('claude-'))) {
+      // Ghost path is Anthropic-only — caching semantics differ per provider
+      // and the brief locks Ghost on Haiku 4.5. Fall back to the shared
+      // path for any non-Anthropic override so config typos don't 500.
+      return this.callLLM([
+        { role: 'system', content: system },
+        { role: 'user', content: userInput }
+      ]);
+    }
+
+    const apiKey = this.config.anthropicApiKey;
+    if (!apiKey) {
+      console.warn('  ⚠ callGhostLLM: anthropicApiKey not set');
+      return '';
+    }
+    const anthropicModel = model.replace(/^anthropic\//, '');
+
+    const body = {
+      model: anthropicModel,
+      max_tokens: maxTokens,
+      temperature,
+      system: [
+        {
+          type: 'text',
+          text: system,
+          cache_control: { type: 'ephemeral' }
+        }
+      ],
+      messages: [{ role: 'user', content: userInput }]
     };
-    const response = await this.processMessage(message);
-    return response?.content ?? '';
+
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        console.warn(`  ⚠ Ghost LLM ${response.status}: ${await response.text()}`);
+        return '';
+      }
+      const data: any = await response.json();
+      const block = Array.isArray(data.content)
+        ? data.content.find((b: any) => b?.type === 'text')
+        : null;
+      return block?.text ?? '';
+    } catch (err) {
+      console.warn('  ⚠ Ghost LLM transport error:', (err as Error).message);
+      return '';
+    }
   }
 
   /**
@@ -440,6 +544,10 @@ export class ThunderGateRuntime {
     // Stop channels — drain client connections.
     try { await this.channels.stopAll(); } catch { /* ignore */ }
     console.log('  ✓ Channels stopped');
+
+    // Detach the DB from the Ghost context loader so a future restart
+    // doesn't see a stale handle.
+    try { setGhostContextDB(null); } catch { /* ignore */ }
 
     // Save checkpoint before stopping
     await this.saveCheckpoint();

@@ -33,6 +33,12 @@ import {
 import { basename, dirname, join } from 'path';
 import { createInterface } from 'readline';
 import type { Config } from '../config/loader.js';
+import {
+  compareResponses,
+  voyageEmbedder,
+  type EmbeddingFn,
+  type MatchResult
+} from './compare.js';
 
 export interface GhostEntry {
   timestamp: number;
@@ -41,6 +47,14 @@ export interface GhostEntry {
   openclaw_response: string | null;
   thundergate_response: string;
   match: boolean;
+  /**
+   * Tiered comparator score (0..1). `match` is `score >= 0.75`. Older
+   * log lines pre-dating the tiered metric won't have this field; the
+   * evaluator falls back to the binary `match` value when it's absent.
+   */
+  score?: number;
+  /** Which tier produced the verdict — useful for doctor diagnostics. */
+  match_tier?: 1 | 2 | 3;
   latency_ms: number;
 }
 
@@ -74,6 +88,8 @@ export class GhostHarness {
   private startedAt: number | null = null;
   private lastError: string | null = null;
   private tgResponses = new Map<string, { response: string; latency_ms: number }>();
+  private embed: EmbeddingFn | undefined;
+  private embeddingSkipLogged = false;
 
   constructor(config: Config, respond: GhostResponder) {
     this.config = config;
@@ -81,6 +97,12 @@ export class GhostHarness {
     this.watchIntervalMs = config.ghost.watch_interval_ms;
     this.logFile = config.ghost.log_file;
     this.respond = respond;
+    // Tier-3 of the comparator hits Voyage's embeddings endpoint. If no
+    // key is configured the comparator silently degrades to tier-2 and
+    // tags the entry so doctor can see we skipped.
+    if (config.voyageApiKey && config.voyageApiKey.length > 0) {
+      this.embed = voyageEmbedder(config.voyageApiKey);
+    }
   }
 
   async start(): Promise<void> {
@@ -298,13 +320,34 @@ export class GhostHarness {
     }
     this.tgResponses.delete(key);
 
+    let comparison: MatchResult | null = null;
+    if (tg) {
+      try {
+        comparison = await compareResponses(openclawResponse, tg.response, this.embed);
+      } catch (err) {
+        this.lastError = `compare failed: ${(err as Error).message}`;
+        comparison = null;
+      }
+      if (
+        comparison &&
+        comparison.embedding_skipped === 'no_key' &&
+        !this.embeddingSkipLogged
+      ) {
+        // One-shot info log per process — don't spam stdout for every pair.
+        console.log('  ℹ Ghost: voyageApiKey not set; tier-3 cosine skipped, using tier-1/2 only.');
+        this.embeddingSkipLogged = true;
+      }
+    }
+
     const entry: GhostEntry = {
       timestamp: Date.now(),
       session_id: session.sessionId,
       input: pending.text,
       openclaw_response: openclawResponse,
       thundergate_response: tg?.response ?? '[ghost: not yet ready]',
-      match: tg ? fuzzyMatch(openclawResponse, tg.response) : false,
+      match: comparison ? comparison.match : false,
+      score: comparison ? comparison.score : 0,
+      match_tier: comparison ? comparison.tier : undefined,
       latency_ms: tg?.latency_ms ?? -1
     };
 
@@ -404,25 +447,3 @@ function parseLine(line: string): ParsedOpenclawLine | null {
   return null;
 }
 
-/**
- * Cheap heuristic — true if the two responses share enough lowercase
- * tokens to plausibly agree. Real evaluation happens in evaluator.ts.
- */
-function fuzzyMatch(a: string, b: string): boolean {
-  if (!a || !b) return false;
-  const norm = (s: string) =>
-    new Set(
-      s
-        .toLowerCase()
-        .replace(/[^a-z0-9 ]+/g, ' ')
-        .split(/\s+/)
-        .filter((w) => w.length >= 4)
-    );
-  const sa = norm(a);
-  const sb = norm(b);
-  if (sa.size === 0 || sb.size === 0) return false;
-  let overlap = 0;
-  for (const tok of sa) if (sb.has(tok)) overlap++;
-  const union = sa.size + sb.size - overlap;
-  return union > 0 && overlap / union >= 0.3;
-}

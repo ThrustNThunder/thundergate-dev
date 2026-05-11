@@ -42,6 +42,10 @@ export interface Config {
   // Phase 4: provider credentials. Populated from env or OpenClaw auth.
   openaiApiKey?: string;
   anthropicApiKey?: string;
+  // Voyage AI embeddings (now part of Anthropic). Used by Ghost Jon's
+  // tier-3 semantic comparator. If absent, the comparator falls back to
+  // its tier-1/tier-2 scores and logs the skip — it never blocks pairing.
+  voyageApiKey?: string;
 
   // Model routing
   model: {
@@ -89,6 +93,13 @@ export interface Config {
       port?: number;
       relay_url?: string;
       tokens?: Record<string, string>;
+    };
+    browser: {
+      enabled: boolean;
+      port?: number;
+      audit_file?: string;
+      max_queue_per_client?: number;
+      accept_unverified_pairing?: boolean;
     };
     slack: { enabled: boolean; token?: string; };
     whatsapp: { enabled: boolean; };
@@ -144,6 +155,7 @@ const DEFAULT_CONFIG: Config = {
 
   openaiApiKey: process.env.OPENAI_API_KEY ?? '',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
+  voyageApiKey: process.env.VOYAGE_API_KEY ?? '',
 
   model: {
     mode: 'auto',
@@ -186,6 +198,13 @@ const DEFAULT_CONFIG: Config = {
       port: 8765,
       relay_url: 'wss://relay.thunderai.us',
       tokens: {}
+    },
+    browser: {
+      enabled: true,
+      port: 9876,
+      audit_file: join(process.env.HOME || '', '.thundergate', 'browser-audit.jsonl'),
+      max_queue_per_client: 256,
+      accept_unverified_pairing: true
     },
     slack: { enabled: true },
     whatsapp: { enabled: true },

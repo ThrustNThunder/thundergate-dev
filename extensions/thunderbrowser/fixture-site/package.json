@@ -1,0 +1,10 @@
+{
+  "name": "thunderbrowser-fixture-site",
+  "version": "0.1.0",
+  "description": "Local AA fixture portal for Phase 0/1 ThunderBrowser tests (TB-0-11).",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  }
+}

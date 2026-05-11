@@ -96,9 +96,33 @@ export class ChannelRegistry {
     return [...this.channels.values()];
   }
 
+  /**
+   * Start every channel. Per-channel failure is captured and rethrown as
+   * a single aggregate error at the end so a port conflict on one channel
+   * (e.g., bridge.mjs already owns 8765) does not prevent the others from
+   * coming up. Runtime treats startup errors as non-fatal — Doctor will
+   * show the affected channel as not running.
+   */
   async startAll(): Promise<void> {
+    const errors: Array<{ name: string; err: Error }> = [];
     for (const ch of this.channels.values()) {
-      await ch.start();
+      try {
+        await ch.start();
+      } catch (err) {
+        errors.push({ name: ch.name, err: err as Error });
+      }
+    }
+    if (errors.length === 1) {
+      const e = errors[0];
+      const wrapped = new Error(`[${e.name}] ${e.err.message}`);
+      (wrapped as Error & { channel?: string }).channel = e.name;
+      throw wrapped;
+    }
+    if (errors.length > 1) {
+      throw new Error(
+        'multiple channel start failures: ' +
+          errors.map((e) => `${e.name}: ${e.err.message}`).join('; ')
+      );
     }
   }
 

@@ -19,6 +19,8 @@ import { createInterface } from 'readline';
 import * as os from 'os';
 import { ensureConfig, validateConfig, getConfigPath } from '../config/index.js';
 import { GhostEvaluator } from '../ghost/evaluator.js';
+import { runLearnTests, formatReport } from '../ghost/learn-test.js';
+import { describeGhostContextFiles, getGhostContextDir } from '../ghost/context.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -238,13 +240,32 @@ ghost
     console.log(`  Consecutive clean days: ${scores.consecutive_clean_days}`);
     console.log(`  Cutover ready: ${scores.consecutive_clean_days >= 7 ? '🏆 YES' : `${7 - scores.consecutive_clean_days} more clean days needed`}`);
     console.log('');
+    console.log(`  Doctor green (8-check): ${scores.doctor_green ? '✅ YES' : '❌ NO'}`);
+    const deployTs = scores.deploy_timestamp
+      ? new Date(scores.deploy_timestamp).toISOString()
+      : '(unset — fail-closed mode)';
+    console.log(`  Last deploy reference:  ${deployTs}`);
+    for (const c of scores.doctor_checks) {
+      const icon = c.pass ? '✅' : '❌';
+      const head = `    ${icon} [${c.id}] ${c.name}  (${c.value}  ${c.threshold})`;
+      console.log(head);
+      if (!c.pass && c.reason) {
+        console.log(`         reason: ${c.reason}`);
+      }
+    }
+    console.log('');
     console.log('  Recent days (newest first):');
+    console.log('    Legend: weighted = gate metric (length-weighted),  match = legacy binary rate,  nyr = [ghost: not yet ready] rate');
     if (scores.days.length === 0) {
       console.log('    (no data)');
     } else {
       for (const day of scores.days.slice(0, 7)) {
         const icon = day.status === 'green' ? '✅' : day.status === 'yellow' ? '⚠️ ' : '❌';
-        console.log(`    ${icon} ${day.date}  samples=${day.samples}  match=${(day.match_rate * 100).toFixed(0)}%  err=${(day.error_rate * 100).toFixed(0)}%  med_lat=${day.median_latency_ms}ms`);
+        const weighted = day.weighted_score.toFixed(2);
+        const match = `${(day.match_rate * 100).toFixed(0)}%`;
+        console.log(
+          `    ${icon} ${day.date}  samples=${day.samples}  weighted=${weighted}  match=${match}  err=${(day.error_rate * 100).toFixed(0)}%  nyr=${(day.not_yet_ready_rate * 100).toFixed(0)}%  med_lat=${day.median_latency_ms}ms`
+        );
       }
     }
   });
@@ -282,6 +303,42 @@ ghost
         console.log(line);
       }
     }
+  });
+
+ghost
+  .command('learn-test')
+  .description('Run learning-loop tests T1-T6 (gate bar = T1+T2+T3); records into ghost-scores.json for Doctor check 7')
+  .action(async () => {
+    console.log('⚡ Running Ghost Jon learning-loop tests...');
+    const report = await runLearnTests();
+    console.log('');
+    console.log(formatReport(report));
+    console.log('');
+    // Doctor check 7 reads the cached learn-test result; record it now so
+    // the next `ghost status` sees a fresh value. Bar is T1+T2+T3 per the
+    // Doctor-green spec — T6 is part of the learn-test gatePass but Doctor
+    // green explicitly calls out T1+T2+T3 only.
+    try {
+      const cfg = ensureConfig();
+      const evaluator = new GhostEvaluator(cfg);
+      const byName = new Map(report.results.map((r) => [r.name, r]));
+      const passOrSkip = (n: string) => {
+        const r = byName.get(n);
+        return !!r && (r.pass || r.skipped === true);
+      };
+      const gatePass = passOrSkip('T1') && passOrSkip('T2') && passOrSkip('T3');
+      evaluator.recordLearnTestResult({
+        gatePass,
+        results: report.results.map((r) => ({
+          name: r.name,
+          pass: r.pass,
+          skipped: r.skipped
+        }))
+      });
+    } catch (e) {
+      console.warn(`(could not persist learn-test result for Doctor check 7: ${(e as Error).message})`);
+    }
+    process.exit(report.gatePass ? 0 : 1);
   });
 
 ghost

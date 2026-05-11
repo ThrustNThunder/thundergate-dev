@@ -15,6 +15,7 @@ import { SessionDB } from '../session/database.js';
 import { execFile } from 'child_process';
 import { join } from 'path';
 import * as os from 'os';
+import { MEMORY_REVIEW_PROMPT, SKILL_REVIEW_PROMPT, extractKeywords } from './review_prompts.js';
 
 interface TriggerEvent {
   type: 'task_complete' | 'correction' | 'session_end' | 'failure' | 'backstop';
@@ -40,6 +41,12 @@ export class TriggerEngine {
   private reviewInProgress: boolean = false;
   private lastReviewAt: number = 0;
   private MIN_REVIEW_INTERVAL_MS = 60000; // Minimum 1 min between reviews
+  // Monotonic counter to disambiguate keys produced inside the same
+  // millisecond. T4 flagged that `failure_${Date.now()}` could collide
+  // and silently overwrite via ON CONFLICT(key) DO UPDATE — this fixes
+  // it without paying the cost of a real throttle (failures *should*
+  // burn in immediately, not be coalesced).
+  private monotonicSeq: number = 0;
 
   constructor(db: SessionDB, backstopInterval: number = 20) {
     this.db = db;
@@ -121,9 +128,10 @@ export class TriggerEngine {
           break;
 
         case 'task_complete':
-          // Task completion may create a new skill
-          const created = await this.handleTaskComplete(event.context);
-          if (created) skillsCreated = 1;
+          // Task completion may create *or update* a skill.
+          const taskResult = await this.handleTaskComplete(event.context);
+          skillsCreated = taskResult.created;
+          skillsUpdated = taskResult.updated;
           break;
 
         case 'session_end':
@@ -160,9 +168,11 @@ export class TriggerEngine {
    * Handle correction — burns into memory immediately
    */
   private async handleCorrection(correction: string): Promise<void> {
-    // Store as critical memory
+    // Store as critical memory. Append a monotonic suffix so two
+    // corrections fired inside the same ms get distinct keys instead
+    // of one silently overwriting the other.
     this.db.storeMemory({
-      key: `correction_${Date.now()}`,
+      key: this.uniqueKey('correction'),
       value: correction,
       category: 'corrections',
       importance: 'critical',
@@ -176,11 +186,13 @@ export class TriggerEngine {
   }
 
   /**
-   * Handle failure — update skills to prevent repeat
+   * Handle failure — log it so we don't repeat ourselves. Unique keys
+   * (Date.now + monotonic) ensure back-to-back failures don't merge via
+   * ON CONFLICT and overwrite each other — T4 surfaced that latent risk.
    */
   private async handleFailure(error: string, context?: string): Promise<void> {
     this.db.storeMemory({
-      key: `failure_${Date.now()}`,
+      key: this.uniqueKey('failure'),
       value: `Error: ${error}${context ? `\nContext: ${context}` : ''}`,
       category: 'failures',
       importance: 'high',
@@ -191,58 +203,132 @@ export class TriggerEngine {
   }
 
   /**
-   * Handle task complete — may create skill
+   * Handle task complete — update an existing skill if one looks like
+   * a fit; only create a new skill if nothing matches. This mirrors the
+   * Hermes bias toward *deepening* the skill library rather than
+   * fragmenting it.
+   *
+   * Matching is keyword-overlap based — extract content tokens, look
+   * for skills whose name or content contains any of them. If the most
+   * recent match shares ≥ 2 keywords, we update it; otherwise we create.
    */
-  private async handleTaskComplete(context?: string): Promise<boolean> {
-    // Get recent messages to analyze
+  private async handleTaskComplete(context?: string): Promise<{ created: number; updated: number }> {
     const messages = this.db.getRecentMessages(30);
-    if (messages.length < 5) return false;
+    if (messages.length < 5) return { created: 0, updated: 0 };
 
-    // Count tool calls — if many, might be a skill opportunity
-    const assistantMessages = messages.filter(m => m.role === 'assistant');
-    const hasPattern = assistantMessages.length >= 3;
+    const assistantMessages = messages.filter((m) => m.role === 'assistant');
+    if (assistantMessages.length < 3) return { created: 0, updated: 0 };
+    if (!context) return { created: 0, updated: 0 };
 
-    if (hasPattern && context) {
-      // Create a skill from this pattern
-      const skillName = `task_${Date.now()}`;
-      this.db.storeSkill({
-        name: skillName,
-        content: `Task pattern learned:\n${context}`,
-        category: 'task_patterns',
-        source: 'agent'
-      });
-      console.log(`    💾 Skill created from task: ${skillName}`);
-      return true;
+    const keywords = extractKeywords(context, 8);
+    const similar = keywords.length > 0 ? this.db.findSimilarSkills(keywords, 5) : [];
+
+    // Pick the strongest match: skill with most keyword overlap in
+    // its content. Threshold of 2 means a single coincidental token
+    // doesn't force a wrong merge.
+    let best: { name: string; overlap: number } | null = null;
+    for (const skill of similar) {
+      const body = `${skill.name} ${skill.content}`.toLowerCase();
+      let overlap = 0;
+      for (const k of keywords) if (body.includes(k)) overlap++;
+      if (overlap >= 2 && (!best || overlap > best.overlap)) {
+        best = { name: skill.name, overlap };
+      }
     }
 
-    return false;
+    if (best) {
+      // Update path: append the new pattern under a separator so the
+      // skill's prior content is preserved and the history is readable.
+      const existing = this.db.getSkill(best.name);
+      const stamp = new Date().toISOString();
+      const appended =
+        (existing?.content ?? '') +
+        `\n\n---\nUpdate ${stamp}:\n${context}`;
+      this.db.storeSkill({
+        name: best.name,
+        content: appended,
+        category: existing?.category ?? 'task_patterns',
+        source: 'agent'
+      });
+      console.log(`    🔁 Skill updated: ${best.name} (+${best.overlap} keyword overlap)`);
+      return { created: 0, updated: 1 };
+    }
+
+    // Create path — only when nothing similar exists.
+    const skillName = this.uniqueKey('task');
+    this.db.storeSkill({
+      name: skillName,
+      content: `Task pattern learned:\n${context}`,
+      category: 'task_patterns',
+      source: 'agent'
+    });
+    console.log(`    💾 Skill created (no existing match): ${skillName}`);
+    return { created: 1, updated: 0 };
   }
 
   /**
-   * Handle session end — full review
+   * Handle session end — structured extraction guided by the memory
+   * review prompt. Not yet a full LLM-backed background fork (see
+   * `review_prompts.ts` for the contract that the future fork will use);
+   * for now we sweep recent messages with heuristics that target the
+   * same signal categories the prompt asks for: preferences, behavioral
+   * expectations, personal facts.
    */
   private async handleSessionEnd(): Promise<{ memories: number; skills: number }> {
+    // Referenced so a future background-fork implementation has the
+    // exact prompts loaded; also prevents tree-shaking from dropping
+    // the module while it's still infrastructure-only.
+    void MEMORY_REVIEW_PROMPT;
+    void SKILL_REVIEW_PROMPT;
+
     const messages = this.db.getRecentMessages(100);
     let memories = 0;
-    let skills = 0;
+    const skills = 0;
 
-    // Look for preference statements
+    // Preference / behavioral-expectation signals.
     const preferencePatterns = [
       /i (prefer|like|want|need|always|never)/i,
       /remember that/i,
       /don't forget/i,
-      /going forward/i
+      /going forward/i,
+      /from now on/i,
+      /stop (doing|saying)/i
+    ];
+
+    // Personal-fact signals — "i'm a", "my <noun>", "we (live|work|fly|ride)".
+    const factPatterns = [
+      /\bi('m| am) (a|an) /i,
+      /\bmy (wife|husband|partner|son|daughter|kid|kids|family|home|job|truck|boat|rv|tesla|f-?150|company)\b/i,
+      /\bwe (live|work|fly|ride|own) /i
     ];
 
     for (const msg of messages) {
       if (msg.role !== 'user' || !msg.content) continue;
 
+      let captured = false;
+
       for (const pattern of preferencePatterns) {
         if (pattern.test(msg.content)) {
           this.db.storeMemory({
-            key: `preference_${Date.now()}_${memories}`,
+            key: `preference_${this.uniqueKey('pref')}_${memories}`,
             value: msg.content,
             category: 'preferences',
+            importance: 'normal',
+            source: 'inferred'
+          });
+          memories++;
+          captured = true;
+          break;
+        }
+      }
+      if (captured) continue;
+
+      for (const pattern of factPatterns) {
+        if (pattern.test(msg.content)) {
+          this.db.storeMemory({
+            key: `fact_${this.uniqueKey('fact')}_${memories}`,
+            value: msg.content,
+            category: 'facts',
             importance: 'normal',
             source: 'inferred'
           });
@@ -254,6 +340,17 @@ export class TriggerEngine {
 
     console.log(`    💾 Session end: ${memories} memories extracted`);
     return { memories, skills };
+  }
+
+  /**
+   * Date.now() + monotonic counter — guarantees uniqueness across
+   * keys produced by the same trigger fire even if the clock hasn't
+   * advanced. The counter wraps inside the process but each value
+   * combined with the timestamp is still distinct.
+   */
+  private uniqueKey(prefix: string): string {
+    this.monotonicSeq = (this.monotonicSeq + 1) >>> 0;
+    return `${prefix}_${Date.now()}_${this.monotonicSeq}`;
   }
 
   /**

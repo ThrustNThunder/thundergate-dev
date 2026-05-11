@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>AA — Travel Planner (fixture)</title>
+<link rel="stylesheet" href="/pages/_shared.css">
+</head>
+<body data-aa-state="aa.planner">
+<header class="aa-bar">
+  <div class="brand">AA Fixture Portal</div>
+  <nav>
+    <a href="/dashboard">Dashboard</a>
+    <a href="/travel-planner">Travel Planner</a>
+    <a href="/results">Results</a>
+    <a href="/">Sign out</a>
+  </nav>
+</header>
+<div class="state-strip">State: aa.planner</div>
+<main>
+  <h1>Travel Planner</h1>
+  <div class="card">
+    <form data-aa-form="planner">
+      <div class="row">
+        <div style="flex:1;">
+          <label for="from">From</label>
+          <input id="from" name="from" type="text" data-aa-field="origin" placeholder="DFW" />
+        </div>
+        <div style="flex:1;">
+          <label for="to">To</label>
+          <input id="to" name="to" type="text" data-aa-field="destination" placeholder="LAX" />
+        </div>
+      </div>
+      <div class="row">
+        <div style="flex:1;">
+          <label for="depart">Depart</label>
+          <input id="depart" name="depart" type="text" data-aa-field="depart" placeholder="2026-06-15" />
+        </div>
+        <div style="flex:1;">
+          <label for="return">Return</label>
+          <input id="return" name="return" type="text" data-aa-field="return" placeholder="2026-06-22" />
+        </div>
+      </div>
+      <button type="button" data-aa-action="search" onclick="location.href='/results'">Search flights</button>
+    </form>
+  </div>
+</main>
+<footer>Fixture site — not real AA.</footer>
+</body>
+</html>

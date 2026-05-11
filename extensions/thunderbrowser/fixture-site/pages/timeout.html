@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>AA — Session timeout (fixture)</title>
+<link rel="stylesheet" href="/pages/_shared.css">
+</head>
+<body data-aa-state="aa.timeout">
+<header class="aa-bar">
+  <div class="brand">AA Fixture Portal</div>
+  <nav>
+    <a href="/dashboard">Dashboard</a>
+    <a href="/travel-planner">Travel Planner</a>
+    <a href="/results">Results</a>
+    <a href="/">Sign out</a>
+  </nav>
+</header>
+<div class="state-strip">State: aa.timeout</div>
+<main>
+  <h1>Travel Planner</h1>
+  <div class="card">
+    <p>(stale page content behind the timeout modal)</p>
+  </div>
+</main>
+<div class="modal-shade" data-aa-modal="timeout">
+  <div class="modal">
+    <h2 style="margin-top:0;">Your session has timed out</h2>
+    <p>For your security, we've signed you out. Please sign in again to continue.</p>
+    <div class="row" style="justify-content:flex-end;">
+      <button type="button" data-aa-action="reauth" onclick="location.href='/'">Sign in</button>
+    </div>
+  </div>
+</div>
+<footer>Fixture site — not real AA.</footer>
+</body>
+</html>

@@ -339,6 +339,52 @@ export class SessionDB {
   }
 
   /**
+   * Recent memory rows in importance-then-recency order. Importance is
+   * stored as a string ('critical' | 'high' | 'normal' | …) so we map it
+   * to an integer in the query rather than relying on lexicographic sort,
+   * which would put 'normal' above 'critical'.
+   *
+   * Consumed by the Ghost system-prompt assembler so a fresh correction
+   * actually influences the next shadow turn — without this, the learning
+   * loop is write-only and behavior cannot change.
+   */
+  getRecentMemories(limit: number = 10): MemoryEntry[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memory
+      ORDER BY
+        CASE importance
+          WHEN 'critical' THEN 0
+          WHEN 'high'     THEN 1
+          WHEN 'normal'   THEN 2
+          ELSE 3
+        END,
+        updated_at DESC
+      LIMIT ?
+    `);
+    return stmt.all(limit) as MemoryEntry[];
+  }
+
+  /**
+   * Skill content search — used by the learning trigger to decide whether
+   * a new pattern should update an existing skill instead of creating a
+   * new one. Returns skills whose name or content contains any of the
+   * supplied keyword tokens, ordered by recency.
+   */
+  findSimilarSkills(keywords: string[], limit: number = 5): Skill[] {
+    if (keywords.length === 0) return [];
+    const likes = keywords.map(() => '(content LIKE ? OR name LIKE ?)').join(' OR ');
+    const params: string[] = [];
+    for (const k of keywords) {
+      const wild = `%${k}%`;
+      params.push(wild, wild);
+    }
+    const stmt = this.db.prepare(
+      `SELECT * FROM skills WHERE ${likes} ORDER BY updated_at DESC LIMIT ?`
+    );
+    return stmt.all(...params, limit) as Skill[];
+  }
+
+  /**
    * Log health status
    */
   logHealth(status: {

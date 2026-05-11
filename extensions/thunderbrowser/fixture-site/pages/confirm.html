@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>AA — Confirm trip (fixture)</title>
+<link rel="stylesheet" href="/pages/_shared.css">
+</head>
+<body data-aa-state="aa.confirm_review">
+<header class="aa-bar">
+  <div class="brand">AA Fixture Portal</div>
+  <nav>
+    <a href="/dashboard">Dashboard</a>
+    <a href="/travel-planner">Travel Planner</a>
+    <a href="/results">Results</a>
+    <a href="/">Sign out</a>
+  </nav>
+</header>
+<div class="state-strip">State: aa.confirm_review · precision-click required</div>
+<main>
+  <h1>Review and confirm</h1>
+  <div class="card">
+    <h2>Itinerary</h2>
+    <p><strong>AA 1488</strong> · DFW → LAX · Jun 15 · 11:05a → 12:30p</p>
+    <h2>Passenger</h2>
+    <p>Michael Q · AAdvantage® 4XK11J9</p>
+    <h2>Total</h2>
+    <p class="price">$348.00 USD</p>
+  </div>
+  <div class="card warning-banner">
+    Confirming charges your saved payment method. Precision-click only.
+  </div>
+  <div class="row">
+    <button type="button" data-aa-action="confirm-trip" id="confirm-trip-btn" onclick="location.href='/confirmed'">Confirm trip</button>
+    <a class="btn muted" href="/results" data-aa-action="back">Back to results</a>
+  </div>
+</main>
+<footer>Fixture site — not real AA.</footer>
+</body>
+</html>

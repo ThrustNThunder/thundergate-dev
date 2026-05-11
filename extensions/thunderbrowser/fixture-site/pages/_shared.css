@@ -1,0 +1,35 @@
+/* Shared chrome for ThunderBrowser fixture pages. Visually AA-ish without
+   borrowing actual branding — we want the FSM/state-detector tests to lock
+   onto structure, not pixels. */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; background: #f4f5f7; color: #1a1d21; }
+header.aa-bar { background: #002244; color: #fff; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+header.aa-bar .brand { font-weight: 700; letter-spacing: 0.06em; font-size: 14px; }
+header.aa-bar nav { display: flex; gap: 14px; font-size: 13px; }
+header.aa-bar nav a { color: #fff; text-decoration: none; opacity: 0.85; }
+header.aa-bar nav a:hover { opacity: 1; text-decoration: underline; }
+.state-strip { background: #1f3b66; color: #cfe0ff; padding: 6px 24px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+main { max-width: 960px; margin: 28px auto; padding: 0 24px; }
+h1 { font-size: 22px; margin: 0 0 16px 0; }
+h2 { font-size: 16px; margin: 24px 0 12px 0; }
+.card { background: #fff; border: 1px solid #d9dce1; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+.row { display: flex; gap: 14px; margin-bottom: 12px; align-items: center; }
+label { display: block; font-size: 12px; color: #595c61; margin-bottom: 4px; }
+input[type=text], input[type=email], input[type=password], input[type=tel] {
+  width: 100%; padding: 8px 10px; border: 1px solid #c8cbd0; border-radius: 4px; font-size: 14px;
+}
+button, .btn {
+  background: #002244; color: #fff; padding: 9px 14px; border: 0; border-radius: 4px;
+  font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-block;
+}
+button:hover, .btn:hover { background: #003366; }
+.btn.muted { background: #b4b8be; color: #1a1d21; }
+.btn.danger { background: #b03030; }
+.fare-card { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border: 1px solid #d9dce1; border-radius: 6px; margin-bottom: 10px; background: #fff; }
+.fare-card .price { font-size: 18px; font-weight: 700; }
+.modal-shade { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; }
+.modal { background: #fff; padding: 22px 24px; border-radius: 8px; max-width: 420px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+.captcha-box { padding: 28px; text-align: center; }
+.captcha-box .checkbox { display: inline-flex; align-items: center; gap: 10px; padding: 12px 18px; border: 1px solid #d9dce1; border-radius: 6px; background: #fafbfc; }
+.warning-banner { background: #fdf2dc; border: 1px solid #e7c97a; color: #6e4f00; padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; }
+footer { text-align: center; color: #7b7d82; font-size: 11px; padding: 20px; }
