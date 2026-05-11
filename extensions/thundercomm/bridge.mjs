@@ -17,7 +17,7 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { readFileSync, watchFile, statSync } from 'fs';
+import { readFileSync, watchFile, statSync, appendFileSync, writeFileSync, existsSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { createServer } from 'http';
@@ -636,6 +636,80 @@ setInterval(() => {
     loadHistory(1);
   }
 }, 30000);
+
+// ── CLI Jon launcher (trigger-file watcher) ──────────────────────────────
+//
+// When /home/ubuntu/cli-jon-trigger.txt is written with a non-empty body,
+// spawn CLI Jon (`claude`) as a detached child using that body as the
+// prompt, then clear the trigger so the next write fires again. Lets Jon
+// launch CLI Jon from any channel (Slack, ThunderCommo, WhatsApp) by
+// writing to the trigger file — the bridge is a long-lived systemd
+// service and is not subject to the per-message exec sandbox that
+// constrains the agent itself.
+
+const CLI_JON_TRIGGER_FILE = process.env.TC_CLI_JON_TRIGGER || '/home/ubuntu/cli-jon-trigger.txt';
+const CLI_JON_LAUNCHER_LOG = process.env.TC_CLI_JON_LOG || '/tmp/cli-jon-launcher.log';
+const CLI_JON_BIN          = process.env.TC_CLI_JON_BIN || '/home/ubuntu/.npm-global/bin/claude';
+const CLI_JON_CWD          = process.env.TC_CLI_JON_CWD || '/home/ubuntu';
+
+function appendLauncherLog(line) {
+  try {
+    appendFileSync(CLI_JON_LAUNCHER_LOG, `[${new Date().toISOString()}] ${line}\n`);
+  } catch (err) {
+    console.warn(`[Launcher] log write failed: ${err.message}`);
+  }
+}
+
+function handleTriggerChange(curr, prev) {
+  // Skip if size is zero (we clear after firing) or nothing changed.
+  if (curr.size === 0) return;
+  if (curr.size === prev.size && curr.mtimeMs === prev.mtimeMs) return;
+
+  let prompt = '';
+  try {
+    prompt = readFileSync(CLI_JON_TRIGGER_FILE, 'utf8').trim();
+  } catch (err) {
+    appendLauncherLog(`read trigger failed: ${err.message}`);
+    return;
+  }
+  if (!prompt) return;
+
+  appendLauncherLog(`fired with prompt (${prompt.length} chars): ${prompt.slice(0, 120).replace(/\n/g, ' ')}`);
+
+  let child;
+  try {
+    child = spawn(CLI_JON_BIN, [prompt], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: CLI_JON_CWD,
+      env: process.env,
+    });
+    child.unref();
+  } catch (err) {
+    appendLauncherLog(`spawn failed: ${err.message}`);
+    return;
+  }
+  appendLauncherLog(`spawned PID ${child.pid}`);
+
+  // Clear the trigger so the next write is detected as a state change.
+  try {
+    writeFileSync(CLI_JON_TRIGGER_FILE, '');
+  } catch (err) {
+    appendLauncherLog(`clear trigger failed: ${err.message}`);
+  }
+}
+
+// Ensure the trigger file exists so watchFile has something to poll.
+try {
+  if (!existsSync(CLI_JON_TRIGGER_FILE)) {
+    writeFileSync(CLI_JON_TRIGGER_FILE, '');
+  }
+} catch (err) {
+  console.warn(`[Launcher] could not initialize trigger file: ${err.message}`);
+}
+
+watchFile(CLI_JON_TRIGGER_FILE, { interval: 2000, persistent: false }, handleTriggerChange);
+console.log(`[Launcher] watching ${CLI_JON_TRIGGER_FILE} (poll 2s) → spawns ${CLI_JON_BIN}`);
 
 console.log('[ThunderCommo Bridge] Starting…');
 
