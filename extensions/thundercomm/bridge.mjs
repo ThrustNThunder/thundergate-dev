@@ -17,7 +17,7 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { readFileSync, watchFile, statSync, appendFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, watchFile, statSync, appendFileSync, writeFileSync, existsSync, openSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { createServer } from 'http';
@@ -678,11 +678,13 @@ function handleTriggerChange(curr, prev) {
 
   let child;
   try {
-    child = spawn(CLI_JON_BIN, [prompt], {
+    const logFile = `${CLI_JON_LAUNCHER_LOG}.${Date.now()}.out`;
+    const logFd = openSync(logFile, 'a');
+    child = spawn(CLI_JON_BIN, ['--dangerously-skip-permissions', '-p', prompt], {
       detached: true,
-      stdio: 'ignore',
+      stdio: ['ignore', logFd, logFd],
       cwd: CLI_JON_CWD,
-      env: process.env,
+      env: { ...process.env, PATH: `/home/ubuntu/.npm-global/bin:${process.env.PATH}` },
     });
     child.unref();
   } catch (err) {
