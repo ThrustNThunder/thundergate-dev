@@ -59,7 +59,7 @@ wss.on('connection', (ws, req) => {
       }
 
       peerId = msg.peerId || randomUUID().slice(0, 8);
-      const channels = (msg.channels || []).filter(c => FEDERATED_CHANNELS.includes(c));
+      const channels = (msg.channels || []).filter(c => FEDERATED_CHANNELS.includes(c) || c.startsWith('direct:'));
       
       peers.set(peerId, { ws, channels, connectedAt: Date.now(), model: msg.model || null });
       authenticated = true;
@@ -109,8 +109,8 @@ wss.on('connection', (ws, req) => {
 
     // Federation message
     if (msg.type === 'federation_message') {
-      // Allow federated channels and direct:agent messages
-      const isDirectAgent = msg.channel?.startsWith('direct:');
+      // Allow federated channels, direct:agent messages, and bare 'direct' (bridge handles routing)
+      const isDirectAgent = msg.channel?.startsWith('direct:') || msg.channel === 'direct';
       if (!FEDERATED_CHANNELS.includes(msg.channel) && !isDirectAgent) {
         console.warn(`[Relay] Rejected message to non-federated channel: ${msg.channel}`);
         return;
@@ -124,9 +124,9 @@ wss.on('connection', (ws, req) => {
       // Broadcast to all OTHER peers
       for (const [pid, peer] of peers) {
         if (pid === peerId) continue; // Don't echo back to sender
-        // Allow if peer subscribes to channel OR if it's a direct:agent message
-        const isDirectAgent = msg.channel?.startsWith('direct:');
-        if (!peer.channels.includes(msg.channel) && !isDirectAgent) continue;
+        // Allow if peer subscribes to channel OR if it's a direct:agent message (including bare 'direct')
+        const isPeerDirectEligible = msg.channel?.startsWith('direct:') || msg.channel === 'direct';
+        if (!peer.channels.includes(msg.channel) && !isPeerDirectEligible) continue;
         if (peer.ws.readyState === WebSocket.OPEN) {
           peer.ws.send(JSON.stringify(msg));
         }
