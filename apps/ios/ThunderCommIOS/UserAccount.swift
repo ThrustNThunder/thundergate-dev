@@ -303,6 +303,7 @@ public final class UserStore: ObservableObject {
         if ok {
             isAuthenticated = true
             lastAuthenticatedAt = Date()
+            APNsManager.shared.retryTokenUploadIfNeeded()
         }
         return ok
     }
