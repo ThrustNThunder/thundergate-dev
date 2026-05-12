@@ -203,6 +203,7 @@ public final class UserStore: ObservableObject {
         isAuthenticated = true
         lastAuthenticatedAt = Date()
         persist()
+        APNsManager.shared.retryTokenUploadIfNeeded()
     }
 
     public func signIn(email: String, password: String) async throws {
@@ -231,6 +232,7 @@ public final class UserStore: ObservableObject {
         isAuthenticated = true
         lastAuthenticatedAt = Date()
         persist()
+        APNsManager.shared.retryTokenUploadIfNeeded()
     }
 
     /// POST /api/auth/refresh with the current bearer token. Replaces the
@@ -329,6 +331,17 @@ public final class UserStore: ObservableObject {
 
     public func token(for agentId: UUID) -> String? {
         try? readAgentToken(agentId: agentId)
+    }
+
+    public func updateProfile(displayName: String, phoneNumber: String?) {
+        guard var user = currentUser else { return }
+        user.displayName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digitsOnly = phoneNumber?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .filter(\.isNumber)
+        user.phoneNumber = (digitsOnly?.isEmpty == false) ? digitsOnly : nil
+        currentUser = user
+        persist()
     }
 
     // MARK: Persistence

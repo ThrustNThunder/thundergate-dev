@@ -6,15 +6,16 @@
 //     cold launch or stale session    → biometrics prompt.
 //   - Authenticated, fresh            → Content (chat root).
 //
-// "Stale" is defined as more than 5 minutes since lastAuthenticatedAt. We
+// "Stale" is defined as more than 20 minutes since lastAuthenticatedAt. We
 // re-evaluate whenever scenePhase becomes .active so a backgrounded app that
 // sat in someone else's hands has to re-prove identity before it shows the
-// thread list. Anything shorter would feel hostile; anything longer wouldn't
-// match what users expect from a messaging app.
+// thread list. 5min was hostile for an app people glance at constantly during
+// debug sessions; 20min is the messaging-app norm and still re-locks after a
+// real pocket-time idle.
 
 import SwiftUI
 
-private let kReAuthAfterSeconds: TimeInterval = 5 * 60
+private let kReAuthAfterSeconds: TimeInterval = 20 * 60
 
 public struct AuthGate<Content: View>: View {
 

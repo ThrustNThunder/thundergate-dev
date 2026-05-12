@@ -10,10 +10,14 @@ import Observation
         private static let senderDefaultsKey = "ThunderComm.senderOverride"
         private static let routeDefaultsKey = "ThunderComm.route"
         private static let directAgentDefaultsKey = "ThunderComm.directAgent"
+        private static let selectedChannelDefaultsKey = "ThunderComm.selectedChannel"
+        private static let customChannelsDefaultsKey = "ThunderComm.customChannels"
+        private static let userAccountDefaultsKey = "thunder.user.account.v1"
         private static let initialVisibleMessageCount = 100
         private static let historyPageSize = 100
         private static let maxPersistedMessages = 300
-        private static let activityExpiryMs: Int64 = 8_000
+        private static let activityExpiryMs: Int64 = 60_000
+        private static let sendTimeoutSeconds: TimeInterval = 60
 
         var connectionState: ThunderCommConnectionState = .disconnected
         var messages: [ThunderCommMessage] = []
@@ -23,13 +27,16 @@ import Observation
         var senderName: String = ThunderCommStore.loadSenderName()
         var currentRoute: ThunderCommRoute = ThunderCommStore.loadRoute()
         var directAgentId: String = ThunderCommStore.loadDirectAgentId()
-        let peerId: String = ThunderCommIdentity.loadOrCreatePeerId()
+        var selectedChannelName: String = ThunderCommStore.loadSelectedChannel()
+        var customChannels: [String] = ThunderCommStore.loadCustomChannels()
+        let peerId: String = ThunderCommIdentity.loadOrCreatePeerId(forUserKey: ThunderCommStore.signedInUserKey())
 
         var activeIndicators: [ThunderCommActivityIndicator] = []
         var streamingPreviews: [ThunderCommStreamingPreview] = []
         var hasOlderMessages: Bool = false
+        var deliveryStateByMessageID: [String: ThunderCommDeliveryState] = [:]
 
-        let availableDirectAgents: [String] = ["jon", "mack", "rex", "burt"]
+        let availableDirectAgents: [String] = ["jon", "mack", "rex"]
 
         private var messageIDs = Set<String>()
         private var allMessages: [ThunderCommMessage] = []
@@ -37,8 +44,9 @@ import Observation
         private var streamByParticipantID: [String: ThunderCommStreamingPreview] = [:]
         private var rosterByParticipantID: [String: ThunderCommParticipant] = [:]
         private var rosterOrder: [String] = []
-        private var knownParticipantIDs = Set<String>(["michael", "jon", "mack", "rex", "burt"])
+        private var knownParticipantIDs = Set<String>(["michael", "jon", "mack", "rex"])
         private let client = ThunderCommWebSocketClient()
+        private let delivery = DeliveryStateCore()
         private let persistence = ThunderCommSQLiteStore()
         private let autoSendText = ProcessInfo.processInfo.environment["THUNDERCOMM_AUTOSEND_TEXT"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         private let autoSendDelaySeconds = Double(ProcessInfo.processInfo.environment["THUNDERCOMM_AUTOSEND_DELAY_SECONDS"] ?? "0") ?? 0
@@ -46,12 +54,24 @@ import Observation
         private var activityPruneTimer: Timer?
         private var localTypingStopWorkItem: DispatchWorkItem?
         private var isSendingLocalTyping = false
+        private var deliveryWatchdogs: [String: DispatchWorkItem] = [:]
+        private var pendingMessages: [String: ThunderCommMessage] = [:]
+        private var lastDispatchChannelByAgent: [String: String] = [:]
 
         private func debug(_ message: String) {
             print("[ThunderCommStore] \(message)")
         }
 
         init() {
+            if currentRoute == .channel {
+                if selectedChannelName.isEmpty {
+                    selectedChannelName = customChannels.first ?? "ops"
+                }
+                if !selectedChannelName.isEmpty, !customChannels.contains(selectedChannelName) {
+                    customChannels.insert(selectedChannelName, at: 0)
+                }
+            }
+
             loadPersistedMessages()
             refreshVisibleMessages()
             startActivityPruneTimer()
@@ -61,6 +81,7 @@ import Observation
                     self?.connectionState = state
                     if case .connected = state {
                         self?.requestRecentHistoryIfAvailable()
+                        self?.resendFailedMessagesIfNeeded()
                         self?.sendAutoProbeIfNeeded()
                     }
                 }
@@ -70,6 +91,22 @@ import Observation
                 DispatchQueue.main.async {
                     self?.handle(event)
                 }
+            }
+
+            client.onMessageSent = { [weak self] messageID in
+                DispatchQueue.main.async {
+                    self?.markMessageSent(messageID)
+                }
+            }
+
+            client.onMessageFailed = { [weak self] messageID, _ in
+                DispatchQueue.main.async {
+                    self?.markMessageFailed(messageID)
+                }
+            }
+
+            client.onResolveAfterTimestamp = { [weak self] channel in
+                self?.lastMessageTimestamp(for: channel) ?? 0
             }
         }
 
@@ -83,6 +120,9 @@ import Observation
                 return "#tnt"
             case .jmab:
                 return "#jmab"
+            case .channel:
+                let channel = selectedChannelName.trimmingCharacters(in: .whitespacesAndNewlines)
+                return channel.isEmpty ? "#channel" : "#\(channel)"
             case .direct:
                 return "direct: \(ThunderCommParticipantIdentity.displayName(sender: nil, agentId: directAgentId, participantId: directAgentId, senderType: .agent))"
             }
@@ -110,7 +150,7 @@ import Observation
                 connectionState = .failed("Bad relay URL")
                 return
             }
-            client.connect(endpoint: endpoint, token: token, peerId: peerId, channel: subscriptionChannel)
+            client.connect(endpoint: endpoint, token: token, peerId: peerId, channels: subscribedChannels)
         }
 
         func disconnect() {
@@ -118,17 +158,54 @@ import Observation
             client.disconnect()
         }
 
-        func setRoute(_ route: ThunderCommRoute, agentId: String? = nil) {
-            currentRoute = route
+        func setRoute(_ route: ThunderCommRoute, agentId: String? = nil, channelName: String? = nil) {
+            let previousSubscribedChannels = Set(subscribedChannels)
+
             if let agentId, !agentId.isEmpty {
                 directAgentId = agentId
             }
+
+            if route == .channel,
+               let normalizedChannel = normalizeCustomChannel(channelName ?? selectedChannelName) {
+                selectedChannelName = normalizedChannel
+                if !customChannels.contains(normalizedChannel) {
+                    customChannels.append(normalizedChannel)
+                    customChannels.sort()
+                }
+            }
+
+            currentRoute = route
             persistRoute()
             refreshVisibleMessages()
             refreshIndicators()
             refreshStreamingPreviews()
-            if case .connected = connectionState, route != .direct {
-                requestRecentHistoryIfAvailable()
+
+            if case .connected = connectionState {
+                if Set(subscribedChannels) != previousSubscribedChannels {
+                    reconnectForSettingsChange()
+                } else {
+                    requestRecentHistoryIfAvailable()
+                }
+            }
+        }
+
+        func addChannel(named name: String) {
+            guard let normalizedChannel = normalizeCustomChannel(name) else { return }
+            setRoute(.channel, channelName: normalizedChannel)
+        }
+
+        /// Adopt a new account-level display name as the wire-level sender so
+        /// the change shows up on outgoing messages without waiting for the
+        /// next cold launch. No-op when an explicit Connection-section
+        /// override exists — that override is a deliberate chat-only choice.
+        func applyProfileDisplayName(_ name: String) {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let stored = UserDefaults.standard.string(forKey: Self.senderDefaultsKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard stored.isEmpty else { return }
+            if senderName != trimmed {
+                senderName = trimmed
             }
         }
 
@@ -161,16 +238,16 @@ import Observation
             let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
 
-            if let inferredAgentId = inferDirectAgentIDIfNeeded(for: trimmed) {
-                setRoute(.direct, agentId: inferredAgentId)
-            }
+            let inferredAgentId = inferDirectAgentIDIfNeeded(for: trimmed)
+            let targetAgentId = outboundAgentId ?? inferredAgentId
+            let visibleChannel = activeThreadChannel(targetAgentId: targetAgentId)
 
             let message = ThunderCommMessage(
                 id: UUID().uuidString,
-                channel: outboundChannel,
+                channel: visibleChannel,
                 sender: ThunderCommParticipantIdentity.displayName(sender: senderName, agentId: nil, participantId: nil, senderType: .human),
                 senderType: .human,
-                agentId: outboundAgentId,
+                agentId: targetAgentId,
                 text: trimmed,
                 timestamp: Self.nowMs,
                 originPeer: peerId,
@@ -179,10 +256,44 @@ import Observation
                 contentKind: .text,
                 attachment: nil
             )
+            let wireMessage = ThunderCommMessage(
+                id: message.id,
+                channel: outboundChannel,
+                sender: message.sender,
+                senderType: message.senderType,
+                agentId: message.agentId,
+                text: message.text,
+                timestamp: message.timestamp,
+                originPeer: message.originPeer,
+                relayedAt: message.relayedAt,
+                relayedBy: message.relayedBy,
+                contentKind: message.contentKind,
+                attachment: message.attachment
+            )
+            deliveryStateByMessageID[message.id] = .sending
+            pendingMessages[message.id] = wireMessage
+            Task { await delivery.arm(messageId: message.id) }
             append(message)
-            client.send(message: message)
+            if let trackingAgentID = targetAgentId ?? explicitMentionedAgentID(in: trimmed) {
+                lastDispatchChannelByAgent[trackingAgentID] = visibleChannel
+            }
+            client.send(message: wireMessage)
+            armDeliveryWatchdog(messageID: message.id)
             clearLocalTypingIndicator(sendEvent: true)
             draft = ""
+        }
+
+        func retrySend(messageID: String) {
+            guard let message = pendingMessages[messageID] ?? messageCacheLookup(id: messageID) else { return }
+            deliveryStateByMessageID[messageID] = .sending
+            pendingMessages[messageID] = message
+            Task { await delivery.arm(messageId: messageID) }
+            client.send(message: message)
+            armDeliveryWatchdog(messageID: messageID)
+        }
+
+        private func messageCacheLookup(id: String) -> ThunderCommMessage? {
+            allMessages.first { $0.id == id }
         }
 
         func draftDidChange(_ draft: String) {
@@ -196,6 +307,29 @@ import Observation
             } else {
                 clearLocalTypingIndicator(sendEvent: true)
             }
+        }
+
+        func deleteMessage(_ message: ThunderCommMessage) {
+            allMessages.removeAll { $0.id == message.id }
+            messageIDs.remove(message.id)
+            deliveryStateByMessageID.removeValue(forKey: message.id)
+            pendingMessages.removeValue(forKey: message.id)
+            cancelDeliveryWatchdog(messageID: message.id)
+            Task { await delivery.clear(messageId: message.id) }
+            persistMessages()
+            refreshVisibleMessages()
+        }
+
+        func deliveryState(for message: ThunderCommMessage) -> ThunderCommDeliveryState? {
+            guard message.senderType == .human else { return nil }
+            let participantID = ThunderCommParticipantIdentity.canonicalID(
+                sender: message.sender,
+                agentId: message.agentId,
+                participantId: message.originPeer,
+                senderType: message.senderType
+            )
+            guard participantID == localParticipantID else { return nil }
+            return deliveryStateByMessageID[message.id]
         }
 
         func loadOlderMessages() {
@@ -233,6 +367,7 @@ import Observation
                 var nextOrder: [String] = []
                 for agent in payload.agents {
                     let participantID = normalizedRosterParticipantID(agent.id)
+                    guard participantID != "burt" else { continue }
                     nextRoster[participantID] = agent
                     nextOrder.append(participantID)
                     knownParticipantIDs.insert(participantID)
@@ -252,8 +387,8 @@ import Observation
                 handleThinking(payload)
             case .stream(let payload):
                 handleStream(payload)
-            case .ack:
-                break
+            case .ack(let payload):
+                handleAck(payload)
             case .systemEvent(let payload):
                 handleSystemEvent(payload)
             case .error(let payload):
@@ -286,11 +421,11 @@ import Observation
                 senderType: senderType
             )
 
-            setActivity(participantID: participantID, displayName: displayName, senderType: senderType, isActive: payload.typing, timestamp: payload.timestamp)
+            setActivity(participantID: participantID, displayName: displayName, senderType: senderType, channel: eventChannel, isActive: payload.typing, timestamp: payload.timestamp)
         }
 
         private func handleThinking(_ payload: ThunderCommThinkingPayload) {
-            let eventChannel = normalizedEventChannel(payload.channel)
+            let eventChannel = thinkingChannel(for: payload.agentId, explicitChannel: payload.channel)
             guard routeShows(channel: eventChannel) else { return }
 
             let senderType: ThunderCommSenderType = .agent
@@ -307,7 +442,10 @@ import Observation
                 senderType: senderType
             )
 
-            setActivity(participantID: participantID, displayName: displayName, senderType: senderType, isActive: true, timestamp: payload.timestamp)
+            if !participantID.isEmpty {
+                lastDispatchChannelByAgent[participantID] = eventChannel
+            }
+            setActivity(participantID: participantID, displayName: displayName, senderType: senderType, channel: eventChannel, isActive: true, timestamp: payload.timestamp)
         }
 
         private func handleStream(_ payload: ThunderCommStreamPayload) {
@@ -337,7 +475,64 @@ import Observation
                 updatedAt: payload.timestamp ?? Self.nowMs
             )
             refreshStreamingPreviews()
-            setActivity(participantID: participantID, displayName: displayName, senderType: senderType, isActive: true, timestamp: payload.timestamp)
+            setActivity(participantID: participantID, displayName: displayName, senderType: senderType, channel: eventChannel, isActive: true, timestamp: payload.timestamp)
+        }
+
+        private func handleAck(_ payload: ThunderCommAckPayload) {
+            let messageID = [payload.idempotencyKey, payload.messageId]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+            if let messageID {
+                deliveryStateByMessageID[messageID] = .sent
+                cancelDeliveryWatchdog(messageID: messageID)
+                pendingMessages.removeValue(forKey: messageID)
+                Task { await delivery.markSent(messageId: messageID) }
+            }
+        }
+
+        private func markMessageSent(_ messageID: String) {
+            guard deliveryStateByMessageID[messageID] == .sending else { return }
+            deliveryStateByMessageID[messageID] = .sent
+            cancelDeliveryWatchdog(messageID: messageID)
+            Task { await delivery.markSent(messageId: messageID) }
+        }
+
+        private func markMessageFailed(_ messageID: String) {
+            guard deliveryStateByMessageID[messageID] != .delivered else { return }
+            deliveryStateByMessageID[messageID] = .failed
+            cancelDeliveryWatchdog(messageID: messageID)
+            Task { await delivery.markFailed(messageId: messageID) }
+        }
+
+        private func armDeliveryWatchdog(messageID: String) {
+            cancelDeliveryWatchdog(messageID: messageID)
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                Task { [weak self] in
+                    guard let self else { return }
+                    let current = await self.delivery.state(for: messageID)
+                    guard current == .sending else {
+                        await MainActor.run {
+                            self.deliveryWatchdogs.removeValue(forKey: messageID)
+                        }
+                        return
+                    }
+                    await self.delivery.markFailed(messageId: messageID)
+                    await MainActor.run {
+                        if self.deliveryStateByMessageID[messageID] != .delivered {
+                            self.deliveryStateByMessageID[messageID] = .failed
+                        }
+                        self.deliveryWatchdogs.removeValue(forKey: messageID)
+                    }
+                }
+            }
+            deliveryWatchdogs[messageID] = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.sendTimeoutSeconds, execute: work)
+        }
+
+        private func cancelDeliveryWatchdog(messageID: String) {
+            deliveryWatchdogs[messageID]?.cancel()
+            deliveryWatchdogs.removeValue(forKey: messageID)
         }
 
         private func handleSystemEvent(_ payload: ThunderCommSystemEventPayload) {
@@ -380,7 +575,7 @@ import Observation
             }
         }
 
-        private func setActivity(participantID: String, displayName: String, senderType: ThunderCommSenderType, isActive: Bool, timestamp: Int64?) {
+        private func setActivity(participantID: String, displayName: String, senderType: ThunderCommSenderType, channel: String, isActive: Bool, timestamp: Int64?) {
             guard !participantID.isEmpty else { return }
             knownParticipantIDs.insert(participantID)
 
@@ -389,6 +584,7 @@ import Observation
                     id: participantID,
                     displayName: displayName,
                     senderType: senderType,
+                    channel: channel,
                     updatedAt: timestamp ?? Self.nowMs
                 )
             } else {
@@ -420,6 +616,36 @@ import Observation
         private func append(_ message: ThunderCommMessage) {
             merge([message])
             clearActivity(for: message)
+            autoRouteIfDirect(message)
+        }
+
+        // When a live `direct:<agent>` message arrives and the user isn't
+        // already parked in that DM thread, flip the route so the reply
+        // is visible immediately. Without this, Michael sends a DM from
+        // #tnt and the reply silently drops into allMessages while he
+        // keeps staring at the channel he was on. Only fires for the
+        // single-message event path — bulk history replay does NOT call
+        // append(), so old DMs in the replay won't yank the UI around.
+        private func autoRouteIfDirect(_ message: ThunderCommMessage) {
+            let channel = normalizeChannel(message.channel)
+            guard channel.hasPrefix("direct:") else { return }
+            let agentId = String(channel.dropFirst("direct:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !agentId.isEmpty, agentId != localParticipantID else { return }
+            // Skip messages we sent ourselves — we don't want sending a
+            // DM from elsewhere to also yank the route, because the
+            // composer flow already handles that explicitly when needed.
+            let senderID = ThunderCommParticipantIdentity.canonicalID(
+                sender: message.sender,
+                agentId: message.agentId,
+                participantId: message.originPeer,
+                senderType: message.senderType
+            )
+            guard senderID != localParticipantID else { return }
+            // Already in this DM thread? Nothing to do.
+            guard currentRoute != .direct || directAgentId != agentId else { return }
+            setRoute(.direct, agentId: agentId)
         }
 
         func orderedPeerIDs() -> [String] {
@@ -546,6 +772,47 @@ import Observation
 
             refreshVisibleMessages()
             persistMessages()
+            persistLastSeenTimestamps()
+        }
+
+        // Returns the highest timestamp the store has observed for `channel`.
+        // Used as `afterTimestamp` on (re)subscribe so the relay only ships
+        // messages newer than what we already have, preventing the burst
+        // replay seen in Build 28 when reconnecting after a brief drop.
+        // Falls back to the persisted UserDefaults snapshot if memory is
+        // empty (e.g. SQLite was trimmed but UserDefaults survived).
+        func lastMessageTimestamp(for channel: String) -> Int64 {
+            let target = normalizeChannel(channel)
+            let inMemory = allMessages
+                .filter { normalizeChannel($0.channel) == target }
+                .map { $0.timestamp }
+                .max() ?? 0
+            let persisted = Int64(UserDefaults.standard.integer(forKey: lastSeenDefaultsKey(for: target)))
+            return max(inMemory, persisted)
+        }
+
+        private func lastSeenDefaultsKey(for channel: String) -> String {
+            "thunder.lastTs.\(normalizeChannel(channel))"
+        }
+
+        private func persistLastSeenTimestamps() {
+            // Snapshot the channels we actively subscribe to. Other channels
+            // are still queryable via lastMessageTimestamp(for:) at runtime.
+            var channels: Set<String> = [
+                normalizeChannel("tnt"),
+                normalizeChannel("jmab"),
+                normalizeChannel("direct")
+            ]
+            for channel in customChannels {
+                channels.insert(normalizeChannel(channel))
+            }
+
+            for channel in channels {
+                let ts = lastMessageTimestamp(for: channel)
+                if ts > 0 {
+                    UserDefaults.standard.set(Int(ts), forKey: lastSeenDefaultsKey(for: channel))
+                }
+            }
         }
 
         private func normalize(_ message: ThunderCommMessage) -> ThunderCommMessage {
@@ -614,7 +881,6 @@ import Observation
         }
 
         private func inferDirectAgentIDIfNeeded(for text: String) -> String? {
-            guard currentRoute == .tnt else { return nil }
             guard outboundAgentId == nil else { return nil }
 
             let normalizedTokens = Set(
@@ -626,17 +892,40 @@ import Observation
                 return nil
             }
 
-            guard let priorMessage = messages.last else { return nil }
-            guard priorMessage.senderType == .agent else { return nil }
+            let channel: String
+            switch currentRoute {
+            case .tnt:
+                channel = "tnt"
+            case .jmab:
+                channel = "jmab"
+            case .channel:
+                channel = subscriptionChannel
+            case .direct:
+                channel = "direct:\(directAgentId)"
+            }
 
-            let participantID = ThunderCommParticipantIdentity.canonicalID(
-                sender: priorMessage.sender,
-                agentId: priorMessage.agentId,
-                participantId: priorMessage.originPeer,
-                senderType: priorMessage.senderType
-            )
-            guard availableDirectAgents.contains(participantID) else { return nil }
-            return participantID
+            guard let inferred = MessageListView.inferTargetAgent(from: allMessages, channel: channel) else {
+                return nil
+            }
+            return availableDirectAgents.contains(inferred) ? inferred : nil
+        }
+
+        private func resendFailedMessagesIfNeeded() {
+            Task { [weak self] in
+                guard let self else { return }
+                let messageIDs = await delivery.retryPending()
+                guard !messageIDs.isEmpty else { return }
+                await MainActor.run {
+                    for messageID in messageIDs {
+                        guard let message = self.pendingMessages[messageID] ?? self.messageCacheLookup(id: messageID) else { continue }
+                        self.deliveryStateByMessageID[messageID] = .sending
+                        self.pendingMessages[messageID] = message
+                        Task { await self.delivery.arm(messageId: messageID) }
+                        self.client.send(message: message)
+                        self.armDeliveryWatchdog(messageID: messageID)
+                    }
+                }
+            }
         }
 
         private func loadPersistedMessages() {
@@ -672,8 +961,18 @@ import Observation
         }
 
         private func requestRecentHistoryIfAvailable() {
-            guard currentRoute != .direct else { return }
-            client.sendHistoryRequest(channel: subscriptionChannel, limit: Self.initialVisibleMessageCount)
+            let channel: String
+            switch currentRoute {
+            case .direct:
+                channel = activeThreadChannel(targetAgentId: directAgentId)
+            case .channel:
+                channel = subscriptionChannel
+            case .tnt:
+                channel = "tnt"
+            case .jmab:
+                channel = "jmab"
+            }
+            client.sendHistoryRequest(channel: channel, limit: Self.initialVisibleMessageCount)
         }
 
         private func startActivityPruneTimer() {
@@ -702,7 +1001,7 @@ import Observation
 
         private func refreshIndicators() {
             activeIndicators = activityByParticipantID.values
-                .filter { _ in true }
+                .filter { routeShows(channel: $0.channel) }
                 .sorted { lhs, rhs in
                     if lhs.updatedAt == rhs.updatedAt {
                         return lhs.displayName < rhs.displayName
@@ -740,23 +1039,23 @@ import Observation
                 return channel == "tnt"
             case .jmab:
                 return channel == "jmab"
+            case .channel:
+                return channel == subscriptionChannel
             case .direct:
                 let target = directAgentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                guard !target.isEmpty else { return channel == "direct" }
-                if channel == "direct:\(target)" {
-                    return true
-                }
-                guard channel == "direct" else { return false }
-                if message.agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target {
-                    return true
-                }
-                let participantID = ThunderCommParticipantIdentity.canonicalID(
+                guard !target.isEmpty else { return false }
+                let senderParticipantID = ThunderCommParticipantIdentity.canonicalID(
                     sender: message.sender,
                     agentId: message.agentId,
                     participantId: message.originPeer,
                     senderType: message.senderType
                 )
-                return participantID == target
+                let isFromLocalUser = message.senderType == .human &&
+                    (senderParticipantID == localParticipantID || message.sender == senderName)
+                let messageAgentId = message.agentId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                let isFromTargetAgent = message.senderType == .agent &&
+                    (messageAgentId == target || senderParticipantID == target)
+                return isFromLocalUser || isFromTargetAgent
             }
         }
 
@@ -766,6 +1065,8 @@ import Observation
                 return channel == "tnt"
             case .jmab:
                 return channel == "jmab"
+            case .channel:
+                return channel == subscriptionChannel
             case .direct:
                 let target = directAgentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 guard !target.isEmpty else { return channel == "direct" }
@@ -784,6 +1085,48 @@ import Observation
 
         private func normalizedEventChannel(_ channel: String?) -> String {
             normalizeChannel(channel)
+        }
+
+        private func thinkingChannel(for agentId: String?, explicitChannel: String?) -> String {
+            if let explicitChannel,
+               explicitChannel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                return normalizedEventChannel(explicitChannel)
+            }
+
+            let normalizedAgentID = ThunderCommParticipantIdentity.canonicalID(
+                sender: nil,
+                agentId: agentId,
+                participantId: agentId,
+                senderType: .agent
+            )
+            if let remembered = lastDispatchChannelByAgent[normalizedAgentID], !remembered.isEmpty {
+                return remembered
+            }
+            return "tnt"
+        }
+
+        private func activeThreadChannel(targetAgentId: String?) -> String {
+            switch currentRoute {
+            case .tnt:
+                return "tnt"
+            case .jmab:
+                return "jmab"
+            case .channel:
+                return subscriptionChannel
+            case .direct:
+                let target = (targetAgentId ?? directAgentId).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return target.isEmpty ? "direct" : "direct:\(target)"
+            }
+        }
+
+        private func explicitMentionedAgentID(in text: String) -> String? {
+            let lowered = text.lowercased()
+            for agentID in availableDirectAgents {
+                if lowered.contains("@\(agentID)") {
+                    return agentID
+                }
+            }
+            return nil
         }
 
         private func scheduleLocalTypingStop() {
@@ -809,7 +1152,35 @@ import Observation
         }
 
         private var subscriptionChannel: String {
-            currentRoute == .jmab ? "jmab" : "tnt"
+            switch currentRoute {
+            case .tnt:
+                return "tnt"
+            case .jmab:
+                return "jmab"
+            case .channel:
+                return normalizeCustomChannel(selectedChannelName) ?? "tnt"
+            case .direct:
+                return "tnt"
+            }
+        }
+
+        // Channels the relay should deliver on this connection:
+        //   • the two shared rooms (tnt, jmab)
+        //   • the active custom channel when route is .channel
+        //   • all supported direct:<peer> channels so DM peer swaps do not
+        //     require a narrow one-peer subscription window
+        private var subscribedChannels: [String] {
+            var list: [String] = ["tnt", "jmab"]
+            if currentRoute == .channel,
+               let custom = normalizeCustomChannel(selectedChannelName) {
+                list.append(custom)
+            }
+            for agent in availableDirectAgents {
+                let a = agent.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !a.isEmpty { list.append("direct:\(a)") }
+            }
+            var seen = Set<String>()
+            return list.filter { seen.insert($0).inserted }
         }
 
         private var outboundChannel: String {
@@ -818,6 +1189,8 @@ import Observation
                 return "tnt"
             case .jmab:
                 return "jmab"
+            case .channel:
+                return subscriptionChannel
             case .direct:
                 return "direct"
             }
@@ -830,6 +1203,8 @@ import Observation
         private func persistRoute() {
             UserDefaults.standard.set(currentRoute.rawValue, forKey: Self.routeDefaultsKey)
             UserDefaults.standard.set(directAgentId, forKey: Self.directAgentDefaultsKey)
+            UserDefaults.standard.set(selectedChannelName, forKey: Self.selectedChannelDefaultsKey)
+            UserDefaults.standard.set(customChannels, forKey: Self.customChannelsDefaultsKey)
         }
 
         private static func loadEndpoint() -> String {
@@ -859,7 +1234,41 @@ import Observation
             if let stored = UserDefaults.standard.string(forKey: senderDefaultsKey), !stored.isEmpty {
                 return stored
             }
+            if let signedIn = signedInUserDisplayName(), !signedIn.isEmpty {
+                return signedIn
+            }
             return ThunderCommConfig.defaultSender
+        }
+
+        // Pulled from the persisted UserStore blob so we don't have to hop onto
+        // the MainActor at init time. Falls back to nil when no account is yet
+        // saved (first-launch race) — the hard-coded default catches that case.
+        private static func signedInUserDisplayName() -> String? {
+            decodedSignedInUser()?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        static func signedInUserKey() -> String? {
+            let user = decodedSignedInUser()
+            if let name = user?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return name
+            }
+            if let email = user?.email,
+               let local = email.split(separator: "@").first {
+                return String(local)
+            }
+            return nil
+        }
+
+        private struct PersistedUserInfo: Decodable {
+            let displayName: String?
+            let email: String?
+        }
+
+        private static func decodedSignedInUser() -> PersistedUserInfo? {
+            guard let data = UserDefaults.standard.data(forKey: userAccountDefaultsKey) else {
+                return nil
+            }
+            return try? JSONDecoder().decode(PersistedUserInfo.self, from: data)
         }
 
         private static func loadRoute() -> ThunderCommRoute {
@@ -874,6 +1283,33 @@ import Observation
                 return stored
             }
             return "jon"
+        }
+
+        private static func loadSelectedChannel() -> String {
+            if let stored = UserDefaults.standard.string(forKey: selectedChannelDefaultsKey), !stored.isEmpty {
+                return stored
+            }
+            return ""
+        }
+
+        private static func loadCustomChannels() -> [String] {
+            guard let stored = UserDefaults.standard.array(forKey: customChannelsDefaultsKey) as? [String] else {
+                return []
+            }
+            return Array(Set(
+                stored
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                    .filter { !$0.isEmpty && $0 != "tnt" && $0 != "jmab" && $0 != "direct" && !$0.hasPrefix("direct:") }
+            )).sorted()
+        }
+
+        private func normalizeCustomChannel(_ channel: String) -> String? {
+            let normalized = normalizeChannel(channel)
+            guard !normalized.isEmpty else { return nil }
+            guard normalized != "tnt", normalized != "jmab", normalized != "direct", !normalized.hasPrefix("direct:") else {
+                return nil
+            }
+            return normalized
         }
 
         private static var nowMs: Int64 {

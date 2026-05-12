@@ -15,8 +15,8 @@ import Security
 public struct Account: Codable, Identifiable, Equatable {
     public var id: String          // stable UUID, generated at create time
     public var name: String        // display name shown in UI
-    public var wsURL: String       // e.g. "wss://thunderai.us"
-    public var httpURL: String     // e.g. "https://thunderai.us"
+    public var wsURL: String       // e.g. "wss://relay.thunderai.us"
+    public var httpURL: String     // e.g. "https://relay.thunderai.us"
     // Gateway bearer token. Lives in the Keychain keyed by `id`; AccountStore
     // injects it on load and writes it on add/update. Excluded from Codable so
     // the persisted UserDefaults blob can never carry a working credential.
@@ -36,11 +36,14 @@ public struct Account: Codable, Identifiable, Equatable {
         self.id = id
         self.name = name
         self.wsURL = wsURL
-        self.httpURL = httpURL
+        self.httpURL = Self.normalizeHTTPURL(httpURL, wsURL: wsURL)
         self.token = token
         self.deviceToken = deviceToken
         self.createdAtMs = createdAtMs
     }
+
+    public static let defaultRelayWSURL = "wss://relay.thunderai.us"
+    public static let defaultRelayHTTPURL = "https://relay.thunderai.us"
 
     // `token` is deliberately omitted — see the property comment.
     // `gatewayURL` is the legacy key for `wsURL` (pre-rename builds).
@@ -69,10 +72,9 @@ public struct Account: Codable, Identifiable, Equatable {
             )
         }
         if let http = try c.decodeIfPresent(String.self, forKey: .httpURL) {
-            self.httpURL = http
+            self.httpURL = Self.normalizeHTTPURL(http, wsURL: self.wsURL)
         } else {
-            // Derive once from wsURL, then store going forward.
-            self.httpURL = Account.deriveHttpURL(fromWS: self.wsURL)
+            self.httpURL = Self.deriveHttpURL(fromWS: self.wsURL)
         }
     }
 
@@ -91,6 +93,31 @@ public struct Account: Codable, Identifiable, Equatable {
         if s.hasPrefix("wss://") { return "https://" + s.dropFirst("wss://".count) }
         if s.hasPrefix("ws://")  { return "http://"  + s.dropFirst("ws://".count) }
         return s
+    }
+
+    private static let legacyHTTPHosts: Set<String> = [
+        "thunderai.us",
+        "3.232.106.78",
+        "localhost"
+    ]
+
+    fileprivate static func normalizeHTTPURL(_ rawValue: String, wsURL: String) -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return Self.deriveHttpURL(fromWS: wsURL)
+        }
+        guard let comps = URLComponents(string: trimmed),
+              let scheme = comps.scheme?.lowercased(),
+              scheme == "https",
+              let host = comps.host?.lowercased(),
+              !host.isEmpty
+        else {
+            return Self.defaultRelayHTTPURL
+        }
+        if Self.legacyHTTPHosts.contains(host) {
+            return Self.defaultRelayHTTPURL
+        }
+        return comps.url?.absoluteString ?? trimmed
     }
 }
 
@@ -120,13 +147,15 @@ public final class AccountStore: ObservableObject {
     // MARK: - mutators
 
     public func add(_ account: Account, makeCurrent: Bool = true) {
-        if let idx = accounts.firstIndex(where: { $0.id == account.id }) {
-            accounts[idx] = account
+        var normalized = account
+        normalized.httpURL = Account.normalizeHTTPURL(normalized.httpURL, wsURL: normalized.wsURL)
+        if let idx = accounts.firstIndex(where: { $0.id == normalized.id }) {
+            accounts[idx] = normalized
         } else {
-            accounts.append(account)
+            accounts.append(normalized)
         }
-        try? writeTokenKeychain(account.token, accountID: account.id)
-        if makeCurrent { currentID = account.id }
+        try? writeTokenKeychain(normalized.token, accountID: normalized.id)
+        if makeCurrent { currentID = normalized.id }
         persist()
     }
 
@@ -160,15 +189,22 @@ public final class AccountStore: ObservableObject {
 
     private func load() {
         let d = UserDefaults.standard
+        var needsPersist = false
         if let data = d.data(forKey: Self.accountsKey),
            let decoded = try? JSONDecoder().decode([Account].self, from: data) {
             accounts = decoded.map { acct in
                 var a = acct
+                let normalizedHTTPURL = Account.normalizeHTTPURL(a.httpURL, wsURL: a.wsURL)
+                if normalizedHTTPURL != a.httpURL {
+                    a.httpURL = normalizedHTTPURL
+                    needsPersist = true
+                }
                 a.token = (try? readTokenKeychain(accountID: a.id)) ?? ""
                 return a
             }
         }
         currentID = d.string(forKey: Self.currentIDKey) ?? accounts.first?.id
+        if needsPersist { persist() }
     }
 
     private func persist() {

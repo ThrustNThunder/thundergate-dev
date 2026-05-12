@@ -7,19 +7,35 @@
 import SwiftUI
 
 public struct SettingsView: View {
+    @Environment(\.dismiss) private var dismiss
 
     @StateObject private var store = UserStore.shared
+    private let connectionStore: ThunderCommStore?
 
     @State private var displayName = ""
     @State private var phone = ""
+    @State private var phoneDisplay = ""
     @State private var showSignOutConfirm = false
     @State private var showAddAgent = false
     @State private var showChangePassword = false
     @State private var biometricsError: String?
+    @State private var profileSaved = false
+    @State private var endpointDraft = ""
+    @State private var tokenDraft = ""
+    @State private var senderDraft = ""
+    @State private var connectionDraftsLoaded = false
+    @State private var isSavingConnection = false
+    @State private var isTokenVisible = false
 
     public var onSignedOut: (() -> Void)?
 
     public init(onSignedOut: (() -> Void)? = nil) {
+        self.connectionStore = nil
+        self.onSignedOut = onSignedOut
+    }
+
+    init(connectionStore: ThunderCommStore?, onSignedOut: (() -> Void)? = nil) {
+        self.connectionStore = connectionStore
         self.onSignedOut = onSignedOut
     }
 
@@ -27,11 +43,21 @@ public struct SettingsView: View {
         NavigationStack {
             Form {
                 accountSection
+                connectionSection
                 securitySection
                 agentsSection
             }
             .navigationTitle("Settings")
-            .onAppear { syncFromStore() }
+            .onAppear {
+                syncFromStore()
+                syncConnectionDraftsIfNeeded()
+            }
+            .onChange(of: store.currentUser?.displayName) { _, _ in
+                syncFromStore()
+            }
+            .onChange(of: store.currentUser?.phoneNumber) { _, _ in
+                syncFromStore()
+            }
             .sheet(isPresented: $showAddAgent) {
                 AddAgentView { _ in showAddAgent = false }
             }
@@ -53,6 +79,15 @@ public struct SettingsView: View {
     private func syncFromStore() {
         displayName = store.currentUser?.displayName ?? ""
         phone = store.currentUser?.phoneNumber ?? ""
+        phoneDisplay = formatPhone(phone)
+    }
+
+    private func syncConnectionDraftsIfNeeded() {
+        guard !connectionDraftsLoaded, let connectionStore else { return }
+        endpointDraft = connectionStore.endpointText
+        tokenDraft = connectionStore.token
+        senderDraft = connectionStore.senderName
+        connectionDraftsLoaded = true
     }
 
     // MARK: - Account
@@ -69,9 +104,22 @@ public struct SettingsView: View {
             TextField("Display name", text: $displayName)
                 .onSubmit { saveProfileEdits() }
 
-            TextField("Phone (optional)", text: $phone)
+            TextField("Phone (optional)", text: $phoneDisplay)
                 .keyboardType(.phonePad)
+                .textContentType(.telephoneNumber)
+                .onChange(of: phoneDisplay) { _, newValue in
+                    let digits = String(newValue.filter(\.isNumber).prefix(10))
+                    phone = digits
+                    let formatted = formatPhone(digits)
+                    if formatted != newValue {
+                        phoneDisplay = formatted
+                    }
+                }
                 .onSubmit { saveProfileEdits() }
+
+            Button(profileSaved ? "Profile saved" : "Save profile") {
+                saveProfileEdits()
+            }
 
             if let role = store.currentUser?.role {
                 HStack {
@@ -85,15 +133,108 @@ public struct SettingsView: View {
     }
 
     private func saveProfileEdits() {
-        guard var user = store.currentUser else { return }
-        user.displayName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        user.phoneNumber = phone.isEmpty ? nil : phone
-        // Mutating UserStore from here is fine — currentUser's setter is private,
-        // so we re-add the user via the same code path sign-up uses.
-        UserDefaults.standard.set(
-            try? JSONEncoder().encode(user),
-            forKey: "thunder.user.account.v1"
-        )
+        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        store.updateProfile(displayName: trimmedName, phoneNumber: phone)
+        displayName = store.currentUser?.displayName ?? trimmedName
+        phone = store.currentUser?.phoneNumber ?? phone
+        phoneDisplay = formatPhone(phone)
+        profileSaved = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            profileSaved = false
+        }
+        // Propagate the new display name to the live wire sender so outgoing
+        // messages don't keep using the stale name until a cold launch. The
+        // helper no-ops if the user has set an explicit Connection-section
+        // override, so this can't clobber a conscious chat-sender choice.
+        connectionStore?.applyProfileDisplayName(trimmedName)
+    }
+
+    private func formatPhone(_ digits: String) -> String {
+        let clean = Array(digits.filter(\.isNumber).prefix(10))
+        switch clean.count {
+        case 0:
+            return ""
+        case 1...3:
+            return "(" + String(clean)
+        case 4...6:
+            return "(" + String(clean[0..<3]) + ") " + String(clean[3..<clean.count])
+        default:
+            return "(" + String(clean[0..<3]) + ") " + String(clean[3..<6]) + "-" + String(clean[6..<clean.count])
+        }
+    }
+
+    // MARK: - Connection
+    //
+    // Same endpoint/token/sender knobs that used to live in the header's
+    // ellipsis menu. Folding them in here means there's exactly one
+    // settings surface — the gear — instead of two near-identical entry
+    // points. Only present when SettingsView is given a connectionStore;
+    // the public init (sign-up flow) skips this section because the chat
+    // shell hasn't booted yet.
+
+    @ViewBuilder
+    private var connectionSection: some View {
+        if let connectionStore {
+            Section {
+                TextField("wss://relay.thunderai.us", text: $endpointDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .font(.callout.monospaced())
+
+                Group {
+                    if isTokenVisible {
+                        TextField("Gateway token", text: $tokenDraft)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .font(.callout.monospaced())
+                    } else {
+                        SecureField("Gateway token", text: $tokenDraft)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                }
+
+                Button(isTokenVisible ? "Hide token" : "Show token") {
+                    isTokenVisible.toggle()
+                }
+                .font(.caption.weight(.semibold))
+
+                TextField("Display name", text: $senderDraft)
+                    .textInputAutocapitalization(.words)
+                    .autocorrectionDisabled()
+
+                Button {
+                    isSavingConnection = true
+                    connectionStore.updateConnectionSettings(
+                        endpoint: endpointDraft,
+                        token: tokenDraft,
+                        senderName: senderDraft
+                    )
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        isSavingConnection = false
+                        dismiss()
+                    }
+                } label: {
+                    Label(isSavingConnection ? "Saving..." : "Save & reconnect",
+                          systemImage: isSavingConnection ? "checkmark.circle.fill" : "arrow.triangle.2.circlepath")
+                }
+                .disabled(isSavingConnection)
+
+                if connectionStore.isUsingCustomEndpoint {
+                    Button(role: .destructive) {
+                        connectionStore.resetEndpoint()
+                        endpointDraft = connectionStore.endpointText
+                    } label: {
+                        Label("Reset endpoint to default", systemImage: "arrow.uturn.backward")
+                    }
+                }
+            } header: {
+                Text("Connection")
+            } footer: {
+                Text("Live chat endpoint, token, and the display name other peers see.")
+            }
+        }
     }
 
     // MARK: - Security

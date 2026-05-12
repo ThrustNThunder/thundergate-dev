@@ -25,8 +25,8 @@ public struct AddAgentView: View {
 
     @State private var agentName: String = "Jon"
     @State private var agentEmoji: String = "⚡"
-    @State private var wsURL: String = "wss://thunderai.us"
-    @State private var httpURL: String = "https://thunderai.us"
+    @State private var wsURL: String = "wss://relay.thunderai.us"
+    @State private var httpURL: String = "https://relay.thunderai.us"
     @State private var token: String = ""
 
     @State private var isVerifying = false
@@ -68,9 +68,15 @@ public struct AddAgentView: View {
     private var chooseStep: some View {
         VStack(spacing: 16) {
             Spacer()
-            Text("How do you want to connect?")
+            Text("Bring your own agent")
                 .font(.title2.bold())
                 .multilineTextAlignment(.center)
+
+            Text("Scan a QR code or enter the details manually. This is the BYOAA lane, and ThunderCommo verifies the agent identity before it joins your workspace.")
+                .font(.callout)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
 
             Button {
                 step = .qr
@@ -108,6 +114,12 @@ public struct AddAgentView: View {
 
             Text("Point at the agent's QR code")
                 .foregroundStyle(.secondary)
+
+            Text("QR keeps the token out of the keyboard path and drops you straight into KYA verification.")
+                .font(.footnote)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
 
             Button("Enter manually instead") { step = .manual }
                 .padding()
@@ -150,6 +162,9 @@ public struct AddAgentView: View {
             Section("Token") {
                 SecureField("Bearer token", text: $token)
                     .textContentType(.password)
+                Text("Manual entry is the fallback. ThunderCommo still runs KYA verification before it saves this BYOAA connection.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
             Section {
                 Button("Verify Agent") { step = .verify }
@@ -184,7 +199,7 @@ public struct AddAgentView: View {
 
                 Spacer()
 
-                Button("This is the agent I want to connect") { confirm(kya: kya) }
+                Button("Trust and connect this agent") { confirm(kya: kya) }
                     .buttonStyle(.borderedProminent)
                     .frame(maxWidth: .infinity)
 

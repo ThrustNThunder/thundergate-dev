@@ -1,13 +1,19 @@
 
 import SwiftUI
 
+extension ThunderCommMessage: LookAboveMessage {}
+
 struct MessageListView: View {
     let messages: [ThunderCommMessage]
     let localSender: String
+    let localPeerId: String
     let activeIndicators: [ThunderCommActivityIndicator]
     let streamingPreviews: [ThunderCommStreamingPreview]
     let hasOlderMessages: Bool
     let loadOlderMessages: () -> Void
+    let deleteMessage: (ThunderCommMessage) -> Void
+    let retryMessage: (ThunderCommMessage) -> Void
+    let deliveryState: (ThunderCommMessage) -> ThunderCommDeliveryState?
 
     @State private var didInitialScroll = false
 
@@ -27,13 +33,24 @@ struct MessageListView: View {
                     }
 
                     ForEach(messages) { message in
-                        MessageBubble(message: message, localSender: localSender)
-                            .id(message.id)
+                        MessageBubble(
+                            message: message,
+                            localSender: localSender,
+                            localPeerId: localPeerId,
+                            deliveryState: deliveryState(message),
+                            onDelete: {
+                                deleteMessage(message)
+                            },
+                            onRetry: {
+                                retryMessage(message)
+                            }
+                        )
+                        .id(message.id)
                     }
 
                     ForEach(streamingPreviews) { preview in
                         StreamingPreviewBubble(preview: preview)
-                            .id("stream-\(preview.id)-\(preview.updatedAt)")
+                            .id("stream-\(preview.id)")
                     }
 
                     if !activeIndicators.isEmpty {
@@ -55,7 +72,11 @@ struct MessageListView: View {
             .onChange(of: messages.last?.id) { _, _ in
                 scrollToBottom(proxy: proxy, animated: true)
             }
-            .onChange(of: streamingPreviews.map { "\($0.id)-\($0.updatedAt)" }.joined(separator: ",")) { _, _ in
+            .onChange(of: streamingPreviews.map { "\($0.id)-\($0.text)" }.joined(separator: ",")) { _, _ in
+                scrollToBottom(proxy: proxy, animated: true)
+            }
+            .onChange(of: activeIndicators.map { "\($0.id)-\($0.updatedAt)" }.joined(separator: ",")) { _, newValue in
+                guard !newValue.isEmpty else { return }
                 scrollToBottom(proxy: proxy, animated: true)
             }
         }
@@ -64,7 +85,7 @@ struct MessageListView: View {
     private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
         if let lastPreview = streamingPreviews.last {
             let action = {
-                proxy.scrollTo("stream-\(lastPreview.id)-\(lastPreview.updatedAt)", anchor: .bottom)
+                proxy.scrollTo("stream-\(lastPreview.id)", anchor: .bottom)
             }
             if animated {
                 withAnimation(.easeOut(duration: 0.2)) { action() }
@@ -145,6 +166,25 @@ private struct ThinkingDotsView: View {
         }
         .onAppear {
             phase = true
+        }
+    }
+}
+
+extension MessageListView {
+    static func inferTargetAgent(from messages: [ThunderCommMessage], channel: String) -> String? {
+        switch LightweightContextEngine.inferTargetAgent(from: messages, channel: channel) {
+        case .explicit(let id):
+            return id
+        case .inferred(let id, let confidence):
+            #if DEBUG
+            print("[look-above] inferred \(id) (confidence \(String(format: "%.2f", confidence))) on channel \(channel)")
+            #endif
+            return id
+        case .none:
+            #if DEBUG
+            print("[look-above] no agent inferred on channel \(channel), caller should broadcast")
+            #endif
+            return nil
         }
     }
 }

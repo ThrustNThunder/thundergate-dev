@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ConnectionStatusView: View {
     let state: ThunderCommConnectionState
+    var routeLabel: String? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -27,7 +28,10 @@ struct ConnectionStatusView: View {
         case .authenticating:
             return "Authenticating"
         case .connected:
-            return "Connected to #tnt"
+            if let routeLabel, !routeLabel.isEmpty {
+                return "Connected to \(routeLabel)"
+            }
+            return "Connected"
         case .reconnecting(let delay):
             return "Reconnecting in \(Int(delay))s"
         case .failed(let message):

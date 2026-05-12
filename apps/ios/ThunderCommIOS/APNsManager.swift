@@ -45,10 +45,22 @@ public final class APNsManager: NSObject {
     // receive it, regardless of whether we have an account yet.
     private var lastUploadedToken: String?
 
+    // Prevent duplicate bootstrap/register calls when both AppDelegate and
+    // SwiftUI scene lifecycle try to kick APNs off during launch.
+    private var didBootstrap = false
+
     // The token the server has confirmed (200/204) it accepted. Stays nil
     // until /api/devices/token returns 2xx, so we can detect "received from
     // APNs but never accepted by server" and retry after onboarding.
     private var lastConfirmedUpload: String?
+
+    // Token waiting to be retried after a timeout or missing account.
+    private var pendingAPNsDeviceToken: String?
+
+    // Prevent duplicate POSTs when APNs delivers a token before the account
+    // exists and onboarding/sign-in both trigger retries.
+    private var inflightUploadHex: String?
+    private var inflightUploadTask: Task<Void, Never>?
 
     // Call this from your App's `init` or `applicationDidFinishLaunching`.
     //
@@ -58,6 +70,9 @@ public final class APNsManager: NSObject {
     // the onboarding primer (see `requestUserAuthorization`). Silent pushes
     // do not require user authorization, so registering up-front is fine.
     public func bootstrap() {
+        guard !didBootstrap else { return }
+        didBootstrap = true
+        NSLog("[APNs] bootstrap called")
         registerBackgroundTask()
         // Safe to call regardless of permission state; this gives us a
         // device token for silent push even if the user later denies alerts.
@@ -101,9 +116,11 @@ public final class APNsManager: NSObject {
 
     public func handleDeviceToken(_ tokenData: Data) {
         let token = tokenData.map { String(format: "%02x", $0) }.joined()
+        NSLog("[APNs] handleDeviceToken called: \(token.prefix(8))...")
         lastUploadedToken = token
+        pendingAPNsDeviceToken = token
         guard token != lastConfirmedUpload else { return }
-        Task { await uploadToken(token) }
+        enqueueUpload(token)
     }
 
     public func handleRegistrationFailure(_ error: Error) {
@@ -114,24 +131,63 @@ public final class APNsManager: NSObject {
     // initial uploadToken() call short-circuited on a nil AccountStore.current.
     // The OnboardingView calls this after a new account is committed.
     public func retryTokenUploadIfNeeded() {
-        guard let token = lastUploadedToken else { return }
+        NSLog("[APNs] retryTokenUploadIfNeeded called")
+        guard let token = pendingAPNsDeviceToken ?? lastUploadedToken else {
+            // APNs never handed us a token before onboarding completed (e.g.
+            // first-launch registration raced ahead of network). Kick another
+            // registration so Apple re-issues; otherwise we'd silently stall
+            // with no device token on the server.
+            UIApplication.shared.registerForRemoteNotifications()
+            return
+        }
         if token == lastConfirmedUpload { return }
-        Task { await uploadToken(token) }
+        enqueueUpload(token)
+    }
+
+    private func enqueueUpload(_ hexToken: String) {
+        if inflightUploadHex == hexToken, inflightUploadTask != nil { return }
+        inflightUploadHex = hexToken
+        inflightUploadTask = Task { [weak self] in
+            defer {
+                Task { @MainActor [weak self] in
+                    self?.inflightUploadTask = nil
+                    self?.inflightUploadHex = nil
+                }
+            }
+            await self?.uploadToken(hexToken)
+        }
     }
 
     private func uploadToken(_ hexToken: String) async {
-        guard let account = AccountStore.shared.current else { return }
-        // Register device token via the public relay so clients no longer
-        // need direct access to ThunderBase. The relay exposes
-        // /api/devices/token and will forward/store the registration.
-        guard let url = URL(string: "https://relay.thunderai.us/api/devices/token") else { return }
+        var account: Account? = AccountStore.shared.current
+        if account == nil {
+            for attempt in 0..<30 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                account = AccountStore.shared.current
+                if account != nil {
+                    NSLog("[APNs] uploadToken: account available after \((attempt + 1) * 100)ms")
+                    break
+                }
+            }
+        }
+        guard let account else {
+            NSLog("[APNs] uploadToken: no account after 3s, caching token for retry")
+            pendingAPNsDeviceToken = hexToken
+            return
+        }
+        NSLog("[APNs] uploadToken: account.httpURL = \(account.httpURL)")
+        let urlString = account.httpURL + "/api/devices/token"
+        NSLog("[APNs] uploadToken: request URL = \(urlString)")
+        guard let url = URL(string: urlString) else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         do {
-            req.setValue("Bearer \(try await AuthManager.shared.currentToken())", forHTTPHeaderField: "Authorization")
+            let bearer = try await AuthManager.shared.currentToken()
+            NSLog("[APNs] uploadToken: auth token lookup succeeded")
+            req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         } catch {
-            NSLog("[APNs] no auth token, deferring upload")
+            NSLog("[APNs] uploadToken: auth token lookup threw \(error)")
             return
         }
         let body: [String: Any] = [
@@ -147,6 +203,7 @@ public final class APNsManager: NSObject {
                 NSLog("[APNs] token upload non-2xx: \(http.statusCode)")
             } else {
                 lastConfirmedUpload = hexToken
+                pendingAPNsDeviceToken = nil
                 AccountStore.shared.updateDeviceToken(hexToken, for: account.id)
             }
         } catch {

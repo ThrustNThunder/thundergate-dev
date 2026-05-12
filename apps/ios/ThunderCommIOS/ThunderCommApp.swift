@@ -5,6 +5,10 @@ struct ThunderCommApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        NSLog("[APNs] ThunderCommApp init")
+    }
+
     var body: some Scene {
         WindowGroup {
             AuthGate {
@@ -15,6 +19,11 @@ struct ThunderCommApp: App {
             .environmentObject(DeliveryCore.shared)
             .environmentObject(AuthManager.shared)
             .environmentObject(AccountStore.shared)
+            .onAppear {
+                Task { @MainActor in
+                    APNsManager.shared.bootstrap()
+                }
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             DeliveryCore.shared.handleScenePhase(phase)

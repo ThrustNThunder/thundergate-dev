@@ -3,7 +3,7 @@
 // First-run setup for a new account on this device.
 //
 // Five steps:
-//   1. Gateway URLs        (defaults: wss://thunderai.us + https://thunderai.us)
+//   1. Gateway URLs        (defaults: wss://relay.thunderai.us + https://relay.thunderai.us)
 //   2. Gateway token       (paste or scan; we don't validate format)
 //   3. Display name
 //   4. Connect test        (WS handshake AND GET /api/inbox?since=0 must succeed)
@@ -24,8 +24,8 @@ public struct OnboardingView: View {
     private let onComplete: (Account) -> Void
 
     @State private var step: Step = .gateway
-    @State private var wsURL: String = "wss://thunderai.us"
-    @State private var httpURL: String = "https://thunderai.us"
+    @State private var wsURL: String = "wss://relay.thunderai.us"
+    @State private var httpURL: String = "https://relay.thunderai.us"
     @State private var token: String = ""
     @State private var displayName: String = ""
     @State private var testState: TestState = .idle
@@ -155,14 +155,14 @@ public struct OnboardingView: View {
                 .font(.subheadline).foregroundStyle(.secondary)
 
             Text("WebSocket URL").font(.caption).foregroundStyle(.secondary)
-            TextField("wss://thunderai.us", text: $wsURL)
+            TextField("wss://relay.thunderai.us", text: $wsURL)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)
                 .keyboardType(.URL)
 
             Text("HTTP URL").font(.caption).foregroundStyle(.secondary)
-            TextField("https://thunderai.us", text: $httpURL)
+            TextField("https://relay.thunderai.us", text: $httpURL)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)

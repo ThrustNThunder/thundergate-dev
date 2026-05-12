@@ -56,9 +56,23 @@ public struct SignUpView: View {
 
     private var credentialsStep: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Create your account")
-                .font(.largeTitle.bold())
-                .padding(.top, 24)
+            HStack(spacing: 8) {
+                Image(systemName: "bolt.fill")
+                    .font(.title.weight(.bold))
+                    .foregroundStyle(brandGradient)
+                Text("ThunderCommo")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(brandGradient)
+            }
+            .padding(.top, 24)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Create your account")
+                    .font(.largeTitle.bold())
+                Text("A workspace where you and your agents can sync up.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
 
             TextField("Email", text: $email)
                 .keyboardType(.emailAddress)
@@ -280,17 +294,28 @@ public struct SignUpView: View {
     // MARK: - Step 5: done
 
     private var doneStep: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: 22) {
             Spacer()
-            Text("⚡")
-                .font(.system(size: 80))
-            Text("Welcome, \(store.currentUser?.displayName ?? "")")
-                .font(.largeTitle.bold())
-                .multilineTextAlignment(.center)
+            Image(systemName: "bolt.fill")
+                .font(.system(size: 72, weight: .bold))
+                .foregroundStyle(brandGradient)
 
-            Text("Now connect an agent to start chatting.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+            VStack(spacing: 10) {
+                Text("Welcome, \(store.currentUser?.displayName ?? "")")
+                    .font(.largeTitle.bold())
+                    .multilineTextAlignment(.center)
+
+                Text("Connect an agent to finish setup.")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                Text("Once connected, agents and other humans share your channels — that's the whole point.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
 
             Spacer()
 
@@ -301,11 +326,23 @@ public struct SignUpView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .controlSize(.large)
 
             Button("I'll do it later") { onFinished?() }
                 .buttonStyle(.borderless)
         }
         .padding()
+    }
+
+    private var brandGradient: LinearGradient {
+        LinearGradient(
+            colors: [
+                Color(red: 0.66, green: 0.42, blue: 0.98),
+                Color(red: 0.92, green: 0.55, blue: 1.0)
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
     }
 
     // MARK: - Helpers

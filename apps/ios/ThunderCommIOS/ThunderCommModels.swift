@@ -21,9 +21,17 @@ enum ThunderCommContentKind: String, Codable {
     case file
 }
 
+enum ThunderCommDeliveryState: String, Codable {
+    case sending
+    case sent
+    case delivered
+    case failed
+}
+
 enum ThunderCommRoute: String, CaseIterable, Identifiable {
     case tnt
     case jmab
+    case channel
     case direct
 
     var id: String { rawValue }
@@ -119,8 +127,6 @@ enum ThunderCommParticipantIdentity {
             return "mack"
         case "michael":
             return "michael"
-        case let token where token.hasPrefix("ios-michael"):
-            return "michael"
         case "alex":
             return "alex"
         case "burt", "alex-bridge", "alexbridge":
@@ -133,10 +139,18 @@ enum ThunderCommParticipantIdentity {
             return "system"
         case let token where token.hasPrefix("thunderbase-"):
             return mappedCanonicalID(for: String(token.dropFirst("thunderbase-".count)))
-        case let token where token.hasPrefix("mac-"):
-            return mappedCanonicalID(for: String(token.dropFirst("mac-".count)))
+        case let token where token.hasPrefix("mac-mack"):
+            return "mack"
         case let token where token.hasPrefix("ios-"):
-            return mappedCanonicalID(for: String(token.dropFirst("ios-".count)))
+            // Generic device-prefixed identity: ios-<userKey>-<uuid>.
+            // Strip the prefix, take the userKey segment, fall back to the
+            // raw segment if it's not in the known table so non-Michael
+            // accounts surface as themselves rather than collapsing to one
+            // of us.
+            let stripped = String(token.dropFirst("ios-".count))
+            let segment = stripped.components(separatedBy: "-").first ?? stripped
+            if segment.isEmpty { return nil }
+            return mappedCanonicalID(for: segment) ?? segment
         default:
             return nil
         }
@@ -153,7 +167,11 @@ enum ThunderCommParticipantIdentity {
         case "rex": return "Rex"
         case "sasha": return "Sasha"
         case "system": return "System"
-        default: return nil
+        default:
+            // Unknown but stable canonical (e.g. a custom signed-in user).
+            // Title-case it so they show up as a name, not "Human".
+            guard let first = canonical.first else { return nil }
+            return first.uppercased() + canonical.dropFirst()
         }
     }
 
@@ -271,6 +289,12 @@ struct FederationAuthPayload: Encodable {
     let peerId: String
     let channels: [String]
     let model: String? = nil
+    // Single replay floor for the subscribed bundle. We intentionally use the
+    // oldest known channel timestamp when subscribing to multiple channels so
+    // a busy room like #tnt cannot suppress replay for a quieter DM thread.
+    // This may allow some duplicate replay on reconnect, but merge() de-dupes
+    // by message id and correctness matters more than shaving a few repeats.
+    let afterTimestamp: Int64?
 }
 
 struct FederationMessagePayload: Encodable {
@@ -301,6 +325,8 @@ struct ThunderCommHistoryRequestPayload: Encodable {
     let channel: String
     let limit: Int
     let lastMessageId: String? = nil
+    // See FederationAuthPayload.afterTimestamp — same semantics.
+    let afterTimestamp: Int64?
 }
 
 struct ThunderCommTypingPayload: Codable, Equatable {
@@ -399,6 +425,7 @@ struct ThunderCommActivityIndicator: Identifiable, Equatable {
     let id: String
     let displayName: String
     let senderType: ThunderCommSenderType
+    let channel: String
     let updatedAt: Int64
 }
 
@@ -428,15 +455,33 @@ enum ThunderCommInboundEvent {
 
 enum ThunderCommIdentity {
     private static let peerIdKey = "ThunderComm.peerId"
+    private static let peerIdUserKey = "ThunderComm.peerIdUserKey"
 
-    static func loadOrCreatePeerId() -> String {
+    /// Returns a stable peerId for the current device, scoped to the signed-in
+    /// user's normalized key. If the userKey changes (account switch on the
+    /// same device), a fresh peerId is minted so the new account doesn't
+    /// inherit the old one's identity.
+    static func loadOrCreatePeerId(forUserKey userKey: String? = nil) -> String {
         let defaults = UserDefaults.standard
-        if let existing = defaults.string(forKey: peerIdKey), !existing.isEmpty {
+        let resolved = sanitize(userKey) ?? "anon"
+        let storedKey = defaults.string(forKey: peerIdUserKey)
+        if storedKey == resolved,
+           let existing = defaults.string(forKey: peerIdKey),
+           !existing.isEmpty {
             return existing
         }
-        let created = "ios-michael-\(UUID().uuidString.lowercased())"
+        let created = "ios-\(resolved)-\(UUID().uuidString.lowercased())"
         defaults.set(created, forKey: peerIdKey)
+        defaults.set(resolved, forKey: peerIdUserKey)
         return created
+    }
+
+    private static func sanitize(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        let cleaned = value.lowercased().filter { $0.isLetter || $0.isNumber }
+        return cleaned.isEmpty ? nil : cleaned
     }
 }
 

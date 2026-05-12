@@ -4,40 +4,66 @@ import UIKit
 struct MessageBubble: View {
     let message: ThunderCommMessage
     let localSender: String
+    let localPeerId: String
+    let deliveryState: ThunderCommDeliveryState?
+    let onDelete: (() -> Void)?
+    let onRetry: (() -> Void)?
 
     @State private var copiedCodeBlockIndex: Int?
 
+    init(
+        message: ThunderCommMessage,
+        localSender: String,
+        localPeerId: String,
+        deliveryState: ThunderCommDeliveryState?,
+        onDelete: (() -> Void)? = nil,
+        onRetry: (() -> Void)? = nil
+    ) {
+        self.message = message
+        self.localSender = localSender
+        self.localPeerId = localPeerId
+        self.deliveryState = deliveryState
+        self.onDelete = onDelete
+        self.onRetry = onRetry
+    }
+
     var body: some View {
-        HStack {
+        HStack(alignment: .bottom, spacing: 10) {
             if isLocal {
-                Spacer(minLength: 36)
+                Spacer(minLength: 52)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: isLocal ? .trailing : .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if isLocal {
+                        Spacer(minLength: 0)
+                    }
+
                     Text(senderLine)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(senderColor)
-                    Text(timestampText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
 
-                VStack(alignment: .leading, spacing: 10) {
+                    Text(timestampText)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+
+                    if let deliveryState, isLocal {
+                        deliveryBadge(for: deliveryState)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: isLocal ? .trailing : .leading)
+
+                VStack(alignment: isLocal ? .trailing : .leading, spacing: 10) {
                     ForEach(Array(messageSegments.enumerated()), id: \.offset) { index, segment in
                         switch segment {
                         case .text(let text):
                             if !text.isEmpty {
                                 Text(text)
-                                    .font(.body)
+                                    .font(.system(size: 14))
                                     .foregroundStyle(.primary)
+                                    .multilineTextAlignment(isLocal ? .trailing : .leading)
                                     .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contextMenu {
-                                        Button("Copy") {
-                                            UIPasteboard.general.string = text
-                                        }
-                                    }
+                                    .frame(maxWidth: .infinity, alignment: isLocal ? .trailing : .leading)
                             }
                         case .code(let language, let code):
                             CodeBlockView(
@@ -58,12 +84,43 @@ struct MessageBubble: View {
                     }
                 }
             }
-            .padding(12)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
             .background(bubbleColor)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .frame(maxWidth: bubbleMaxWidth, alignment: isLocal ? .trailing : .leading)
+            .overlay(alignment: .topTrailing) {
+                if isLocal, deliveryState == .failed {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .background(Circle().fill(Color(uiColor: .secondarySystemBackground)))
+                        .offset(x: 6, y: -6)
+                }
+            }
+            .contextMenu {
+                Button("Copy") {
+                    UIPasteboard.general.string = message.text
+                }
+                if isLocal, deliveryState == .failed, let onRetry {
+                    Button("Retry send", systemImage: "arrow.clockwise") {
+                        onRetry()
+                    }
+                }
+                if let onDelete {
+                    Button("Delete", role: .destructive) {
+                        onDelete()
+                    }
+                }
+            }
+            .onTapGesture {
+                guard isLocal, deliveryState == .failed, let onRetry else { return }
+                onRetry()
+            }
+            .frame(maxWidth: .infinity, alignment: isLocal ? .trailing : .leading)
 
             if !isLocal {
-                Spacer(minLength: 36)
+                Spacer(minLength: 52)
             }
         }
     }
@@ -73,11 +130,21 @@ struct MessageBubble: View {
     }
 
     private var isLocal: Bool {
-        message.senderType == .human && participantKey == localParticipantKey
+        guard message.senderType == .human else { return false }
+
+        if let originPeer = message.originPeer?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !originPeer.isEmpty,
+           originPeer.caseInsensitiveCompare(localPeerId) == .orderedSame {
+            return true
+        }
+
+        return participantKey == localParticipantKey
     }
 
     private var bubbleColor: Color {
-        senderColor.opacity(isLocal ? 0.22 : 0.14)
+        isLocal
+            ? senderColor.opacity(0.24)
+            : Color(uiColor: .tertiarySystemFill).opacity(0.95)
     }
 
     private var senderLine: String {
@@ -107,7 +174,7 @@ struct MessageBubble: View {
         ThunderCommParticipantIdentity.canonicalID(
             sender: localSender,
             agentId: nil,
-            participantId: nil,
+            participantId: localPeerId,
             senderType: .human
         )
     }
@@ -124,6 +191,33 @@ struct MessageBubble: View {
             return message.senderType == .agent
                 ? Color(red: 0.80, green: 0.84, blue: 0.92)
                 : Color(red: 0.72, green: 0.72, blue: 0.80)
+        }
+    }
+
+    private var bubbleMaxWidth: CGFloat {
+        min(UIScreen.main.bounds.width * 0.74, 360)
+    }
+
+    @ViewBuilder
+    private func deliveryBadge(for state: ThunderCommDeliveryState) -> some View {
+        switch state {
+        case .sending:
+            Label("Sending", systemImage: "clock")
+                .labelStyle(.iconOnly)
+                .foregroundStyle(.secondary)
+        case .sent:
+            Image(systemName: "checkmark")
+                .foregroundStyle(.secondary)
+        case .delivered:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.secondary)
+        case .failed:
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.clockwise.circle.fill")
+                Text("Tap to retry")
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.red)
         }
     }
 }
