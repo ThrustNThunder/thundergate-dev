@@ -17,7 +17,7 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { readFileSync, watchFile, statSync, appendFileSync, writeFileSync, existsSync, openSync } from 'fs';
+import { readFileSync, watchFile, statSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { createServer } from 'http';
@@ -39,14 +39,6 @@ const EXTERNAL_USERS = {
   'alex-thundercommo-4a365924ea69066effbb9ed88fead6c7': 'Alex',
   'burt-thundercommo-placeholder': 'Burt',
 };
-
-// Agents that participate via OpenClaw/Slack and never connect directly to the
-// federation relay. They show as online whenever the OpenClaw gateway is healthy,
-// so iOS rosters don't render them as offline just because they aren't on the relay.
-const OPENCLAW_AGENTS = new Set(
-  (process.env.TC_OPENCLAW_AGENTS || 'mack,rex')
-    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-);
 
 // ── Model info ──────────────────────────────────────────────────────────────
 
@@ -85,17 +77,6 @@ const federationPeers = new Set(); // track online federation peers
 let transcriptPath = null;
 let transcriptSize  = 0;
 let lastMessageId   = null;
-let lastDispatchChannel = 'tnt'; // track which channel triggered the last dispatch — used for reply routing
-
-// Optimistic gateway health — flipped to false on chat.send failure, back to true on
-// the next success. Drives "online" status for OPENCLAW_AGENTS in the roster.
-let gatewayHealthy = true;
-function setGatewayHealthy(healthy) {
-  if (gatewayHealthy === healthy) return;
-  gatewayHealthy = healthy;
-  console.log(`[Bridge] Gateway health changed → ${healthy ? 'healthy' : 'unhealthy'}`);
-  broadcastRoster();
-}
 
 // ── Find current session transcript ───────────────────────────────────────
 
@@ -242,9 +223,7 @@ function broadcastAgentMessage(id, text, timestamp) {
     recentlyBroadcast.delete(firstId);
   }
   
-  // Reply on the same channel that triggered the dispatch (DM vs #tnt)
-  const replyChannel = lastDispatchChannel || 'tnt';
-  console.log(`[Bridge] Broadcasting agent message on ${replyChannel}: ${text.slice(0, 60)}…`);
+  console.log(`[Bridge] Broadcasting agent message: ${text.slice(0, 60)}…`);
   const msgTimestamp = timestamp || Date.now();
   
   // Broadcast to local web clients
@@ -252,16 +231,16 @@ function broadcastAgentMessage(id, text, timestamp) {
     type: 'message',
     id,
     agentId: AGENT_ID,
-    channel: replyChannel,
+    channel: 'tnt',
     text,
     timestamp: msgTimestamp,
   });
   
-  // Federation relay — use tnt for channel messages, direct channel for DMs
+  // Also send to federation relay so other agents can see Jon's responses
   if (federationWs && federationWs.readyState === WebSocket.OPEN) {
     federationWs.send(JSON.stringify({
       type: 'federation_message',
-      channel: replyChannel,
+      channel: 'tnt',
       text,
       sender: 'Jon',
       senderType: 'agent',
@@ -343,7 +322,6 @@ function dispatchToAgent(text) {
     child.on('close', code => {
       if (code !== 0) {
         console.error('[Bridge] chat.send failed:', stderr);
-        setGatewayHealthy(false);
         broadcast({
           type: 'error',
           code: 'INVALID_MESSAGE',
@@ -352,7 +330,6 @@ function dispatchToAgent(text) {
         reject(new Error(stderr));
       } else {
         console.log('[Bridge] chat.send dispatched:', stdout.trim().slice(0, 80));
-        setGatewayHealthy(true);
         resolve(JSON.parse(stdout || '{}'));
       }
     });
@@ -472,11 +449,9 @@ wss.on('connection', (ws, req) => {
         return;
 
       case 'subscribe': {
-        // If client sends afterTimestamp, only deliver messages newer than that.
-        // This prevents replay storms on reconnect / force-quit relaunch.
-        // History disabled temporarily — iOS sends afterTimestamp once that fix ships
-        const filtered = [];
-        ws.send(JSON.stringify({ type: 'history', messages: filtered, hasMore: false }));
+        // Send recent history
+        const history = loadHistory(30);
+        ws.send(JSON.stringify({ type: 'history', messages: history, hasMore: false }));
         ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.lastMessageId || 'init', messageId: 'history-sent' }));
         break;
       }
@@ -526,12 +501,11 @@ wss.on('connection', (ws, req) => {
         
         // Direct message to Jon — dispatch immediately, no mention required
         if (channel === 'direct' && (!msg.agentId || msg.agentId === AGENT_ID_SELF)) {
-          // Track channel so reply routes back to the DM thread
-          lastDispatchChannel = `direct:${AGENT_ID}`;
-          // Ack immediately before dispatching
-          ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.idempotencyKey, messageId: randomUUID() }));
           broadcast({ type: 'thinking', agentId: AGENT_ID });
-          dispatchToAgent(text).catch(() => { /* error already broadcast */ });
+          try {
+            await dispatchToAgent(text);
+          } catch (e) { /* error already broadcast */ }
+          ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.idempotencyKey, messageId: randomUUID() }));
           break;
         }
 
@@ -572,16 +546,16 @@ wss.on('connection', (ws, req) => {
           }
         }
         
-        // Track channel so reply routes back to #tnt
-        lastDispatchChannel = 'tnt';
-        // Ack immediately — iOS ack means "received", not "agent replied".
-        // Dispatch async so the ack is never delayed by gateway processing time.
-        ws.send(JSON.stringify({
-          type: 'ack',
-          idempotencyKey: msg.idempotencyKey,
-          messageId: randomUUID(),
-        }));
-        dispatchToAgent(text).catch(() => { /* error already broadcast */ });
+        try {
+          await dispatchToAgent(text);
+          ws.send(JSON.stringify({
+            type: 'ack',
+            idempotencyKey: msg.idempotencyKey,
+            messageId: randomUUID(),
+          }));
+        } catch (e) {
+          // Error already broadcast above
+        }
         break;
       }
       
@@ -639,82 +613,6 @@ setInterval(() => {
   }
 }, 30000);
 
-// ── CLI Jon launcher (trigger-file watcher) ──────────────────────────────
-//
-// When /home/ubuntu/cli-jon-trigger.txt is written with a non-empty body,
-// spawn CLI Jon (`claude`) as a detached child using that body as the
-// prompt, then clear the trigger so the next write fires again. Lets Jon
-// launch CLI Jon from any channel (Slack, ThunderCommo, WhatsApp) by
-// writing to the trigger file — the bridge is a long-lived systemd
-// service and is not subject to the per-message exec sandbox that
-// constrains the agent itself.
-
-const CLI_JON_TRIGGER_FILE = process.env.TC_CLI_JON_TRIGGER || '/home/ubuntu/cli-jon-trigger.txt';
-const CLI_JON_LAUNCHER_LOG = process.env.TC_CLI_JON_LOG || '/tmp/cli-jon-launcher.log';
-const CLI_JON_BIN          = process.env.TC_CLI_JON_BIN || '/home/ubuntu/.npm-global/bin/claude';
-const CLI_JON_CWD          = process.env.TC_CLI_JON_CWD || '/home/ubuntu';
-
-function appendLauncherLog(line) {
-  try {
-    appendFileSync(CLI_JON_LAUNCHER_LOG, `[${new Date().toISOString()}] ${line}\n`);
-  } catch (err) {
-    console.warn(`[Launcher] log write failed: ${err.message}`);
-  }
-}
-
-function handleTriggerChange(curr, prev) {
-  // Skip if size is zero (we clear after firing) or nothing changed.
-  if (curr.size === 0) return;
-  if (curr.size === prev.size && curr.mtimeMs === prev.mtimeMs) return;
-
-  let prompt = '';
-  try {
-    prompt = readFileSync(CLI_JON_TRIGGER_FILE, 'utf8').trim();
-  } catch (err) {
-    appendLauncherLog(`read trigger failed: ${err.message}`);
-    return;
-  }
-  if (!prompt) return;
-
-  appendLauncherLog(`fired with prompt (${prompt.length} chars): ${prompt.slice(0, 120).replace(/\n/g, ' ')}`);
-
-  let child;
-  try {
-    const logFile = `${CLI_JON_LAUNCHER_LOG}.${Date.now()}.out`;
-    const logFd = openSync(logFile, 'a');
-    child = spawn(CLI_JON_BIN, ['--dangerously-skip-permissions', '-p', prompt], {
-      detached: true,
-      stdio: ['ignore', logFd, logFd],
-      cwd: CLI_JON_CWD,
-      env: { ...process.env, PATH: `/home/ubuntu/.npm-global/bin:${process.env.PATH}` },
-    });
-    child.unref();
-  } catch (err) {
-    appendLauncherLog(`spawn failed: ${err.message}`);
-    return;
-  }
-  appendLauncherLog(`spawned PID ${child.pid}`);
-
-  // Clear the trigger so the next write is detected as a state change.
-  try {
-    writeFileSync(CLI_JON_TRIGGER_FILE, '');
-  } catch (err) {
-    appendLauncherLog(`clear trigger failed: ${err.message}`);
-  }
-}
-
-// Ensure the trigger file exists so watchFile has something to poll.
-try {
-  if (!existsSync(CLI_JON_TRIGGER_FILE)) {
-    writeFileSync(CLI_JON_TRIGGER_FILE, '');
-  }
-} catch (err) {
-  console.warn(`[Launcher] could not initialize trigger file: ${err.message}`);
-}
-
-watchFile(CLI_JON_TRIGGER_FILE, { interval: 2000, persistent: false }, handleTriggerChange);
-console.log(`[Launcher] watching ${CLI_JON_TRIGGER_FILE} (poll 2s) → spawns ${CLI_JON_BIN}`);
-
 console.log('[ThunderCommo Bridge] Starting…');
 
 // ── Federation connection (for peer status) ──────────────────────────────
@@ -750,8 +648,6 @@ function connectToRelay() {
     lastRelayActivity = Date.now();
     try {
       const msg = JSON.parse(data.toString());
-      if (msg.type === 'federation_message') {
-      }
       
       if (msg.type === 'federation_status') {
         console.log(`[Federation] Status: ${msg.status}, peers: ${msg.peers?.join(', ')}`);
@@ -770,8 +666,6 @@ function connectToRelay() {
       
       // Forward federated messages to web clients
       if (msg.type === 'federation_message') {
-        if (msg.channel === 'direct' || String(msg.channel || '').startsWith('direct:')) {
-        }
         // Skip messages that originated from us — we already broadcast them directly
         const fromSelf = msg.originPeer && msg.originPeer.includes('thunderbase');
         if (!fromSelf) {
@@ -785,19 +679,15 @@ function connectToRelay() {
           });
         }
         
-        // Check if Jon should respond
+        // Check if Jon should respond (mentioned in the message)
         const text = msg.text || '';
         const mentionPatterns = ['jon', '@jon', 'Jon', '@Jon'];
         const hasMention = mentionPatterns.some(p => text.includes(p));
-        const targetedAgent = msg.agentId ? String(msg.agentId).toLowerCase() : null;
-        const normalizedChannel = String(msg.channel || '').toLowerCase();
-        const isDirect = normalizedChannel === 'direct:jon' || (normalizedChannel === 'direct' && targetedAgent === 'jon');
-        const isTargetedTnt = (normalizedChannel === 'tnt' || normalizedChannel === 'team') && targetedAgent === 'jon';
-
-        if ((hasMention || isDirect || isTargetedTnt) && msg.originPeer && !msg.originPeer.includes('thunderbase')) {
-          // Message from another agent/peer mentions Jon, targets him in #tnt, or is a direct DM
-          const reason = isDirect ? 'DM' : isTargetedTnt ? 'targeted #tnt' : 'mention';
-          console.log(`[Federation] ${reason} from ${msg.sender || msg.originPeer}, dispatching`);
+        
+        const isDirect = msg.channel === 'direct:jon';
+        if ((hasMention || isDirect) && msg.originPeer && !msg.originPeer.includes('thunderbase')) {
+          // Message from another agent/peer mentions Jon or is a direct DM — dispatch to Jon
+          console.log(`[Federation] ${isDirect ? 'DM' : 'mention'} from ${msg.sender || msg.originPeer}, dispatching`);
           const envelope = `[${msg.sender || msg.originPeer}] [#${msg.channel}] [TO:jon]: ${text}`;
           dispatchToAgent(envelope);
         }
@@ -845,15 +735,10 @@ function getModelForPeer(peerId) {
 
 function buildRoster() {
   const currentModel = resolveCurrentModel().model;
-  // Federation relay = strongest signal. OpenClaw-known agents (Mack/Rex) reach us
-  // through the OpenClaw gateway / Slack — never the relay — so absence from the
-  // federation peer list does NOT mean they're offline.
-  const isOnline = (id) =>
-    federationPeers.has(id) || (gatewayHealthy && OPENCLAW_AGENTS.has(id));
   return [
     { id: 'jon',   name: 'Jon',   status: federationPeers.has('jon') || AGENT_ID_SELF === 'jon' ? 'online' : 'offline', role: 'Technical Director', model: currentModel },
-    { id: 'mack',  name: 'Mack',  status: isOnline('mack') ? 'online' : 'offline', role: 'Operations', model: getModelForPeer('mack') || 'openai/gpt-5.4-mini' },
-    { id: 'rex',   name: 'Rex',   status: isOnline('rex') ? 'online' : 'offline', role: 'AA Automation' },
+    { id: 'mack',  name: 'Mack',  status: federationPeers.has('mack') ? 'online' : 'offline', role: 'Operations', model: getModelForPeer('mack') || 'openai/gpt-5.4-mini' },
+    { id: 'rex',   name: 'Rex',   status: federationPeers.has('rex') ? 'online' : 'offline', role: 'AA Automation' },
   ];
 }
 

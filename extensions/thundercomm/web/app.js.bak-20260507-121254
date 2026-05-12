@@ -1,0 +1,612 @@
+/**
+ * ThunderComm Web UI — app.js
+ *
+ * Wire protocol: per THUNDERCOMM_MASTER.md
+ * Session model: one persistent session, all surfaces are windows
+ * 
+ * Input modes: Ambient 🎙️ | Push-to-talk 🎤 | Silent 🔇
+ * UI: Streaming text, thinking indicator, connection status, agent roster
+ *
+ * Jon | ThunderBase | 2026-05-06
+ */
+
+// ── State ─────────────────────────────────────────────────────────────────
+
+const state = {
+  ws: null,
+  token: null,
+  host: null,
+  channel: 'tnt',
+  agentId: null,          // null = team channel
+  inputMode: 'silent',    // 'ambient' | 'ptt' | 'silent'
+  streamBuffer: null,     // { msgEl, textEl, agentId } — current streaming message
+  reconnectTimer: null,
+  reconnectAttempts: 0,
+  agents: {},             // { id: { status, name } }
+  pendingKey: null,       // idempotency key of in-flight send
+  allMessages: [],        // all messages across all channels, for filtering
+};
+
+const INPUT_MODES = ['ambient', 'ptt', 'silent'];
+const MODE_ICONS  = { ambient: '🎙️', ptt: '🎤', silent: '🔇' };
+
+// ── DOM refs ──────────────────────────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+const messagesEl    = $('messages');
+const thinkingEl    = $('thinking-indicator');
+const llmIndicator  = $('llm-indicator');
+const textInputEl   = $('text-input');
+const sendBtn       = $('send-btn');
+const connDot       = $('conn-status');
+const chatTitle     = $('chat-title');
+const inputModeBtn  = $('input-mode-toggle');
+const authOverlay   = $('auth-overlay');
+const tokenInput    = $('token-input');
+const hostInput     = $('host-input');
+const connectBtn    = $('connect-btn');
+const authError     = $('auth-error');
+
+// ── Channel helpers ───────────────────────────────────────────────────
+
+function normalizeChannel(channel) {
+  if (!channel) return 'tnt';
+  if (channel === 'team') return 'tnt';
+  if (channel.startsWith('#')) return channel.slice(1);
+  return channel;
+}
+
+// Check if a message channel should be visible in the current view
+// tnt + direct = same stream, jmab = separate
+function shouldShowInCurrentView(msgChannel) {
+  const current = state.channel;
+  
+  // JMAB is isolated — only show JMAB messages in JMAB view
+  if (current === 'jmab') return msgChannel === 'jmab';
+  if (msgChannel === 'jmab') return current === 'jmab';
+  
+  // Everything else (tnt, direct) shares the same stream
+  return true;
+}
+
+// ── Markdown renderer ───────────────────────────────────────────────────
+
+function renderMarkdown(text) {
+  // Escape HTML first
+  const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  // Split into code blocks and non-code blocks
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  let html = '';
+
+  for (const part of parts) {
+    if (part.startsWith('```')) {
+      // Code block
+      const lines = part.split('\n');
+      const lang = lines[0].replace('```','').trim();
+      const code = lines.slice(1, -1).join('\n');
+      html += `<div class="code-block"><div class="code-lang">${esc(lang) || 'code'}</div><pre><code>${esc(code)}</code></pre><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>`;
+    } else {
+      // Inline formatting
+      let p = esc(part);
+      // Inline code
+      p = p.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+      // Bold
+      p = p.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      // Bullet lists
+      p = p.replace(/^[ \t]*[-*] (.+)$/gm, '<li>$1</li>');
+      p = p.replace(/(<li>.*<\/li>\n?)+/g, s => `<ul>${s}</ul>`);
+      // Line breaks
+      p = p.replace(/\n/g, '<br>');
+      html += p;
+    }
+  }
+  return html;
+}
+
+function copyCode(btn) {
+  const code = btn.previousElementSibling.textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 2000);
+  });
+}
+
+// ── LLM Indicator ────────────────────────────────────────────────────
+
+function updateLlmIndicator(model, thinking) {
+  const m = model || 'unknown';
+  // Shorten model name for display
+  let label = m
+    .replace('anthropic/', '')
+    .replace('claude-sonnet-4-6', 'Sonnet 4.6')
+    .replace('claude-opus-4-5', 'Opus 4.5')
+    .replace('openai/', '')
+    .replace('gpt-5.4', 'GPT-5.4')
+    .replace('xai/', '')
+    .replace('grok-4', 'Grok-4');
+  const thinkingLabel = thinking && thinking !== 'off' ? ` ★${thinking}` : '';
+  llmIndicator.textContent = label + thinkingLabel;
+  llmIndicator.title = `Model: ${m}${thinking ? ' | Reasoning: ' + thinking : ''}`;
+}
+
+// ── Auth & connect ────────────────────────────────────────────────────────
+
+// Try to restore saved credentials
+const saved = {
+  token: localStorage.getItem('tc_token'),
+  host:  localStorage.getItem('tc_host'),
+};
+if (saved.token && saved.host) {
+  tokenInput.value = saved.token;
+  hostInput.value  = saved.host;
+  // Don't auto-connect — let user confirm
+}
+
+connectBtn.addEventListener('click', () => {
+  const token = tokenInput.value.trim();
+  const host  = hostInput.value.trim();
+  if (!token || !host) {
+    showAuthError('Token and host are required.');
+    return;
+  }
+  state.token = token;
+  state.host  = host;
+  localStorage.setItem('tc_token', token);
+  localStorage.setItem('tc_host',  host);
+  connect();
+});
+
+tokenInput.addEventListener('keydown', e => { if (e.key === 'Enter') connectBtn.click(); });
+hostInput.addEventListener('keydown',  e => { if (e.key === 'Enter') connectBtn.click(); });
+
+function showAuthError(msg) {
+  authError.textContent = msg;
+  authError.classList.remove('hidden');
+}
+
+// ── WebSocket connection ──────────────────────────────────────────────────
+
+function connect() {
+  setConnStatus('reconnecting');
+  const url = `ws://${state.host}?token=${encodeURIComponent(state.token)}&deviceId=web-${fingerprint()}`;
+  
+  try {
+    state.ws = new WebSocket(url);
+  } catch (e) {
+    showAuthError(`Cannot connect: ${e.message}`);
+    return;
+  }
+
+  state.ws.addEventListener('open', () => {
+    state.reconnectAttempts = 0;
+    clearTimeout(state.reconnectTimer);
+    setConnStatus('online');
+    authOverlay.style.display = 'none';
+    // Subscribe — request recent history + roster
+    send({ type: 'subscribe', lastMessageId: null });
+    addSystemMsg('Connected to ThunderComm gateway ⚡');
+  });
+
+  state.ws.addEventListener('message', evt => {
+    try {
+      const msg = JSON.parse(evt.data);
+      handleMessage(msg);
+    } catch (e) {
+      console.error('[TC] Failed to parse message:', e, evt.data);
+    }
+  });
+
+  state.ws.addEventListener('close', (evt) => {
+    setConnStatus('offline');
+    addSystemMsg(`Disconnected (${evt.code}). Reconnecting…`);
+    scheduleReconnect();
+  });
+
+  state.ws.addEventListener('error', () => {
+    setConnStatus('offline');
+    scheduleReconnect();
+  });
+}
+
+function scheduleReconnect() {
+  if (state.reconnectTimer) return;
+  const delay = Math.min(1000 * Math.pow(1.5, state.reconnectAttempts), 30000);
+  state.reconnectAttempts++;
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null;
+    if (state.token && state.host) connect();
+  }, delay);
+}
+
+function send(msg) {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify(msg));
+  }
+}
+
+// ── Message handling ──────────────────────────────────────────────────────
+
+function handleMessage(msg) {
+  switch (msg.type) {
+
+    case 'status':
+      setConnStatus(msg.gateway === 'connected' ? 'online' : 'reconnecting');
+      if (msg.model) updateLlmIndicator(msg.model, msg.thinking);
+      break;
+
+    case 'roster':
+      updateRoster(msg.agents);
+      break;
+
+    case 'history':
+      if (msg.messages && msg.messages.length) {
+        msg.messages.forEach(m => renderAgentMsg(m.agentId, m.text, m.channel, m.id, m.timestamp));
+      }
+      break;
+
+    case 'thinking':
+      showThinking(msg.agentId);
+      break;
+
+    case 'stream':
+      appendStream(msg.agentId, msg.delta);
+      break;
+
+    case 'message':
+      if (msg.model) updateLlmIndicator(msg.model, msg.thinking);
+      // Small delay before hiding so indicator doesn't flash imperceptibly
+      setTimeout(() => {
+        hideThinking();
+        finalizeStream();
+        // Check if it's a human message (has sender) or agent message (has agentId)
+        if (msg.sender) {
+          renderHumanMsg(msg.sender, msg.text, msg.channel, msg.id, msg.timestamp);
+        } else {
+          renderAgentMsg(msg.agentId, msg.text, msg.channel, msg.id, msg.timestamp);
+        }
+      }, 100);
+      break;
+
+    case 'ack':
+      // Message delivered
+      break;
+
+    case 'system_event':
+      addSystemMsg(msg.text);
+      break;
+
+    case 'error':
+      if (msg.code === 'AUTH_FAILED') {
+        authOverlay.style.display = 'flex';
+        showAuthError(`Auth failed: ${msg.message}`);
+        setConnStatus('offline');
+      } else {
+        addSystemMsg(`Error: ${msg.message}`);
+      }
+      break;
+  }
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────
+
+function storeMessage(msg) {
+  // Store message for channel filtering
+  state.allMessages.push(msg);
+  // Keep max 500 messages in memory
+  if (state.allMessages.length > 500) state.allMessages.shift();
+}
+
+function renderAgentMsg(agentId, text, channel, id, timestamp, skipStore = false) {
+  const msgChannel = normalizeChannel(channel);
+  
+  // Handle missing agentId — use 'agent' as fallback
+  const safeAgentId = agentId || 'agent';
+  
+  // Store for later filtering
+  if (!skipStore) {
+    storeMessage({ type: 'agent', agentId: safeAgentId, text, channel: msgChannel, id, timestamp: timestamp || Date.now() });
+  }
+  
+  // Skip rendering if message doesn't belong to current view
+  if (!shouldShowInCurrentView(msgChannel)) return;
+  
+  const msgEl = document.createElement('div');
+  msgEl.className = 'msg agent';
+  if (id) msgEl.dataset.id = id;
+  msgEl.dataset.channel = msgChannel;
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+
+  const author = document.createElement('span');
+  author.className = `msg-author ${safeAgentId}`;
+  author.textContent = safeAgentId.charAt(0).toUpperCase() + safeAgentId.slice(1);
+
+  const time = document.createElement('span');
+  time.textContent = formatTime(timestamp || Date.now());
+
+  meta.append(author, time);
+
+  const textEl = document.createElement('div');
+  textEl.className = 'msg-text';
+  textEl.innerHTML = renderMarkdown(text);
+
+  msgEl.append(meta, textEl);
+  messagesEl.appendChild(msgEl);
+  scrollBottom();
+}
+
+function renderUserMsg(text) {
+  // Local echo disabled — server broadcasts with sender name
+  // Keeping function for backwards compatibility
+}
+
+function renderHumanMsg(sender, text, channel, id, timestamp, skipStore = false) {
+  const msgChannel = normalizeChannel(channel);
+  
+  // Store for later filtering
+  if (!skipStore) {
+    storeMessage({ type: 'human', sender, text, channel: msgChannel, id, timestamp: timestamp || Date.now() });
+  }
+  
+  // Skip rendering if message doesn't belong to current view
+  if (!shouldShowInCurrentView(msgChannel)) return;
+  
+  const msgEl = document.createElement('div');
+  msgEl.className = 'msg user';
+  if (id) msgEl.dataset.id = id;
+  msgEl.dataset.channel = msgChannel;
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+
+  const author = document.createElement('span');
+  author.className = 'msg-author human';
+  author.textContent = sender;
+
+  const time = document.createElement('span');
+  time.textContent = formatTime(timestamp || Date.now());
+
+  meta.append(author, time);
+
+  const textEl = document.createElement('div');
+  textEl.className = 'msg-text';
+  textEl.textContent = text;
+
+  msgEl.append(meta, textEl);
+  messagesEl.appendChild(msgEl);
+  scrollBottom();
+}
+
+function addSystemMsg(text) {
+  const el = document.createElement('div');
+  el.className = 'msg system';
+  el.textContent = text;
+  messagesEl.appendChild(el);
+  scrollBottom();
+}
+
+function rerenderMessagesForChannel() {
+  // Clear current messages
+  messagesEl.innerHTML = '';
+  
+  // Re-render only messages for current view
+  for (const msg of state.allMessages) {
+    if (!shouldShowInCurrentView(msg.channel)) continue;
+    
+    if (msg.type === 'agent') {
+      renderAgentMsg(msg.agentId, msg.text, msg.channel, msg.id, msg.timestamp, true);
+    } else if (msg.type === 'human') {
+      renderHumanMsg(msg.sender, msg.text, msg.channel, msg.id, msg.timestamp, true);
+    }
+  }
+}
+
+// ── Streaming ─────────────────────────────────────────────────────────────
+
+function appendStream(agentId, delta) {
+  if (!state.streamBuffer || state.streamBuffer.agentId !== agentId) {
+    // Start a new streaming message
+    finalizeStream();
+    const msgEl = document.createElement('div');
+    msgEl.className = 'msg agent';
+
+    const meta = document.createElement('div');
+    meta.className = 'msg-meta';
+    const author = document.createElement('span');
+    author.className = `msg-author ${agentId}`;
+    author.textContent = agentId.charAt(0).toUpperCase() + agentId.slice(1);
+    const time = document.createElement('span');
+    time.textContent = formatTime(Date.now());
+    meta.append(author, time);
+
+    const textEl = document.createElement('div');
+    textEl.className = 'msg-text stream-cursor';
+
+    msgEl.append(meta, textEl);
+    messagesEl.appendChild(msgEl);
+
+    state.streamBuffer = { msgEl, textEl, agentId, text: '' };
+    hideThinking();
+  }
+
+  state.streamBuffer.text += delta;
+  state.streamBuffer.textEl.textContent = state.streamBuffer.text;
+  scrollBottom();
+}
+
+function finalizeStream() {
+  if (state.streamBuffer) {
+    state.streamBuffer.textEl.classList.remove('stream-cursor');
+    state.streamBuffer = null;
+  }
+}
+
+// ── Thinking indicator ────────────────────────────────────────────────────
+
+let thinkingPending = false;
+
+function showThinking(agentId) {
+  thinkingPending = true;
+  thinkingEl.title = `${agentId || 'Jon'} is thinking…`;
+  thinkingEl.classList.remove('hidden');
+}
+
+function hideThinking() {
+  thinkingPending = false;
+  thinkingEl.classList.add('hidden');
+}
+
+// ── Connection status ─────────────────────────────────────────────────────
+
+function setConnStatus(status) {
+  // status: 'online' | 'reconnecting' | 'offline'
+  connDot.className = `status-dot ${status}`;
+  connDot.title = status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+// ── Agent roster ──────────────────────────────────────────────────────────
+
+function updateRoster(agents) {
+  state.agents = {};
+  agents.forEach(a => { state.agents[a.id] = a; });
+  
+  // Update sidebar agent dots and model indicators
+  document.querySelectorAll('.agent-dot[data-agent]').forEach(dot => {
+    const agentId = dot.dataset.agent;
+    const agent   = state.agents[agentId];
+    dot.className = `agent-dot ${agent ? agent.status : 'offline'}`;
+    
+    // Update model indicator if present
+    const btn = dot.closest('.channel-btn');
+    if (btn && agent?.model) {
+      let modelEl = btn.querySelector('.agent-model');
+      if (!modelEl) {
+        modelEl = document.createElement('span');
+        modelEl.className = 'agent-model';
+        btn.appendChild(modelEl);
+      }
+      // Shorten model name
+      const shortModel = agent.model.split('/').pop().replace(/-/g, ' ');
+      modelEl.textContent = shortModel;
+      modelEl.title = agent.model;
+    }
+  });
+}
+
+// ── Channel switching ─────────────────────────────────────────────────────
+
+document.querySelectorAll('.channel-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.channel-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.channel = btn.dataset.channel;
+    state.agentId = btn.dataset.agent || null;
+
+    const label = state.channel === 'tnt'
+      ? '# tnt'
+      : state.channel === 'jmab'
+      ? '# team JMAB'
+      : `direct: ${state.agentId}`;
+    chatTitle.textContent = label;
+    textInputEl.placeholder = `Message ${label}…`;
+
+    // Clear stream state on channel switch
+    finalizeStream();
+    hideThinking();
+    
+    // Re-render messages for this channel
+    rerenderMessagesForChannel();
+  });
+});
+
+// ── Input mode ────────────────────────────────────────────────────────────
+
+function setInputMode(mode) {
+  state.inputMode = mode;
+  inputModeBtn.textContent = MODE_ICONS[mode];
+  inputModeBtn.className   = '';
+  inputModeBtn.classList.add(mode);
+  inputModeBtn.title = `Input mode: ${mode}`;
+}
+
+setInputMode('silent');
+
+inputModeBtn.addEventListener('click', () => {
+  const idx  = INPUT_MODES.indexOf(state.inputMode);
+  const next = INPUT_MODES[(idx + 1) % INPUT_MODES.length];
+  setInputMode(next);
+  // TODO: wire ambient VAD and PTT recording when audio pipeline is ready
+  if (next !== 'silent') {
+    addSystemMsg(`Audio input (${next}) requires ThunderMind integration — text input active.`);
+    setInputMode('silent');
+  }
+});
+
+// ── Sending messages ──────────────────────────────────────────────────────
+
+function sendText() {
+  const text = textInputEl.value.trim();
+  if (!text) return;
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    addSystemMsg('Not connected. Reconnecting…');
+    return;
+  }
+
+  const idempotencyKey = crypto.randomUUID();
+  const msg = {
+    type: 'message',
+    channel: state.channel,
+    text,
+    idempotencyKey,
+  };
+  if (state.channel === 'direct' && state.agentId) {
+    msg.agentId = state.agentId;
+  }
+
+  renderUserMsg(text);
+  send(msg);
+  showThinking(state.agentId || 'jon');
+
+  textInputEl.value = '';
+  autoResize();
+}
+
+sendBtn.addEventListener('click', sendText);
+
+textInputEl.addEventListener('keydown', e => {
+  // Enter = send, Shift+Enter = newline
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendText();
+  }
+});
+
+textInputEl.addEventListener('input', autoResize);
+
+function autoResize() {
+  textInputEl.style.height = 'auto';
+  textInputEl.style.height = Math.min(textInputEl.scrollHeight, 120) + 'px';
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+
+function scrollBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function formatTime(ts) {
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function fingerprint() {
+  // Stable-ish browser fingerprint for device tracking
+  const key = 'tc_device_id';
+  let id = localStorage.getItem(key);
+  if (!id) {
+    id = crypto.randomUUID().slice(0, 8);
+    localStorage.setItem(key, id);
+  }
+  return id;
+}

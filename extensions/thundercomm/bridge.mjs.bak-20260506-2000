@@ -1,0 +1,699 @@
+#!/usr/bin/env node
+/**
+ * ThunderComm Bridge — bridge.mjs
+ *
+ * Standalone WebSocket server that bridges ThunderComm web clients
+ * to the OpenClaw gateway. No TypeScript compilation required.
+ *
+ * Architecture:
+ * - Listens on port 8765 for ThunderComm client connections
+ * - On inbound message: dispatches to OpenClaw via `openclaw gateway call chat.send`
+ * - Watches session transcript file for new agent responses → broadcasts to clients
+ *
+ * "Dispatch is a truth seam — write transcript before broadcast"
+ *  — Burt's design principle. We read FROM the transcript, not from memory.
+ *
+ * Jon | ThunderBase | 2026-05-06
+ */
+
+import { WebSocketServer, WebSocket } from 'ws';
+import { readFileSync, writeFileSync, appendFileSync, watchFile, statSync, existsSync, mkdirSync } from 'fs';
+import { execSync, spawn } from 'child_process';
+import { randomUUID } from 'crypto';
+import { createServer } from 'http';
+
+// ── Config ────────────────────────────────────────────────────────────────
+
+const BRIDGE_PORT     = parseInt(process.env.TC_BRIDGE_PORT || '8765', 10);
+const GATEWAY_TOKEN   = process.env.TC_GATEWAY_TOKEN || '4ca1100a180ad68a94b004056e56fd39c81bdccb742d2926';
+const GATEWAY_URL     = process.env.TC_GATEWAY_URL   || 'ws://localhost:18789';
+const SESSION_KEY     = process.env.TC_SESSION_KEY   || 'agent:main:thundercomm:main';
+const SESSIONS_JSON   = process.env.TC_SESSIONS_JSON  || '/home/ubuntu/.openclaw/agents/main/sessions/sessions.json';
+const AGENT_ID        = 'jon';
+const CONV_LOG_PATH   = process.env.TC_CONV_LOG || '/home/ubuntu/.openclaw/thundercomm/conversation.jsonl';
+const CONV_LOG_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
+
+// ── Federation config ────────────────────────────────────────────────────
+const FEDERATION_RELAY   = process.env.TC_FEDERATION_RELAY || 'ws://localhost:8767';
+const FEDERATION_TOKEN   = process.env.TC_FEDERATION_TOKEN || 'jmab-federation-2026';
+const FEDERATION_PEER_ID = process.env.TC_FEDERATION_PEER_ID || 'thunderbase';
+const FEDERATED_CHANNELS = (process.env.TC_FEDERATED_CHANNELS || 'jmab,tnt').split(',');
+
+// ── User tokens ──────────────────────────────────────────────────────────
+// Maps tokens to user info. Add new users here.
+const USERS = {
+  [GATEWAY_TOKEN]: { name: 'Michael', role: 'owner' },
+  'michael': { name: 'Michael', role: 'owner' },
+  'Michael': { name: 'Michael', role: 'owner' },
+  'alex-jmab-2026': { name: 'Alex', role: 'member' },
+  'burt-jmab-2026': { name: 'Burt', role: 'member' },
+  'mack-tnt-2026': { name: 'Mack', role: 'agent' },
+};
+
+// ── Conversation log ──────────────────────────────────────────────────────
+
+function convLogInit() {
+  const dir = CONV_LOG_PATH.replace(/\/[^\/]+$/, '');
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  purgeOldLogEntries();
+  // Schedule daily purge
+  setInterval(purgeOldLogEntries, 24 * 60 * 60 * 1000);
+}
+
+function purgeOldLogEntries() {
+  if (!existsSync(CONV_LOG_PATH)) return;
+  try {
+    const cutoff = Date.now() - CONV_LOG_TTL_MS;
+    const lines = readFileSync(CONV_LOG_PATH, 'utf8').split('\n').filter(l => l.trim());
+    const kept = lines.filter(l => {
+      try { return JSON.parse(l).ts > cutoff; } catch { return false; }
+    });
+    writeFileSync(CONV_LOG_PATH, kept.join('\n') + (kept.length ? '\n' : ''));
+    const removed = lines.length - kept.length;
+    if (removed > 0) console.log(`[Bridge] Conv log: purged ${removed} entries older than 72h`);
+  } catch (e) {
+    console.error('[Bridge] Conv log purge error:', e.message);
+  }
+}
+
+function convLogAppend(role, text, extra = {}) {
+  try {
+    const entry = JSON.stringify({ ts: Date.now(), role, text, ...extra });
+    appendFileSync(CONV_LOG_PATH, entry + '\n');
+  } catch (e) {
+    console.error('[Bridge] Conv log write error:', e.message);
+  }
+}
+
+// ── State ─────────────────────────────────────────────────────────────────
+
+const clients = new Map(); // clientId → { ws, deviceId, lastSeen }
+let transcriptPath = null;
+let transcriptSize  = 0;
+let lastMessageId   = null;
+
+// ── Find current session transcript ───────────────────────────────────────
+
+function resolveTranscriptPath() {
+  try {
+    const sessions = JSON.parse(readFileSync(SESSIONS_JSON, 'utf8'));
+    const sess = sessions[SESSION_KEY];
+    if (sess && sess.sessionFile) {
+      console.log(`[Bridge] Transcript: ${sess.sessionFile}`);
+      return sess.sessionFile;
+    }
+    // Fallback: construct path from sessionId
+    if (sess && sess.sessionId) {
+      const dir = SESSIONS_JSON.replace('sessions.json', '');
+      const path = `${dir}${sess.sessionId}.jsonl`;
+      console.log(`[Bridge] Transcript (constructed): ${path}`);
+      return path;
+    }
+  } catch (e) {
+    console.error('[Bridge] Could not resolve transcript path:', e.message);
+  }
+  return null;
+}
+
+// ── Read new lines from transcript ─────────────────────────────────────────
+
+function extractAssistantText(line) {
+  try {
+    const entry = JSON.parse(line);
+    if (entry.type !== 'message') return null;
+    const msg = entry.message;
+    if (!msg) return null;
+    
+    // Look for assistant text content (not tool calls, not tool results)
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      const textParts = msg.content
+        .filter(c => c.type === 'text' && c.text && c.text.trim())
+        .map(c => c.text.trim())
+        .filter(t => !t.startsWith('Human: Sender') && t !== 'NO_REPLY');
+      if (textParts.length > 0) {
+        return { id: entry.id, text: textParts.join('\n'), timestamp: entry.timestamp };
+      }
+    }
+    
+    // Also handle simple string content
+    if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.trim()) {
+      const text = msg.content.trim();
+      if (text.startsWith('Human: Sender') || text === 'NO_REPLY') return null;
+      return { id: entry.id, text, timestamp: entry.timestamp };
+    }
+  } catch {}
+  return null;
+}
+
+function checkTranscriptForNew() {
+  if (!transcriptPath) return;
+  
+  try {
+    const stat = statSync(transcriptPath);
+    if (stat.size <= transcriptSize) return;
+    
+    // Read only the new bytes
+    const content = readFileSync(transcriptPath, 'utf8');
+    const lines = content.split('\n');
+    const prevSize = transcriptSize;
+    transcriptSize = stat.size;
+    
+    // Parse all lines, find ones we haven't seen
+    // Simple approach: track last seen ID, broadcast any new assistant messages after it
+    let broadcasting = lastMessageId === null;
+    
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const result = extractAssistantText(line);
+      if (!result) continue;
+      
+      if (result.id === lastMessageId) {
+        broadcasting = true;
+        continue;
+      }
+      
+      if (broadcasting) {
+        lastMessageId = result.id;
+        broadcastAgentMessage(result.id, result.text, new Date(result.timestamp).getTime());
+      }
+    }
+    
+    // If we never found the last ID (new session or first run), mark the last assistant message as seen
+    if (!broadcasting && lines.length > 0) {
+      for (const line of [...lines].reverse()) {
+        if (!line.trim()) continue;
+        const result = extractAssistantText(line);
+        if (result) {
+          lastMessageId = result.id;
+          break;
+        }
+      }
+    }
+    
+  } catch (e) {
+    if (!e.message.includes('ENOENT')) {
+      console.error('[Bridge] Transcript read error:', e.message);
+    }
+  }
+}
+
+// ── Model info ──────────────────────────────────────────────────────────────
+
+function resolveCurrentModel() {
+  try {
+    const sessions = JSON.parse(readFileSync(SESSIONS_JSON, 'utf8'));
+    const sess = sessions[SESSION_KEY];
+    if (sess) {
+      // model is written after runs complete; fall back to openclaw default config
+      const model = sess.model || sess.modelId || resolveDefaultModel();
+      return {
+        model,
+        thinking: sess.thinkingLevel || 'off',
+      };
+    }
+  } catch {}
+  return { model: resolveDefaultModel(), thinking: 'off' };
+}
+
+function resolveDefaultModel() {
+  try {
+    const cfg = JSON.parse(readFileSync('/home/ubuntu/.openclaw/openclaw.json', 'utf8'));
+    return cfg?.agents?.main?.model || cfg?.model || 'anthropic/claude-sonnet-4-6';
+  } catch {}
+  return 'anthropic/claude-sonnet-4-6';
+}
+
+// ── Broadcast helpers ─────────────────────────────────────────────────────
+
+function broadcast(msg) {
+  const json = JSON.stringify(msg);
+  for (const [id, client] of clients) {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(json);
+    }
+  }
+}
+
+// Track federation peers and their models
+let federationPeers = new Set();
+let federationPeerModels = {};  // peerId -> model string
+
+// Build roster based on connected clients + federation peers
+function buildRoster() {
+  const connectedUsers = new Set();
+  for (const [id, client] of clients) {
+    if (client.user?.name) connectedUsers.add(client.user.name.toLowerCase());
+  }
+  
+  // Check federation peers for agent status
+  const mackOnline = federationPeers.has('mac-mack');
+  const burtOnline = federationPeers.has('alex-bridge') || connectedUsers.has('burt');
+  
+  return [
+    { id: 'jon',   name: 'Jon',   status: 'online',  role: 'Technical Director', model: resolveCurrentModel().model },
+    { id: 'mack',  name: 'Mack',  status: mackOnline ? 'online' : 'offline', role: 'Operations', model: mackOnline ? federationPeerModels['mac-mack'] || 'openai/gpt-5.4-mini' : null },
+    { id: 'rex',   name: 'Rex',   status: 'offline', role: 'AA Automation', model: 'openai/gpt-5.4' },
+    { id: 'burt',  name: 'Burt',  status: burtOnline ? 'online' : 'offline', role: 'Agent (Hermes)', model: burtOnline ? federationPeerModels['alex-bridge'] || 'hermes' : null },
+    { id: 'alex',  name: 'Alex',  status: connectedUsers.has('alex') ? 'online' : 'offline', role: 'Human', model: null },
+    { id: 'michael', name: 'Michael', status: connectedUsers.has('michael') ? 'online' : 'offline', role: 'Human', model: null },
+  ];
+}
+
+function broadcastRoster() {
+  broadcast({ type: 'roster', agents: buildRoster() });
+}
+
+function broadcastAgentMessage(id, text, timestamp, channel = 'tnt') {
+  console.log(`[Bridge] Broadcasting agent message: ${text.slice(0, 60)}…`);
+  convLogAppend('assistant', text, { id });
+  const modelInfo = resolveCurrentModel();
+  broadcast({
+    type: 'message',
+    id,
+    agentId: AGENT_ID,
+    ...modelInfo,
+    channel,
+    text,
+    timestamp: timestamp || Date.now(),
+  });
+  
+  // Send to federation if federated channel
+  sendToFederation(channel, 'Jon', 'agent', text, AGENT_ID);
+}
+
+// ── Dispatch message to OpenClaw ──────────────────────────────────────────
+
+function dispatchToAgent(text) {
+  const idempotencyKey = randomUUID();
+  const params = JSON.stringify({
+    sessionKey: SESSION_KEY,
+    message: text,
+    idempotencyKey,
+  });
+  
+  convLogAppend('user', text);
+  // Show thinking indicator immediately, keep pinging while waiting
+  const modelInfo = resolveCurrentModel();
+  broadcast({ type: 'thinking', agentId: AGENT_ID, ...modelInfo });
+  const thinkingInterval = setInterval(() => {
+    broadcast({ type: 'thinking', agentId: AGENT_ID, ...modelInfo });
+  }, 2000);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('openclaw', [
+      'gateway', 'call', 'chat.send',
+      '--url', GATEWAY_URL,
+      '--token', GATEWAY_TOKEN,
+      '--params', params,
+      '--json',
+    ]);
+    
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => stdout += d);
+    child.stderr.on('data', d => stderr += d);
+    
+    child.on('close', code => {
+      clearInterval(thinkingInterval);
+      if (code !== 0) {
+        console.error('[Bridge] chat.send failed:', stderr);
+        broadcast({
+          type: 'error',
+          code: 'INVALID_MESSAGE',
+          message: `Gateway dispatch failed: ${stderr.slice(0, 100)}`,
+        });
+        reject(new Error(stderr));
+      } else {
+        console.log('[Bridge] chat.send dispatched:', stdout.trim().slice(0, 80));
+        resolve(JSON.parse(stdout || '{}'));
+      }
+    });
+  });
+}
+
+// ── Load history from transcript ──────────────────────────────────────────
+
+function loadHistory(limit = 20) {
+  if (!transcriptPath) return [];
+  try {
+    const content = readFileSync(transcriptPath, 'utf8');
+    const lines = content.split('\n').filter(l => l.trim());
+    const messages = [];
+    
+    for (const line of lines) {
+      const result = extractAssistantText(line);
+      if (result) messages.push(result);
+    }
+    
+    // Also grab user messages
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'message' && entry.message?.role === 'user') {
+          const content = entry.message.content;
+          let text = '';
+          if (typeof content === 'string') text = content.trim();
+          else if (Array.isArray(content)) {
+            text = content.filter(c => c.type === 'text').map(c => c.text).join(' ').trim();
+          }
+          if (text) {
+            messages.push({ id: entry.id, text, timestamp: entry.timestamp, role: 'user' });
+          }
+        }
+      } catch {}
+    }
+    
+    // Sort by timestamp, return last N
+    messages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    const recent = messages.slice(-limit);
+    
+    // Mark our position
+    const lastAssistant = [...recent].reverse().find(m => !m.role);
+    if (lastAssistant) lastMessageId = lastAssistant.id;
+    
+    return recent.map(m => ({
+      type: 'message',
+      id: m.id,
+      agentId: m.role === 'user' ? 'user' : AGENT_ID,
+      channel: 'team',
+      text: m.text,
+      timestamp: new Date(m.timestamp).getTime(),
+    }));
+  } catch (e) {
+    console.error('[Bridge] History load error:', e.message);
+    return [];
+  }
+}
+
+// ── WebSocket server ──────────────────────────────────────────────────────
+
+const wss = new WebSocketServer({ port: BRIDGE_PORT });
+
+// Keepalive ping every 30 seconds to prevent tunnel/proxy timeouts
+setInterval(() => {
+  for (const [id, client] of clients) {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.ping();
+    }
+  }
+}, 30000);
+
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url || '/', `http://localhost`);
+  const token = url.searchParams.get('token');
+  
+  // Look up user by token
+  const user = USERS[token];
+  if (!user) {
+    console.warn('[Bridge] Connection rejected: unknown token');
+    ws.close(4001, 'Unauthorized');
+    return;
+  }
+  
+  const clientId  = randomUUID();
+  const deviceId  = url.searchParams.get('deviceId') || clientId.slice(0, 8);
+  
+  clients.set(clientId, { ws, deviceId, user, lastSeen: Date.now() });
+  console.log(`[Bridge] Client connected: ${user.name} / ${deviceId} (${clients.size} total)`);
+  
+  // Send initial status with model info
+  const modelInfo = resolveCurrentModel();
+  ws.send(JSON.stringify({ type: 'status', gateway: 'connected', sessionWarm: true, ...modelInfo }));
+  
+  // Send roster (dynamic based on connected clients)
+  ws.send(JSON.stringify({ type: 'roster', agents: buildRoster() }));
+  
+  // Broadcast updated roster to all OTHER clients (someone just joined)
+  setTimeout(() => broadcastRoster(), 100);
+  
+  ws.on('message', async (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch {
+      ws.send(JSON.stringify({ type: 'error', code: 'INVALID_MESSAGE', message: 'Invalid JSON' }));
+      return;
+    }
+    
+    clients.get(clientId).lastSeen = Date.now();
+    
+    switch (msg.type) {
+      case 'subscribe': {
+        // Send recent history
+        const history = loadHistory(30);
+        ws.send(JSON.stringify({ type: 'history', messages: history, hasMore: false }));
+        ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.lastMessageId || 'init', messageId: 'history-sent' }));
+        break;
+      }
+      
+      case 'message': {
+        const text = msg.text?.trim();
+        if (!text) break;
+        
+        const client = clients.get(clientId);
+        const senderName = client?.user?.name || 'Unknown';
+        const msgId = randomUUID();
+        
+        const channel = msg.channel || 'tnt';
+        
+        // Broadcast the human message to all clients
+        broadcast({
+          type: 'message',
+          id: msgId,
+          sender: senderName,
+          channel,
+          text,
+          timestamp: Date.now(),
+        });
+        
+        // Log it
+        convLogAppend('human', text, { sender: senderName });
+        
+        // Send to federation if federated channel
+        sendToFederation(channel, senderName, 'human', text);
+        
+        // Dispatch ALL messages to agent (for context)
+        // Agent decides whether to respond based on mention
+        // direct:jon = always respond
+        // #tnt, #jmab = only respond if "Jon" mentioned
+        const isDirectToJon = channel === 'direct' && msg.agentId === 'jon';
+        const mentionsJon = /\bjon\b/i.test(text);
+        const shouldRespond = isDirectToJon || mentionsJon;
+        
+        try {
+          // Always dispatch so agent sees full conversation
+          // Include flag so agent knows whether to respond
+          await dispatchToAgent(`[${senderName}] [#${channel}]${shouldRespond ? '' : ' [NO_RESPONSE]'}: ${text}`);
+          ws.send(JSON.stringify({
+            type: 'ack',
+            idempotencyKey: msg.idempotencyKey,
+            messageId: msgId,
+          }));
+        } catch (e) {
+          // Error already broadcast above
+        }
+        break;
+      }
+      
+      default:
+        ws.send(JSON.stringify({ type: 'error', code: 'INVALID_MESSAGE', message: `Unknown: ${msg.type}` }));
+    }
+  });
+  
+  ws.on('close', () => {
+    clients.delete(clientId);
+    console.log(`[Bridge] Client disconnected: ${deviceId} (${clients.size} remaining)`);
+    broadcastRoster();  // Update everyone's roster
+  });
+  
+  ws.on('error', (err) => {
+    console.error(`[Bridge] Client error ${deviceId}:`, err.message);
+    clients.delete(clientId);
+  });
+});
+
+wss.on('listening', () => {
+  console.log(`[ThunderComm Bridge] WebSocket server on ws://0.0.0.0:${BRIDGE_PORT}`);
+  console.log(`[ThunderComm Bridge] Session: ${SESSION_KEY}`);
+  console.log(`[ThunderComm Bridge] Gateway: ${GATEWAY_URL}`);
+});
+
+wss.on('error', err => console.error('[Bridge] Server error:', err));
+
+// ── Transcript watcher ────────────────────────────────────────────────────
+
+transcriptPath = resolveTranscriptPath();
+if (transcriptPath) {
+  try {
+    transcriptSize = statSync(transcriptPath).size;
+  } catch {}
+  
+  // Initialize lastMessageId from existing transcript
+  loadHistory(1); // just to set lastMessageId
+  
+  // Watch for changes (poll every 500ms — fs.watch can miss events on EC2)
+  setInterval(checkTranscriptForNew, 500);
+  console.log(`[Bridge] Watching transcript: ${transcriptPath}`);
+} else {
+  console.warn('[Bridge] No transcript path found — responses will not be delivered');
+}
+
+// Re-resolve transcript path periodically (in case session resets)
+setInterval(() => {
+  const newPath = resolveTranscriptPath();
+  if (newPath && newPath !== transcriptPath) {
+    console.log(`[Bridge] Transcript path changed: ${newPath}`);
+    transcriptPath = newPath;
+    try { transcriptSize = statSync(transcriptPath).size; } catch {}
+    lastMessageId = null;
+    loadHistory(1);
+  }
+}, 30000);
+
+convLogInit();
+console.log('[ThunderComm Bridge] Starting…');
+
+// ── Federation client ─────────────────────────────────────────────────────
+
+let federationWs = null;
+let federationReconnectTimer = null;
+
+function connectFederation() {
+  if (federationWs && federationWs.readyState === WebSocket.OPEN) return;
+  
+  console.log(`[Federation] Connecting to relay: ${FEDERATION_RELAY}`);
+  
+  try {
+    federationWs = new WebSocket(FEDERATION_RELAY);
+  } catch (e) {
+    console.error('[Federation] Connection failed:', e.message);
+    scheduleFederationReconnect();
+    return;
+  }
+  
+  federationWs.on('open', () => {
+    console.log('[Federation] Connected to relay');
+    // Authenticate
+    // Send auth with model info
+    const modelInfo = resolveCurrentModel();
+    federationWs.send(JSON.stringify({
+      type: 'federation_auth',
+      peerId: FEDERATION_PEER_ID,
+      token: FEDERATION_TOKEN,
+      channels: FEDERATED_CHANNELS,
+      model: modelInfo.model,
+    }));
+  });
+  
+  federationWs.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+    
+    if (msg.type === 'federation_status') {
+      console.log(`[Federation] Status: ${msg.status}, peers: ${msg.peers?.join(', ')}`);
+      if (msg.peers) {
+        federationPeers = new Set(msg.peers);
+        if (msg.models) {
+          federationPeerModels = msg.models;
+        }
+        broadcastRoster();
+      }
+    }
+    
+    if (msg.type === 'federation_peers') {
+      console.log(`[Federation] Peers updated: ${msg.peers?.join(', ')}`);
+      if (msg.peers) {
+        federationPeers = new Set(msg.peers);
+        if (msg.models) {
+          federationPeerModels = msg.models;
+        }
+        broadcastRoster();
+      }
+    }
+    
+    if (msg.type === 'federation_message') {
+      // Inject federated message into local clients
+      console.log(`[Federation] Received: ${msg.sender} (${msg.originPeer}) → #${msg.channel}`);
+      
+      // Broadcast to local clients
+      if (msg.senderType === 'agent') {
+        broadcast({
+          type: 'message',
+          id: msg.id,
+          agentId: msg.agentId,
+          channel: msg.channel,
+          text: msg.text,
+          timestamp: msg.timestamp,
+        });
+      } else {
+        broadcast({
+          type: 'message',
+          id: msg.id,
+          sender: msg.sender,
+          channel: msg.channel,
+          text: msg.text,
+          timestamp: msg.timestamp,
+        });
+      }
+      
+      // Log it
+      convLogAppend(msg.senderType === 'agent' ? 'agent' : 'human', msg.text, { 
+        sender: msg.sender, 
+        federated: true, 
+        originPeer: msg.originPeer 
+      });
+      
+      // Check if agent should respond to federated message
+      if (msg.senderType !== 'agent' && msg.originPeer !== FEDERATION_PEER_ID) {
+        const text = msg.text;
+        const channel = msg.channel;
+        const mentionsAgent = new RegExp(`\\b${AGENT_ID}\\b`, 'i').test(text);
+        const shouldRespond = mentionsAgent;
+        
+        if (shouldRespond) {
+          dispatchToAgent(`[${msg.sender}] [#${channel}]: ${text}`);
+        }
+      }
+    }
+  });
+  
+  federationWs.on('close', () => {
+    console.log('[Federation] Disconnected from relay');
+    federationWs = null;
+    scheduleFederationReconnect();
+  });
+  
+  federationWs.on('error', (err) => {
+    console.error('[Federation] Error:', err.message);
+  });
+}
+
+function scheduleFederationReconnect() {
+  if (federationReconnectTimer) return;
+  federationReconnectTimer = setTimeout(() => {
+    federationReconnectTimer = null;
+    connectFederation();
+  }, 5000);
+}
+
+// Send message to federation relay (called for federated channels)
+function sendToFederation(channel, sender, senderType, text, agentId = null) {
+  if (!FEDERATED_CHANNELS.includes(channel)) return;
+  if (!federationWs || federationWs.readyState !== WebSocket.OPEN) return;
+  
+  const msg = {
+    type: 'federation_message',
+    channel,
+    sender,
+    senderType,
+    text,
+    timestamp: Date.now(),
+    originPeer: FEDERATION_PEER_ID,
+    id: randomUUID(),
+  };
+  if (agentId) msg.agentId = agentId;
+  
+  federationWs.send(JSON.stringify(msg));
+  console.log(`[Federation] Sent: ${sender} → #${channel}`);
+}
+
+// Start federation connection
+connectFederation();
