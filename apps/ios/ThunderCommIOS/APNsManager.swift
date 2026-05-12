@@ -83,7 +83,13 @@ public final class APNsManager: NSObject {
             let granted = try await center.requestAuthorization(options: [.alert, .badge, .sound])
             // If the user just granted, re-register so APNs hands us a token
             // bound to the now-permitted environment.
-            if granted { UIApplication.shared.registerForRemoteNotifications() }
+            if granted {
+                UIApplication.shared.registerForRemoteNotifications()
+            } else {
+                // Surface the decline so the chat root can show an in-app
+                // banner inviting the user to enable later via Settings.
+                NotificationCenter.default.post(name: .notificationsDeclined, object: nil)
+            }
             return granted
         } catch {
             NSLog("[APNs] auth request failed: \(error)")
@@ -115,7 +121,10 @@ public final class APNsManager: NSObject {
 
     private func uploadToken(_ hexToken: String) async {
         guard let account = AccountStore.shared.current else { return }
-        guard let url = URL(string: account.httpURL + "/api/devices/token") else { return }
+        // Register device token via the public relay so clients no longer
+        // need direct access to ThunderBase. The relay exposes
+        // /api/devices/token and will forward/store the registration.
+        guard let url = URL(string: "https://relay.thunderai.us/api/devices/token") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
