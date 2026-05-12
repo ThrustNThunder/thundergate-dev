@@ -187,8 +187,9 @@ public final class APNsManager: NSObject {
             NSLog("[APNs] uploadToken: auth token lookup succeeded")
             req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         } catch {
-            NSLog("[APNs] uploadToken: auth token lookup threw \(error)")
-            return
+            NSLog("[APNs] uploadToken: auth token lookup threw \(error), falling back to account token")
+            guard !account.token.isEmpty else { return }
+            req.setValue("Bearer \(account.token)", forHTTPHeaderField: "Authorization")
         }
         let body: [String: Any] = [
             "device_token": hexToken,
