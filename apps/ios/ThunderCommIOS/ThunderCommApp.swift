@@ -19,11 +19,6 @@ struct ThunderCommApp: App {
             .environmentObject(DeliveryCore.shared)
             .environmentObject(AuthManager.shared)
             .environmentObject(AccountStore.shared)
-            .onAppear {
-                Task { @MainActor in
-                    APNsManager.shared.bootstrap()
-                }
-            }
         }
         .onChange(of: scenePhase) { _, phase in
             DeliveryCore.shared.handleScenePhase(phase)
