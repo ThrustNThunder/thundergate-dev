@@ -21,8 +21,11 @@ import { ensureConfig } from '../config/index.js';
 import { ChannelRegistry, type ContextEntry, type OutboundDelivery } from '../channels/index.js';
 import { ThunderCommoChannel, newMessageId } from '../channels/thundercommo.js';
 import { BrowserBridgeChannel } from '../channels/browser.js';
-import { GhostHarness } from '../ghost/harness.js';
+import { GhostHarness, type GhostTurn } from '../ghost/harness.js';
 import { getGhostSystemPrompt, setGhostContextDB } from '../ghost/context.js';
+import { WorldState, ProcessingMode } from '../world/state.js';
+import { ProvenanceLedger } from '../provenance/ledger.js';
+import { LocalInferenceProvider } from '../inference/local_provider.js';
 
 // Runtime state
 interface RuntimeState {
@@ -43,12 +46,22 @@ export class ThunderGateRuntime {
   private channels: ChannelRegistry;
   private ghost: GhostHarness | null = null;
   private state: RuntimeState;
+  // Awareness substrate. WorldState holds the situational snapshot any
+  // path can read before composing a turn (today: processingMode +
+  // local-inference liveness; future: device, network, tone trend, …).
+  // ProvenanceLedger is the audit log of state transitions. The
+  // LocalInferenceProvider is what flips processingMode when ThunderMind
+  // becomes reachable.
+  private world: WorldState;
+  private provenance!: ProvenanceLedger;
+  private localInference!: LocalInferenceProvider;
 
   constructor(configPath?: string) {
     // Phase 3: ensureConfig writes the default config.json on first run
     // and then loads it. configPath override still honored for tests.
     this.config = configPath ? loadConfig(configPath) : ensureConfig();
     this.channels = new ChannelRegistry();
+    this.world = new WorldState();
     this.state = {
       status: 'starting',
       sessionId: '',
@@ -57,6 +70,19 @@ export class ThunderGateRuntime {
       surfaceLayerActive: false,
       lastActivity: new Date()
     };
+  }
+
+  /** Awareness substrate — read by Doctor + the message path. */
+  getWorldState(): WorldState {
+    return this.world;
+  }
+
+  getLocalInference(): LocalInferenceProvider | undefined {
+    return this.localInference;
+  }
+
+  getProvenanceLedger(): ProvenanceLedger | undefined {
+    return this.provenance;
   }
 
   /** Public accessor — used by Doctor and CLI ghost commands. */
@@ -96,6 +122,17 @@ export class ThunderGateRuntime {
     this.checkpoint = loadCheckpoint() ?? saveCheckpoint({});
     this.state.contextTokens = this.checkpoint.contextTokenEstimate;
     console.log(`  ✓ Checkpoint loaded (${this.checkpoint.contextTokenEstimate} tokens)`);
+
+    // Provenance ledger + local inference probe come up before Doctor
+    // so the first health tick sees the right liveness snapshot.
+    this.provenance = new ProvenanceLedger(this.config.localInference.provenanceFile);
+    this.localInference = new LocalInferenceProvider(this.config, this.world, this.provenance);
+    this.localInference.start();
+    if (this.config.localInference.enabled) {
+      console.log(`  ✓ Local inference probe started (${this.config.localInference.endpoint})`);
+    } else {
+      console.log('  ℹ Local inference disabled in config — staying on cloud mode');
+    }
 
     // Start doctor monitoring
     this.doctor = new Doctor(this);
@@ -157,7 +194,9 @@ export class ThunderGateRuntime {
     // Phase 3: start Ghost harness if configured. Failure is non-fatal.
     if (this.config.ghost.enabled) {
       try {
-        this.ghost = new GhostHarness(this.config, (input) => this.shadowResponse(input));
+        this.ghost = new GhostHarness(this.config, (input, history) =>
+          this.shadowResponse(input, history)
+        );
         await this.ghost.start();
       } catch (err) {
         console.warn('  ⚠ Ghost harness failed to start:', err);
@@ -222,15 +261,17 @@ export class ThunderGateRuntime {
    *      (SOUL + USER + IDENTITY + GHOST_ADDENDUM, hot-reloaded on file change).
    *   2. Call Anthropic Messages with the system block marked
    *      `cache_control: { type: "ephemeral" }` so the ~15K-token frame
-   *      is amortized across the day's shadow calls. Only the current
-   *      user input goes in the messages array — no prior turns, no
-   *      runtime context leakage.
+   *      is amortized across the day's shadow calls. The recent per-session
+   *      turn history (snapshotted by the harness at fire time) goes into
+   *      the messages array as alternating user/assistant turns, followed
+   *      by the new user input. Static block stays cacheable; only the
+   *      tail varies per call.
    *   3. Return the text response to the harness for logging. We never
    *      deliver this to a channel and never write it to the session DB.
    */
-  private async shadowResponse(input: string): Promise<string> {
+  private async shadowResponse(input: string, history: GhostTurn[]): Promise<string> {
     const system = getGhostSystemPrompt();
-    return this.callGhostLLM(system, input);
+    return this.callGhostLLM(system, input, history);
   }
 
   /**
@@ -245,10 +286,21 @@ export class ThunderGateRuntime {
    * the harness logs absent responses as `[ghost: not yet ready]` and
    * Doctor surfaces that as an error-rate signal.
    */
-  private async callGhostLLM(system: string, userInput: string): Promise<string> {
+  private async callGhostLLM(
+    system: string,
+    userInput: string,
+    history: GhostTurn[] = []
+  ): Promise<string> {
     const model = this.config.ghost.model;
     const maxTokens = this.config.ghost.maxTokens;
     const temperature = this.config.ghost.temperature;
+
+    // Build the chat tail: prior turns (oldest first) + the current user
+    // input. Anthropic requires alternating user/assistant roles starting
+    // with user — sanitizeHistory enforces that even if the JSONL stream
+    // produced an out-of-order sequence.
+    const chat = sanitizeHistory(history);
+    chat.push({ role: 'user', content: userInput });
 
     if (!(model.startsWith('anthropic/') || model.startsWith('claude-'))) {
       // Ghost path is Anthropic-only — caching semantics differ per provider
@@ -256,7 +308,7 @@ export class ThunderGateRuntime {
       // path for any non-Anthropic override so config typos don't 500.
       return this.callLLM([
         { role: 'system', content: system },
-        { role: 'user', content: userInput }
+        ...chat
       ]);
     }
 
@@ -278,7 +330,7 @@ export class ThunderGateRuntime {
           cache_control: { type: 'ephemeral' }
         }
       ],
-      messages: [{ role: 'user', content: userInput }]
+      messages: chat
     };
 
     try {
@@ -330,19 +382,27 @@ export class ThunderGateRuntime {
   }
 
   /**
-   * Normal processing — full context, full reasoning
+   * Normal processing — full context, full reasoning.
+   *
+   * Forks on `world.processingMode`. The CLOUD branch keeps today's
+   * behavior byte-for-byte (this is the production path). The
+   * LOCAL_INFERENCE branch unlocks a more aggressive algorithm —
+   * larger context window target, more RAG, background pre-processing
+   * hooks. Those hooks are stubs for now since ThunderMind isn't built;
+   * the wiring is the point so the surface is ready when it lands.
    */
   private async normalProcess(message: Message): Promise<Response> {
     // Check if this triggers deep mode
     const isComplex = this.evaluateComplexity(message);
-    
+
     if (isComplex) {
       this.enterDeepMode();
     }
 
-    // Process with LLM
-    const text = await this.callLLM([{ role: 'user', content: message.content }]);
-    const response: Response = { content: text, type: 'normal' };
+    const mode = this.world.effectiveMode();
+    const response = mode === ProcessingMode.LOCAL_INFERENCE
+      ? await this.processLocalInference(message)
+      : await this.processCloud(message);
 
     // Trigger engine: backstop check on each turn. Skip for ghost shadow
     // traffic — those messages have no real session row in the DB, so the
@@ -357,6 +417,80 @@ export class ThunderGateRuntime {
     }
 
     return response;
+  }
+
+  /**
+   * Cloud processing — unchanged from pre-dual-mode behavior. Single
+   * user-turn into callLLM. Cost-aware, conservative context. This is
+   * the path that runs every time ThunderMind isn't up.
+   */
+  private async processCloud(message: Message): Promise<Response> {
+    const text = await this.callLLM([{ role: 'user', content: message.content }]);
+    return { content: text, type: 'normal' };
+  }
+
+  /**
+   * Local-inference processing — runs when ThunderMind / a local 70B is
+   * reachable. Differences vs. cloud, per Michael's brief:
+   *   - Longer context window target (config.localInference.contextWindowTarget)
+   *   - More aggressive RAG retrieval (ragResultsLimit)
+   *   - Background pre-processing hooks light up
+   *   - No cost-conservation compression
+   *
+   * Today this is a thin shim that records *what would change* into
+   * provenance and falls back to the cloud LLM call. We deliberately
+   * don't route to the local endpoint yet: ThunderMind isn't built,
+   * the probe being "green" against a non-existent endpoint would be
+   * a bug, and we don't want the runtime making real calls to a
+   * placeholder. The real routing lands when ThunderMind exists.
+   */
+  private async processLocalInference(message: Message): Promise<Response> {
+    this.provenance.append({
+      actor: 'runtime',
+      action: 'process_local_inference',
+      target: 'message',
+      reason: 'processingMode = LOCAL_INFERENCE',
+      data: {
+        contextWindowTarget: this.config.localInference.contextWindowTarget,
+        ragResultsLimit: this.config.localInference.ragResultsLimit,
+        backgroundPreprocessing: this.config.localInference.enableBackgroundPreprocessing,
+        endpoint: this.config.localInference.endpoint
+      }
+    });
+
+    // Stub: aggressive-RAG hook. Real implementation pulls
+    // `ragResultsLimit` rows from FTS5/embedding store and prepends them
+    // as context blocks. Today the cloud path already runs without any
+    // RAG, so we leave the call site stubbed and tracked in provenance
+    // so it's discoverable once embeddings ship.
+    void this.localInferenceRagStub(message);
+
+    // Stub: background pre-processing. Real impl kicks off summarization,
+    // memory extraction, and proactive triggers on a worker. Stub now —
+    // wiring the runtime to spawn work it can't yet complete would be
+    // worse than a no-op with a provenance trail.
+    if (this.config.localInference.enableBackgroundPreprocessing) {
+      this.backgroundPreprocessStub(message);
+    }
+
+    // Until ThunderMind has a confirmed routing target, the actual LLM
+    // call still goes through `callLLM`. The brief explicitly requires
+    // graceful fallback when the local endpoint isn't real — this is it.
+    const text = await this.callLLM([{ role: 'user', content: message.content }]);
+    return { content: text, type: 'normal' };
+  }
+
+  /** Hook for aggressive RAG retrieval under LOCAL_INFERENCE mode. */
+  private async localInferenceRagStub(_message: Message): Promise<void> {
+    // Intentional no-op stub. Real implementation: pull
+    // config.localInference.ragResultsLimit rows from the FTS5 search +
+    // embedding store and prepend as context blocks.
+  }
+
+  /** Hook for background pre-processing under LOCAL_INFERENCE mode. */
+  private backgroundPreprocessStub(_message: Message): void {
+    // Intentional no-op stub. Real implementation: queue summarization,
+    // memory extraction, and proactive-trigger evaluation on a worker.
   }
 
   /**
@@ -541,6 +675,9 @@ export class ThunderGateRuntime {
       this.ghost = null;
     }
 
+    // Stop local inference probe.
+    try { this.localInference?.stop(); } catch { /* ignore */ }
+
     // Stop channels — drain client connections.
     try { await this.channels.stopAll(); } catch { /* ignore */ }
     console.log('  ✓ Channels stopped');
@@ -564,6 +701,32 @@ export class ThunderGateRuntime {
     this.state.status = 'stopped';
     console.log('⚡ ThunderGate stopped');
   }
+}
+
+/**
+ * Coerce a stream of harness-captured turns into the strict alternating
+ * user→assistant→user…→assistant shape Anthropic's Messages API demands.
+ * Drops empty-text turns and collapses adjacent same-role turns by
+ * keeping the last one (the freshest text in that role wins). If the
+ * sequence would start with an assistant turn we drop it — the first
+ * turn of an Anthropic call must be `user`.
+ */
+function sanitizeHistory(history: GhostTurn[]): Array<{ role: string; content: string }> {
+  const cleaned: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  for (const turn of history) {
+    const text = (turn.text ?? '').trim();
+    if (!text) continue;
+    const last = cleaned[cleaned.length - 1];
+    if (last && last.role === turn.role) {
+      last.content = text;
+    } else {
+      cleaned.push({ role: turn.role, content: text });
+    }
+  }
+  while (cleaned.length > 0 && cleaned[0].role !== 'user') {
+    cleaned.shift();
+  }
+  return cleaned;
 }
 
 // Types

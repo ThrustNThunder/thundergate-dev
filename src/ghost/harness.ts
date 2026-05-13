@@ -58,7 +58,17 @@ export interface GhostEntry {
   latency_ms: number;
 }
 
-export type GhostResponder = (input: string) => Promise<string>;
+/**
+ * A turn the harness has already seen in this session. The Ghost predictor
+ * needs prior (user, assistant) pairs to mirror Jon's voice and stay
+ * grounded in references the live agent already resolved.
+ */
+export interface GhostTurn {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export type GhostResponder = (input: string, history: GhostTurn[]) => Promise<string>;
 
 interface ParsedOpenclawLine {
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -71,9 +81,25 @@ interface SessionState {
   sessionId: string;
   offset: number;
   pendingInput: { text: string; ts: number } | null;
+  /**
+   * Completed turns for this session, oldest first. Trimmed to
+   * MAX_HISTORY_TURNS — enough context for the predictor without bloating
+   * every shadow call. A "completed" turn is a user+assistant pair where
+   * both sides have arrived; we push the user first, then update the
+   * trailing entry when the assistant line lands.
+   */
+  history: GhostTurn[];
 }
 
 const RESCAN_INTERVAL_MS = 30_000;
+/**
+ * Max prior turns we feed Ghost. 16 entries = ~8 user/assistant pairs.
+ * Big enough that "what was the CC discussion?" stays in window; small
+ * enough that Haiku stays fast and the per-call payload doesn't balloon.
+ * The static SOUL/USER/IDENTITY/ADDENDUM block is cached in the system
+ * prompt, so only this tail varies per call.
+ */
+const MAX_HISTORY_TURNS = 16;
 
 export class GhostHarness {
   private config: Config;
@@ -206,7 +232,13 @@ export class GhostHarness {
       }
 
       const sessionId = basename(name, '.jsonl');
-      this.sessions.set(path, { path, sessionId, offset: size, pendingInput: null });
+      this.sessions.set(path, {
+        path,
+        sessionId,
+        offset: size,
+        pendingInput: null,
+        history: []
+      });
       this.attachWatcher(path);
     }
   }
@@ -261,9 +293,19 @@ export class GhostHarness {
 
       if (parsed.role === 'user') {
         session.pendingInput = { text: parsed.text, ts: parsed.ts };
+        // Snapshot history at the moment of fire so Ghost sees the same
+        // context Jon had when he wrote his reply. A later assistant line
+        // that arrives before Ghost finishes must NOT leak into the
+        // prediction — that would let Ghost copy from the answer key.
+        const historyForCall = session.history.slice();
         // Fire ThunderGate in parallel with OpenClaw — we still wait for
         // OpenClaw's response to arrive before logging the pair.
-        this.askThunderGate(session.sessionId, parsed.text, parsed.ts).catch((err) => {
+        this.askThunderGate(
+          session.sessionId,
+          parsed.text,
+          parsed.ts,
+          historyForCall
+        ).catch((err) => {
           console.warn('  ⚠ Ghost ThunderGate response failed:', (err as Error).message);
         });
       } else if (parsed.role === 'assistant' && session.pendingInput) {
@@ -279,12 +321,13 @@ export class GhostHarness {
   private async askThunderGate(
     sessionId: string,
     input: string,
-    ts: number
+    ts: number,
+    history: GhostTurn[]
   ): Promise<void> {
     const started = Date.now();
     let response = '';
     try {
-      response = await this.respond(input);
+      response = await this.respond(input, history);
     } catch (err) {
       response = `[ghost error: ${(err as Error).message}]`;
     }
@@ -350,6 +393,16 @@ export class GhostHarness {
       match_tier: comparison ? comparison.tier : undefined,
       latency_ms: tg?.latency_ms ?? -1
     };
+
+    // Commit the completed pair to per-session history. We feed Jon's
+    // actual reply forward — never Ghost's — so the predictor's next
+    // call sees the same conversation Jon sees. Trim from the head to
+    // keep the window bounded.
+    session.history.push({ role: 'user', text: pending.text });
+    session.history.push({ role: 'assistant', text: openclawResponse });
+    if (session.history.length > MAX_HISTORY_TURNS) {
+      session.history.splice(0, session.history.length - MAX_HISTORY_TURNS);
+    }
 
     try {
       appendFileSync(this.logFile, JSON.stringify(entry) + '\n');

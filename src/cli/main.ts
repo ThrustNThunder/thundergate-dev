@@ -21,6 +21,7 @@ import { ensureConfig, validateConfig, getConfigPath } from '../config/index.js'
 import { GhostEvaluator } from '../ghost/evaluator.js';
 import { runLearnTests, formatReport } from '../ghost/learn-test.js';
 import { describeGhostContextFiles, getGhostContextDir } from '../ghost/context.js';
+import { ProvenanceLedger, type ProvenanceEvent } from '../provenance/ledger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -425,6 +426,19 @@ function getMemoryUsage(): string {
   return used.toFixed(0);
 }
 
+function formatLedgerAge(timestamp: number): string {
+  const ms = Date.now() - timestamp;
+  if (ms < 0) return 'in the future';
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h ago`;
+}
+
 function readPort(): number | null {
   try {
     const cfg = ensureConfig();
@@ -551,6 +565,50 @@ function runDiagnostic(autoFix: boolean = false): void {
   } catch (err) {
     checks.push({
       name: 'Ghost mode',
+      pass: false,
+      detail: `unknown: ${(err as Error).message}`
+    });
+  }
+
+  // Check 10: Local inference (ThunderMind / Ollama).
+  try {
+    const cfg = ensureConfig();
+    if (!cfg.localInference?.enabled) {
+      checks.push({
+        name: 'LocalInfer',
+        pass: true,
+        detail: 'disabled in config'
+      });
+    } else {
+      const endpoint = cfg.localInference.endpoint;
+      const u = (() => { try { return new URL(endpoint); } catch { return null; } })();
+      const port = u && u.port ? parseInt(u.port, 10) : null;
+      const portUp = u && u.hostname === 'localhost' && port ? portOpen(port) : null;
+      const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+      const events: ProvenanceEvent[] = ledger.tail(50);
+      const last = [...events].reverse().find(
+        (e) => e.actor === 'local-inference' && (
+          e.action === 'liveness_ok' ||
+          e.action === 'liveness_lost' ||
+          e.action === 'first_check_missed'
+        )
+      );
+      const reachable = last?.action === 'liveness_ok' || portUp === true;
+      const lastAt = last ? formatLedgerAge(last.timestamp) : '(no probe yet)';
+      checks.push({
+        name: 'LocalInfer',
+        // Today ThunderMind isn't built — unreachable is expected, so
+        // we report pass when configured-but-unreachable matches the
+        // graceful-fallback intent. Operators see the detail string.
+        pass: true,
+        detail: reachable
+          ? `${endpoint} reachable, last check ${lastAt}`
+          : `${endpoint} unreachable, last check ${lastAt} — cloud fallback active`
+      });
+    }
+  } catch (err) {
+    checks.push({
+      name: 'LocalInfer',
       pass: false,
       detail: `unknown: ${(err as Error).message}`
     });

@@ -51,6 +51,15 @@ export class TriggerEngine {
   constructor(db: SessionDB, backstopInterval: number = 20) {
     this.db = db;
     this.backstopInterval = backstopInterval;
+    // Seed the 'current' sessions row up-front. storeMessage() writes
+    // every turn with session_id='current', and messages.session_id FKs
+    // to sessions(id) — without this, every turn throws FOREIGN KEY
+    // constraint failed and surfaces as a ghost-log error.
+    this.ensureCurrentSession();
+  }
+
+  private ensureCurrentSession(): void {
+    this.db.ensureSession('current');
   }
 
   /**

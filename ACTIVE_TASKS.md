@@ -6,6 +6,22 @@
 
 ## 🟡 ACTIVE / NEXT
 
+### ThunderCommo iOS — DM shared-context fix (2026-05-11)
+- `routeShows(message:)` `.direct` case in
+  `apps/ios/ThunderCommIOS/ThunderCommStore.swift` rewritten to filter on
+  sender identity rather than channel: shows messages where
+  `senderType == .human` and sender matches `localParticipantID`/`senderName`
+  (Michael) OR `senderType == .agent` and `agentId`/canonical participantID
+  matches `directAgentId` (target agent, e.g. Jon).
+- Effect: DM view now shows the same continuous context as `#tnt`,
+  filtered to Michael + target agent only; other agents' messages hidden.
+  Outbound send logic and subscription/auth untouched (per brief).
+- `xcodebuild -scheme ThunderCommIOS -configuration Debug -sdk
+  iphonesimulator -destination "generic/platform=iOS Simulator"` →
+  **BUILD SUCCEEDED** on Michael@100.78.229.40 with Xcode 17 / iOS 17 SDK.
+- Per brief rules: no archive, no git push.
+- Completion summary at `/tmp/dm-shared-context-complete.txt`.
+
 ### Ghost Jon 7-Day Clock
 - Day 1 = May 10 (FK fix deployed). Need 7 consecutive clean days before cutover.
 - May 11 pressure test passed clean (54 paired entries, 0 FK errors, median 705ms).
@@ -13,13 +29,34 @@
 - Daily health check at 08:00 UTC flags err > 10%, missing score rows, and
   any FK regression newer than the deploy.
 
-### ThunderCommo Build 28 → 28b
-- Build 28 shipped (4 blockers + 4 UX fixes + TNT watermark).
-- Build 28b adds APNs registration + delivery, fixes Settings shared-suite
-  regression. Brief at `THUNDERCOMMO_BUILD28B_BRIEF.md`.
-- Full APNs iOS spec in `THUNDERCOMMO_APNS_IOS_SPEC.md` (Mack reads first,
-  then implements `didRegisterForRemoteNotificationsWithDeviceToken` +
-  Notification Service Extension).
+### ThunderCommo Build 29 — combined fix run COMPLETE (2026-05-11)
+- 9 bug-regression fixes verified (A: watermark light-mode opacity
+  0.055→0.08, B: thinking-dots expiry 8s→60s, plus 7 prior fixes
+  re-verified intact in source: `channel: String` decoding,
+  `deliveryWatchdogs`, SQLite store, ComposerBar shape, channel display,
+  profileSaved flow).
+- **APNs wiring landed**: `.openChannel` + `.notificationsDeclined`
+  Notification.Names; `UNUserNotificationCenterDelegate` on AppDelegate
+  with foreground-banner presentation and tap-to-channel routing;
+  in-app declined banner in `ContentView` with Open Settings deep-link;
+  decline-event post from `APNsManager.requestUserAuthorization`.
+- **Bug #10 (afterTimestamp replay) fixed**: store now exposes
+  `lastMessageTimestamp(for:)` (in-memory max OR persisted UserDefaults
+  snapshot), persists per-channel ts on every `merge()`, and the
+  WebSocket client carries `afterTimestamp` on both `federation_auth`
+  and `subscribe` payloads via the new `onResolveAfterTimestamp`
+  callback.
+- Source files touched live on `Michael@100.78.229.40` under
+  `~/.openclaw/workspace-mack/repos/thundergate-sparse/apps/ios/`.
+  `xcodebuild Debug iphonesimulator` → **BUILD SUCCEEDED**, 0 errors,
+  pre-existing single warning unrelated to this build.
+- `MACK_MANUAL_STEPS.md` written to `apps/ios/` covering the Xcode-only
+  steps (Push Notifications capability, Background Modes → Remote
+  notifications, Info.plist sanity, .p8 key on relay) and the
+  conservative-choice notes (existing `/api/devices/token` endpoint
+  kept; afterTimestamp added to BOTH auth + subscribe payloads).
+- Per brief rules: no archive, no git push.
+- Completion summary at `/tmp/build29-combined-complete.txt`.
 
 ### ThunderBrowser — Phase 1 in progress
 - Phase 0 scaffold (TB-0-1..TB-0-11) complete.
@@ -56,7 +93,89 @@
 ### thundercomm-stable Web UI Redesign
 - Commit `fb62e6634a` sits on Mac side. Mack handles the push.
 
-## ✅ DONE (this run, 2026-05-11)
+## ✅ DONE (Build 31 run, 2026-05-11)
+
+- **Build 31 — APNs + subscribedChannels + Jon thinking dots** (brief:
+  `/tmp/build31-brief.md`).
+  - **Task 1 (subscribedChannels loop)** — already on disk from the
+    Build 30 DM-routing run; `subscribedChannels` in
+    `ThunderCommStore.swift` (lines ~1172-1185) iterates over
+    `availableDirectAgents` and emits `direct:jon`, `direct:mack`,
+    `direct:rex` plus `tnt` / `jmab` (+ active custom channel). Verified
+    against the brief diff; no further source edit needed.
+  - **Task 2 (APNs iOS)** — `APNsManager.swift` + `AppDelegate.swift`
+    already cover authorization, decline banner via
+    `.notificationsDeclined`, device-token registration, foreground
+    banner presentation, and tap-to-channel routing via `.openChannel`.
+    Verified line-by-line. `MACK_MANUAL_STEPS_BUILD31.md` written to
+    `apps/ios/` capturing the source verification + the Xcode-only
+    steps (Push Notifications, Background Modes, Info.plist sanity,
+    .p8 key on relay) + the smoke test plan + the choices CLI Jon kept
+    conservative (endpoint still `/api/devices/token` via
+    `account.httpURL` rather than the raw `:18794/register` route).
+  - **Task 3 (Jon thinking dots)** — `bridge.mjs` at
+    `/home/ubuntu/thundergate/extensions/thundercomm/bridge.mjs` now
+    emits Mack-format `typing` events to the federation relay:
+    - In `dispatchToAgent()`, immediately after the local
+      `broadcast({ type: 'thinking', agentId })`, a `typing: true`
+      event is sent to `federationWs` with `participantId`, `agentId`,
+      `channel` (`lastDispatchChannel || 'tnt'`), `timestamp`, `model`
+      (from `resolveDefaultModel()`), `thinking: 'off'`,
+      `originPeer: thunderbase-${AGENT_ID_SELF}`, and a fresh `id`.
+    - In `broadcastAgentMessage()`, right after the existing
+      `federation_message` send, a `typing: false` event is sent with
+      the same channel + originPeer to clear the indicator the instant
+      the reply lands.
+    - Both sends are wrapped in try/catch so any relay-side hiccup
+      cannot block the actual dispatch path (the previous attempt at
+      this caused a regression per the brief).
+  - Build: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+    xcodebuild -scheme ThunderCommIOS -configuration Debug -sdk
+    iphonesimulator -destination 'generic/platform=iOS Simulator' build`
+    → **BUILD SUCCEEDED**, single pre-existing AppIntents warning
+    unrelated to this run.
+  - Per brief rules: no archive, no git push.
+  - Completion summary at `/tmp/build31-complete.txt`.
+
+## ✅ DONE (earlier 2026-05-11 runs)
+
+- **DM routing fix on iOS ThunderCommo** (brief:
+  `/tmp/dm-routing-brief.md`). Three fixes applied to Mack's iOS source
+  at `Michael@100.78.229.40:~/.openclaw/workspace-mack/repos/thundergate-sparse/apps/ios/ThunderCommIOS/`:
+  - **Fix A — multi-channel auth on (re)connect.** New `subscribedChannels`
+    computed property on `ThunderCommStore` builds `["tnt", "jmab",
+    "direct:jon", "direct:mack", "direct:rex"]` (plus the current custom
+    channel when in `.channel` route) and is passed to
+    `client.connect(channels:)`. The WebSocket client's `ActiveConnection`
+    now stores `channels: [String]` instead of a single `channel`, and
+    the auth handshake sends the full set.
+  - **Fix B — auto-route on incoming DM.** New
+    `autoRouteIfDirect(_ message:)` on the store flips
+    `currentRoute → .direct` and `directAgentId` to the matching agent
+    when a live `direct:<agent>` message arrives and the user isn't
+    already in that thread. Hooked from `append(_:)` only, so bulk
+    history replay does NOT yank the route. Skips self-sent messages.
+  - **Fix C — re-auth on DM peer switch.** New `reauth(channels:)`
+    method on `ThunderCommWebSocketClient` resends the auth payload
+    without dropping the socket. Called from
+    `setRoute(.direct, agentId:)` when already connected.
+  - Build: `xcodebuild -scheme ThunderCommIOS -configuration Debug -sdk
+    iphonesimulator` → **BUILD SUCCEEDED**, no warnings tied to the
+    two edited files. Files touched (net delta):
+    `ThunderCommStore.swift` (+65 lines),
+    `ThunderCommWebSocketClient.swift` (+20 lines). Per brief: no
+    archive, no push. Completion summary at `/tmp/dm-fix-complete.txt`.
+
+- **Build 28 pressure test (source-level)** against Mack's iOS at
+  `~/.openclaw/workspace-mack/repos/thundergate-sparse/apps/ios/`
+  on Mac (100.78.229.40, branch `thundercomm-ios`). All four blockers
+  (#1 DM routing, #2 watchdog, #3 DM context, #6 settings save) PASS
+  at source. Bugs #4, #5, #7, #8 PASS with notes. **Section I (TNT
+  logo watermark) FAIL** — not present in `ContentView.swift`, asset
+  missing from `Assets.xcassets`. Five warnings logged. Verdict:
+  HOLD under zero-exceptions rule; CONDITIONAL PASS under brief's
+  verdict floor (5-line fix). Full result at
+  `/tmp/build28-pressure-test-result.txt`.
 
 - Full workspace doc + repo audit (brief: cli-jon-context/FULL_AUDIT_BRIEF.md).
   Report at `/tmp/full-audit-report.md`. Workspace changes committed on

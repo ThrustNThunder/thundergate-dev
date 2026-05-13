@@ -154,6 +154,20 @@ export class SessionDB {
   }
 
   /**
+   * Idempotently ensure a sessions row exists for `id`. The messages
+   * table FKs to sessions(id), so any code path that writes a message
+   * for an ad-hoc/synthetic session (e.g. the learning trigger's
+   * 'current' bucket, ghost harness session IDs derived from JSONL
+   * filenames) must call this first or the INSERT throws.
+   */
+  ensureSession(id: string): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO sessions (id, started_at, status)
+      VALUES (?, ?, 'active')
+    `).run(id, Date.now() / 1000);
+  }
+
+  /**
    * Store a message (from any channel)
    */
   storeMessage(message: {

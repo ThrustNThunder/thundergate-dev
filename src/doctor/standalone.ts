@@ -16,6 +16,7 @@ import { execSync } from 'child_process';
 import { loadCheckpoint } from '../checkpoint/save.js';
 import { ensureConfig } from '../config/index.js';
 import { GhostEvaluator } from '../ghost/evaluator.js';
+import { ProvenanceLedger, type ProvenanceEvent } from '../provenance/ledger.js';
 
 const THUNDERGATE_DIR = join(os.homedir(), '.thundergate');
 const PID_FILE = join(THUNDERGATE_DIR, 'thundergate.pid');
@@ -74,6 +75,10 @@ export function runHealthCheck(): HealthReport {
 
   // 10. Ghost mode (truth-telling — never fakes a green when missing data)
   checks.push(checkGhost());
+
+  // 11. Local inference (ThunderMind / Ollama). Configured? Reachable?
+  // When did the long-running provider last successfully probe it?
+  checks.push(checkLocalInference());
 
   // Calculate overall status
   const hasFailures = checks.some(c => c.status === 'fail');
@@ -301,6 +306,72 @@ function checkGhost(): HealthCheck {
     return { name: 'Ghost mode', status: 'warn', detail: `${detail} (no log yet)` };
   }
   return { name: 'Ghost mode', status: days >= 7 ? 'pass' : 'pass', detail };
+}
+
+function checkLocalInference(): HealthCheck {
+  let cfg;
+  try {
+    cfg = ensureConfig();
+  } catch (err) {
+    return { name: 'LocalInfer', status: 'warn', detail: `config error: ${(err as Error).message}` };
+  }
+  if (!cfg.localInference?.enabled) {
+    return { name: 'LocalInfer', status: 'pass', detail: 'disabled in config' };
+  }
+
+  const endpoint = cfg.localInference.endpoint;
+  const parsed = parseEndpoint(endpoint);
+  const portUp = parsed && parsed.host === 'localhost' ? portOpen(parsed.port) : null;
+
+  // Read provenance ledger for the daemon's view — its last health check
+  // is more authoritative than this synchronous port probe, which only
+  // tells us "something is listening on the port".
+  const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+  const events: ProvenanceEvent[] = ledger.tail(50);
+  const last = [...events].reverse().find(
+    (e) => e.actor === 'local-inference' && (e.action === 'liveness_ok' || e.action === 'liveness_lost' || e.action === 'first_check_missed')
+  );
+  const lastCheckedAt = last ? formatAge(last.timestamp) : null;
+  const daemonReachable = last?.action === 'liveness_ok';
+
+  // Synthesize the row. Operator wants to see all three: configured,
+  // currently reachable, when the last health check fired.
+  if (portUp === false && !daemonReachable) {
+    // Configured but not reachable. Expected today since ThunderMind
+    // isn't built — warn rather than fail.
+    return {
+      name: 'LocalInfer',
+      status: 'warn',
+      detail: `${endpoint} unreachable${lastCheckedAt ? ` (last check ${lastCheckedAt} ago)` : ' (no probe yet)'}`,
+      fix: 'Start ThunderMind / Ollama on the configured endpoint, or set localInference.enabled=false'
+    };
+  }
+  if (daemonReachable || portUp === true) {
+    return {
+      name: 'LocalInfer',
+      status: 'pass',
+      detail: `${endpoint} reachable${lastCheckedAt ? ` (last check ${lastCheckedAt} ago)` : ''}`
+    };
+  }
+  // Non-localhost endpoint with no daemon probe yet — can't tell from
+  // /proc/net/tcp. Report unknown rather than guessing.
+  return {
+    name: 'LocalInfer',
+    status: 'warn',
+    detail: `${endpoint} — unknown (daemon hasn't probed yet)`
+  };
+}
+
+function parseEndpoint(endpoint: string): { host: string; port: number } | null {
+  try {
+    const u = new URL(endpoint);
+    const port = u.port
+      ? parseInt(u.port, 10)
+      : u.protocol === 'https:' ? 443 : 80;
+    return { host: u.hostname, port };
+  } catch {
+    return null;
+  }
 }
 
 function portOpen(port: number): boolean {

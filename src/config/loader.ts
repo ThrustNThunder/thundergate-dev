@@ -127,6 +127,28 @@ export interface Config {
     surfaceMaxTokens: number;
     deepModeThreshold: number;  // Tool calls before deep mode activates
   };
+
+  // Local inference (ThunderMind / Ollama).
+  // When reachable, runtime flips into LOCAL_INFERENCE processing mode:
+  // larger context window targets, more RAG results, background pre-processing
+  // hooks light up. When unreachable, behavior is unchanged from cloud mode.
+  localInference: {
+    enabled: boolean;
+    // OpenAI-compatible base URL. Default: http://localhost:11434 (Ollama).
+    endpoint: string;
+    healthCheckIntervalMs: number;
+    // Model name to advertise/use when LOCAL_INFERENCE mode is active.
+    // ThunderMind isn't built yet so this is a placeholder default.
+    model: string;
+    // Append-only JSONL of provider liveness transitions and other
+    // provenance events. Stub for the larger provenance ledger.
+    provenanceFile: string;
+    // Tunables that LOCAL_INFERENCE processing mode reads to decide how
+    // aggressive to be vs. the cloud-defaults.
+    contextWindowTarget: number;
+    ragResultsLimit: number;
+    enableBackgroundPreprocessing: boolean;
+  };
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -229,6 +251,17 @@ const DEFAULT_CONFIG: Config = {
     surfaceModel: 'anthropic/claude-sonnet-4-6',
     surfaceMaxTokens: 5000,
     deepModeThreshold: 5         // 5+ tool calls = deep mode
+  },
+
+  localInference: {
+    enabled: true,
+    endpoint: 'http://localhost:11434',
+    healthCheckIntervalMs: 30000,
+    model: 'thundermind:70b',
+    provenanceFile: join(process.env.HOME || '', '.thundergate', 'provenance.jsonl'),
+    contextWindowTarget: 200000,
+    ragResultsLimit: 24,
+    enableBackgroundPreprocessing: true
   }
 };
 
