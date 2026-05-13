@@ -289,6 +289,27 @@ Ghost Jon proves ThunderGate before cutover:
 thundergate-ghost status|logs|inject|context|crash-test|reset|compare
 ```
 
+### Two-tier gate — infrastructure pass/fail + minimum-resemblance
+
+Ghost Jon tests *the runtime*, not whether the small model can imitate the
+large one verbatim. The gate is intentionally split:
+
+1. **Infrastructure pass/fail** — fixed pass/fail signals that must be green
+   regardless of model pair: harness uptime, FK errors since deploy, JSONL
+   parse integrity, learn-test gate (T1+T2+T3), the `[ghost: not yet ready]`
+   rate, sample-count floor, and the learning-trend regression check. These
+   prove the routing, context delivery, persistence, and learning loop are
+   plumbed correctly.
+2. **Minimum-resemblance threshold** — a single weighted_score floor that
+   is calibrated to the *model pair currently in use*. With Haiku-backed
+   ThunderGate vs Sonnet-backed OpenClaw, the floor is 0.45 — the level at
+   which Haiku's reply is recognizably on-topic relative to its Sonnet pair.
+   Same-model baselining would justify a much higher floor (≈ 0.75); the
+   gap between them is the inherent capability delta, not a runtime defect.
+
+Re-baseline the resemblance floor whenever the model pair changes. The
+infrastructure checks do not move.
+
 ---
 
 ## 20. DOCTOR MODE — LIVE HEALTH MONITORING

@@ -279,7 +279,7 @@ ghost
     console.log(`  Consecutive clean days: ${scores.consecutive_clean_days}`);
     console.log(`  Cutover ready: ${scores.consecutive_clean_days >= 7 ? '🏆 YES' : `${7 - scores.consecutive_clean_days} more clean days needed`}`);
     console.log('');
-    console.log(`  Doctor green (8-check): ${scores.doctor_green ? '✅ YES' : '❌ NO'}`);
+    console.log(`  Doctor green (9-check): ${scores.doctor_green ? '✅ YES' : '❌ NO'}`);
     const deployTs = scores.deploy_timestamp
       ? new Date(scores.deploy_timestamp).toISOString()
       : '(unset — fail-closed mode)';
