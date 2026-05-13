@@ -337,6 +337,16 @@ public final class UserStore: ObservableObject {
         currentUser = user
         if let token { try? writeAgentToken(token, agentId: conn.id) }
         persist()
+
+        let account = Account(
+            id: conn.id.uuidString,
+            name: conn.agentName,
+            wsURL: conn.wsURL,
+            httpURL: conn.httpURL,
+            token: token ?? ""
+        )
+        AccountStore.shared.add(account, makeCurrent: user.agents.count == 1)
+        APNsManager.shared.retryTokenUploadIfNeeded()
     }
 
     public func removeAgent(id: UUID) {
