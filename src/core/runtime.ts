@@ -26,6 +26,10 @@ import { getGhostSystemPrompt, setGhostContextDB } from '../ghost/context.js';
 import { WorldState, ProcessingMode } from '../world/state.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
 import { LocalInferenceProvider } from '../inference/local_provider.js';
+import { PromiseTracker } from '../memory/promises.js';
+import { FrameManager } from '../memory/frame.js';
+import { UntrainService, detectUntrainTrigger } from '../memory/untrain.js';
+import { ProvisionalMemoryService } from '../memory/provisional.js';
 
 // Runtime state
 interface RuntimeState {
@@ -55,6 +59,14 @@ export class ThunderGateRuntime {
   private world: WorldState;
   private provenance!: ProvenanceLedger;
   private localInference!: LocalInferenceProvider;
+  // Persistent-memory subsystems wired in Build 28 — promise tracker,
+  // continuity frame manager, untrain audit, and the provisional-memory
+  // promoter. All four read/write to context.db so they survive
+  // gateway restarts.
+  private promises!: PromiseTracker;
+  private frames!: FrameManager;
+  private untrain!: UntrainService;
+  private provisional!: ProvisionalMemoryService;
 
   constructor(configPath?: string) {
     // Phase 3: ensureConfig writes the default config.json on first run
@@ -83,6 +95,28 @@ export class ThunderGateRuntime {
 
   getProvenanceLedger(): ProvenanceLedger | undefined {
     return this.provenance;
+  }
+
+  /** Accessors for CLI + Doctor. */
+  getPromiseTracker(): PromiseTracker | undefined {
+    return this.promises;
+  }
+
+  getFrameManager(): FrameManager | undefined {
+    return this.frames;
+  }
+
+  getUntrainService(): UntrainService | undefined {
+    return this.untrain;
+  }
+
+  getProvisionalService(): ProvisionalMemoryService | undefined {
+    return this.provisional;
+  }
+
+  /** DB accessor — CLI needs it for read-only memory list. */
+  getDB(): SessionDB | undefined {
+    return this.db;
   }
 
   /** Public accessor — used by Doctor and CLI ghost commands. */
@@ -142,6 +176,23 @@ export class ThunderGateRuntime {
     // Initialize learning trigger engine
     this.learning = new TriggerEngine(this.db, this.config.learning.backstopTurns);
     console.log('  ✓ Learning loop ready');
+
+    // Persistent-memory subsystems. Order matters: provenance must
+    // already exist (constructed above) so UntrainService can append.
+    this.promises = new PromiseTracker(this.db);
+    this.frames = new FrameManager(this.db);
+    this.untrain = new UntrainService(this.db, this.provenance);
+    this.provisional = new ProvisionalMemoryService(this.db);
+
+    // Hydrate the most recent ACTIVE/PAUSED frame so the conversation
+    // survives the restart. If nothing exists, the first inbound will
+    // open a fresh frame.
+    const hydrated = this.frames.hydrate();
+    if (hydrated) {
+      console.log(`  ✓ Frame hydrated: ${hydrated.id.slice(0, 8)} (${hydrated.status})`);
+    } else {
+      console.log('  ✓ No prior frame — first inbound opens a new one');
+    }
 
     // Phase 3: register and start native channels.
     if (this.config.channels.thundercommo.enabled) {
@@ -225,6 +276,56 @@ export class ThunderGateRuntime {
       timestamp: new Date(entry.timestamp)
     };
 
+    // ── Frame lifecycle: advance/transition based on this inbound ──
+    let frameDecision: ReturnType<FrameManager['onInbound']> | null = null;
+    try {
+      frameDecision = this.frames.onInbound({
+        text: entry.text,
+        sessionId: this.state.sessionId || undefined,
+        deviceHint: channelId,
+        modelInUse: this.config.runtime.model
+      });
+      if (frameDecision.transition === 'rejoined') {
+        console.log(`  ↺ Frame rejoined ${frameDecision.frame.id.slice(0, 8)}: ${frameDecision.reason}`);
+      } else if (frameDecision.transition === 'opened' && frameDecision.reason !== 'continuation within gap window') {
+        console.log(`  ✱ Frame opened ${frameDecision.frame.id.slice(0, 8)}: ${frameDecision.reason}`);
+      }
+    } catch (err) {
+      console.warn('  ⚠ frame.onInbound skipped:', (err as Error).message);
+    }
+
+    // ── Promise tracker: surface-on-gap + close-on-reference ──
+    let surfaceLine = '';
+    try {
+      const senderLower = (entry.sender || '').toLowerCase();
+      const pres = this.promises.onInbound({ text: entry.text, sender: senderLower });
+      if (pres.surface.length > 0) {
+        surfaceLine = this.promises.formatSurfaceLine(pres.surface);
+        console.log(`  ⏳ Surfacing ${pres.surface.length} open promise(s) on gap-resume`);
+      }
+      if (pres.closed.length > 0) {
+        console.log(`  ✓ Closed ${pres.closed.length} promise(s) on inbound reference`);
+      }
+    } catch (err) {
+      console.warn('  ⚠ promises.onInbound skipped:', (err as Error).message);
+    }
+
+    // ── Untrain conversational trigger ──
+    let untrainLine = '';
+    try {
+      if (detectUntrainTrigger(entry.text)) {
+        const actor: 'jon' | 'michael' =
+          (entry.sender || '').toLowerCase() === 'michael' ? 'michael' : 'jon';
+        const confirm = this.untrain.conversationalUntrain({ actor });
+        if (confirm) {
+          untrainLine = confirm;
+          console.log(`  ✂ Untrain (conversational): ${confirm}`);
+        }
+      }
+    } catch (err) {
+      console.warn('  ⚠ untrain trigger skipped:', (err as Error).message);
+    }
+
     let response: Response;
     try {
       response = await this.processMessage(message);
@@ -238,12 +339,31 @@ export class ThunderGateRuntime {
 
     if (!response?.content) return;
 
+    // ── Prepend surface lines: open-promises + untrain confirmation ──
+    let composedText = response.content;
+    if (untrainLine) composedText = `${untrainLine}\n\n${composedText}`;
+    if (surfaceLine) composedText = `${surfaceLine}\n\n${composedText}`;
+
+    // ── Promise extraction from the assistant's outbound text ──
+    try {
+      const extracted = this.promises.extractFromOutbound({
+        text: response.content,
+        sessionId: this.state.sessionId || null,
+        channel: channelId
+      });
+      if (extracted.count > 0) {
+        console.log(`  📌 Captured ${extracted.count} promise(s) from outbound`);
+      }
+    } catch (err) {
+      console.warn('  ⚠ promise extraction skipped:', (err as Error).message);
+    }
+
     const delivery: OutboundDelivery = {
       id: newMessageId(),
       agentId: 'jon',
       sender: 'Jon',
       channel: channelId,
-      text: response.content,
+      text: composedText,
       timestamp: Date.now(),
       model: this.config.runtime.model
     };

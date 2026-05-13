@@ -318,12 +318,16 @@ export class TriggerEngine {
 
       for (const pattern of preferencePatterns) {
         if (pattern.test(msg.content)) {
+          // Inferred memories enter as provisional — they only earn
+          // 'confirmed' status after 3 uses without a correction.
           this.db.storeMemory({
             key: `preference_${this.uniqueKey('pref')}_${memories}`,
             value: msg.content,
             category: 'preferences',
             importance: 'normal',
-            source: 'inferred'
+            source: 'inferred',
+            status: 'provisional',
+            usesRemaining: 3
           });
           memories++;
           captured = true;
@@ -339,7 +343,9 @@ export class TriggerEngine {
             value: msg.content,
             category: 'facts',
             importance: 'normal',
-            source: 'inferred'
+            source: 'inferred',
+            status: 'provisional',
+            usesRemaining: 3
           });
           memories++;
           break;

@@ -11,7 +11,7 @@ import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { mkdirSync } from 'fs';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA_SQL = `
 -- Schema version tracking
@@ -93,12 +93,69 @@ CREATE TABLE IF NOT EXISTS health_log (
   action_taken TEXT
 );
 
+-- Promises table — outbound commitments extracted from assistant text.
+-- status: OPEN | FULFILLED | DISMISSED. Closed promises retain the row
+-- so the audit trail survives.
+CREATE TABLE IF NOT EXISTS promises (
+  id TEXT PRIMARY KEY,
+  session_id TEXT,
+  channel TEXT,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  created_at REAL NOT NULL,
+  closed_at REAL,
+  resolved_by TEXT
+);
+
+-- Frames — first-class continuity object. ACTIVE | PAUSED | CLOSED.
+-- parent_frame_id is set when a fresh frame opens after a gap; on
+-- rejoin we reopen the paused frame in place and write a transition row.
+CREATE TABLE IF NOT EXISTS frames (
+  id TEXT PRIMARY KEY,
+  opened_at REAL NOT NULL,
+  closed_at REAL,
+  topic_anchor TEXT NOT NULL,
+  device_hint TEXT,
+  model_in_use TEXT,
+  session_id TEXT,
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
+  parent_frame_id TEXT,
+  confidence_floor REAL NOT NULL DEFAULT 0.8,
+  last_activity_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS frame_transitions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  frame_id TEXT NOT NULL,
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  reason TEXT,
+  timestamp REAL NOT NULL
+);
+
+-- Untrain audit — rows for every untrain operation, regardless of trigger.
+-- The provenance ledger has the primary audit trail; this table is the
+-- query-friendly view for the CLI 'untrain log' command.
+CREATE TABLE IF NOT EXISTS untrain_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp REAL NOT NULL,
+  actor TEXT NOT NULL,
+  target_key TEXT NOT NULL,
+  target_value TEXT,
+  reason TEXT,
+  trigger_type TEXT
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, timestamp);
 CREATE INDEX IF NOT EXISTS idx_context_key ON context(key);
 CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
 CREATE INDEX IF NOT EXISTS idx_memory_category ON memory(category);
+CREATE INDEX IF NOT EXISTS idx_promises_status ON promises(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_frames_status ON frames(status, opened_at);
+CREATE INDEX IF NOT EXISTS idx_frame_transitions_frame ON frame_transitions(frame_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_untrain_log_ts ON untrain_log(timestamp);
 `;
 
 const FTS_SQL = `
@@ -146,11 +203,40 @@ export class SessionDB {
     this.db.exec(SCHEMA_SQL);
     this.db.exec(FTS_SQL);
 
+    // Schema v2 additions to existing tables. ALTER TABLE ADD COLUMN
+    // throws "duplicate column" when re-run; we swallow that specific
+    // error so initialize() stays idempotent across restarts.
+    this.addColumnIfMissing('memory', 'status', "TEXT NOT NULL DEFAULT 'confirmed'");
+    this.addColumnIfMissing('memory', 'uses_remaining', 'INTEGER NOT NULL DEFAULT 0');
+
     // Check/update schema version
     const version = this.db.prepare('SELECT version FROM schema_version').get() as { version: number } | undefined;
     if (!version) {
       this.db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(SCHEMA_VERSION);
+    } else if (version.version < SCHEMA_VERSION) {
+      this.db.prepare('UPDATE schema_version SET version = ?').run(SCHEMA_VERSION);
     }
+  }
+
+  /**
+   * Idempotent ALTER TABLE ADD COLUMN. SQLite has no "IF NOT EXISTS" for
+   * column adds — we issue the ALTER and swallow the duplicate-column
+   * error, which is the only outcome on a re-run.
+   */
+  private addColumnIfMissing(table: string, column: string, ddl: string): void {
+    try {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    } catch (err) {
+      const msg = (err as Error).message || '';
+      if (!/duplicate column name/i.test(msg)) {
+        throw err;
+      }
+    }
+  }
+
+  /** Raw handle escape hatch for memory subsystems (frames, promises). */
+  raw(): Database.Database {
+    return this.db;
   }
 
   /**
@@ -322,7 +408,10 @@ export class SessionDB {
   }
 
   /**
-   * Store memory entry
+   * Store memory entry. The provisional-memory flow (added in schema v2)
+   * routes through the optional `status` and `usesRemaining` fields —
+   * when omitted, rows default to 'confirmed' with 0 uses remaining,
+   * matching pre-v2 behavior.
    */
   storeMemory(entry: {
     key: string;
@@ -330,18 +419,34 @@ export class SessionDB {
     category?: string;
     importance?: string;
     source?: string;
+    status?: 'provisional' | 'confirmed';
+    usesRemaining?: number;
   }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO memory (key, value, category, created_at, updated_at, importance, source)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memory (key, value, category, created_at, updated_at, importance, source, status, uses_remaining)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET
         value = excluded.value,
         updated_at = excluded.updated_at,
-        importance = excluded.importance
+        importance = excluded.importance,
+        status = excluded.status,
+        uses_remaining = excluded.uses_remaining
     `);
 
     const now = Date.now() / 1000;
-    stmt.run(entry.key, entry.value, entry.category || null, now, now, entry.importance || 'normal', entry.source || 'inferred');
+    const status = entry.status || 'confirmed';
+    const uses = entry.usesRemaining ?? 0;
+    stmt.run(
+      entry.key,
+      entry.value,
+      entry.category || null,
+      now,
+      now,
+      entry.importance || 'normal',
+      entry.source || 'inferred',
+      status,
+      uses
+    );
   }
 
   /**
@@ -350,6 +455,217 @@ export class SessionDB {
   getMemory(key: string): MemoryEntry | null {
     const stmt = this.db.prepare('SELECT * FROM memory WHERE key = ?');
     return stmt.get(key) as MemoryEntry | undefined || null;
+  }
+
+  /**
+   * List all memories with status. The CLI 'memory list' command uses this
+   * to surface provisional vs. confirmed counts.
+   */
+  listMemories(limit: number = 100): MemoryEntry[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memory
+      ORDER BY
+        CASE importance
+          WHEN 'critical' THEN 0
+          WHEN 'high'     THEN 1
+          WHEN 'normal'   THEN 2
+          ELSE 3
+        END,
+        updated_at DESC
+      LIMIT ?
+    `);
+    return stmt.all(limit) as MemoryEntry[];
+  }
+
+  /**
+   * Decrement uses_remaining for a provisional memory by one. Returns the
+   * row's new state. Once uses_remaining reaches 0 the caller is expected
+   * to call confirmMemory().
+   */
+  decrementProvisionalUse(key: string): MemoryEntry | null {
+    const tx = this.db.transaction((k: string) => {
+      this.db.prepare(`
+        UPDATE memory
+        SET uses_remaining = CASE WHEN uses_remaining > 0 THEN uses_remaining - 1 ELSE 0 END,
+            updated_at = ?
+        WHERE key = ? AND status = 'provisional'
+      `).run(Date.now() / 1000, k);
+      return this.getMemory(k);
+    });
+    return tx(key);
+  }
+
+  /** Promote a provisional memory to confirmed. Idempotent. */
+  confirmMemory(key: string): void {
+    this.db.prepare(`
+      UPDATE memory
+      SET status = 'confirmed', uses_remaining = 0, updated_at = ?
+      WHERE key = ?
+    `).run(Date.now() / 1000, key);
+  }
+
+  /** Hard delete a memory row by key. Returns true if a row was removed. */
+  deleteMemory(key: string): boolean {
+    const info = this.db.prepare('DELETE FROM memory WHERE key = ?').run(key);
+    return info.changes > 0;
+  }
+
+  // ─── Promises ─────────────────────────────────────────────────────────
+
+  insertPromise(p: {
+    id: string;
+    sessionId?: string | null;
+    channel?: string | null;
+    text: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO promises (id, session_id, channel, text, status, created_at)
+      VALUES (?, ?, ?, ?, 'OPEN', ?)
+    `).run(p.id, p.sessionId ?? null, p.channel ?? null, p.text, Date.now() / 1000);
+  }
+
+  closePromise(id: string, status: 'FULFILLED' | 'DISMISSED', resolvedBy: string): boolean {
+    const info = this.db.prepare(`
+      UPDATE promises
+      SET status = ?, closed_at = ?, resolved_by = ?
+      WHERE id = ? AND status = 'OPEN'
+    `).run(status, Date.now() / 1000, resolvedBy, id);
+    return info.changes > 0;
+  }
+
+  getOpenPromises(limit: number = 50): PromiseRow[] {
+    return this.db.prepare(`
+      SELECT * FROM promises WHERE status = 'OPEN'
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(limit) as PromiseRow[];
+  }
+
+  getAllPromises(limit: number = 100): PromiseRow[] {
+    return this.db.prepare(`
+      SELECT * FROM promises
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(limit) as PromiseRow[];
+  }
+
+  // ─── Frames ───────────────────────────────────────────────────────────
+
+  insertFrame(f: {
+    id: string;
+    topicAnchor: string;
+    deviceHint?: string | null;
+    modelInUse?: string | null;
+    sessionId?: string | null;
+    parentFrameId?: string | null;
+    confidenceFloor?: number;
+  }): void {
+    const now = Date.now() / 1000;
+    this.db.prepare(`
+      INSERT INTO frames (
+        id, opened_at, topic_anchor, device_hint, model_in_use,
+        session_id, status, parent_frame_id, confidence_floor, last_activity_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+    `).run(
+      f.id,
+      now,
+      f.topicAnchor,
+      f.deviceHint ?? null,
+      f.modelInUse ?? null,
+      f.sessionId ?? null,
+      f.parentFrameId ?? null,
+      f.confidenceFloor ?? 0.8,
+      now
+    );
+  }
+
+  updateFrameStatus(id: string, status: 'ACTIVE' | 'PAUSED' | 'CLOSED'): void {
+    const now = Date.now() / 1000;
+    if (status === 'CLOSED') {
+      this.db.prepare(`
+        UPDATE frames SET status = ?, closed_at = ?, last_activity_at = ? WHERE id = ?
+      `).run(status, now, now, id);
+    } else {
+      this.db.prepare(`
+        UPDATE frames SET status = ?, closed_at = NULL, last_activity_at = ? WHERE id = ?
+      `).run(status, now, id);
+    }
+  }
+
+  touchFrame(id: string): void {
+    this.db.prepare(`UPDATE frames SET last_activity_at = ? WHERE id = ?`)
+      .run(Date.now() / 1000, id);
+  }
+
+  getFrame(id: string): FrameRow | null {
+    return (this.db.prepare('SELECT * FROM frames WHERE id = ?').get(id) as FrameRow | undefined) ?? null;
+  }
+
+  getActiveOrPausedFrame(): FrameRow | null {
+    return (this.db.prepare(`
+      SELECT * FROM frames
+      WHERE status IN ('ACTIVE', 'PAUSED')
+      ORDER BY last_activity_at DESC
+      LIMIT 1
+    `).get() as FrameRow | undefined) ?? null;
+  }
+
+  getRecentFrames(limit: number = 20): FrameRow[] {
+    return this.db.prepare(`
+      SELECT * FROM frames
+      ORDER BY opened_at DESC
+      LIMIT ?
+    `).all(limit) as FrameRow[];
+  }
+
+  logFrameTransition(t: {
+    frameId: string;
+    from: string | null;
+    to: string;
+    reason?: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO frame_transitions (frame_id, from_status, to_status, reason, timestamp)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(t.frameId, t.from ?? null, t.to, t.reason ?? null, Date.now() / 1000);
+  }
+
+  getRecentFrameTransitions(limit: number = 50): FrameTransitionRow[] {
+    return this.db.prepare(`
+      SELECT * FROM frame_transitions
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(limit) as FrameTransitionRow[];
+  }
+
+  // ─── Untrain audit ────────────────────────────────────────────────────
+
+  logUntrain(entry: {
+    actor: string;
+    targetKey: string;
+    targetValue?: string | null;
+    reason?: string | null;
+    triggerType?: string | null;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO untrain_log (timestamp, actor, target_key, target_value, reason, trigger_type)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      Date.now() / 1000,
+      entry.actor,
+      entry.targetKey,
+      entry.targetValue ?? null,
+      entry.reason ?? null,
+      entry.triggerType ?? null
+    );
+  }
+
+  getRecentUntrains(limit: number = 50): UntrainLogRow[] {
+    return this.db.prepare(`
+      SELECT * FROM untrain_log
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(limit) as UntrainLogRow[];
   }
 
   /**
@@ -479,7 +795,7 @@ interface Skill {
   source: string;
 }
 
-interface MemoryEntry {
+export interface MemoryEntry {
   id: number;
   key: string;
   value: string;
@@ -488,6 +804,56 @@ interface MemoryEntry {
   updated_at: number;
   importance: string;
   source: string;
+  // v2: provisional-memory machinery. status is 'provisional' | 'confirmed';
+  // existing rows default to 'confirmed' via the column DEFAULT. uses_remaining
+  // is the countdown on a provisional entry — decremented each time the
+  // memory is surfaced into a prompt; promoted to 'confirmed' at 0.
+  status: string;
+  uses_remaining: number;
+}
+
+export interface PromiseRow {
+  id: string;
+  session_id: string | null;
+  channel: string | null;
+  text: string;
+  status: 'OPEN' | 'FULFILLED' | 'DISMISSED' | string;
+  created_at: number;
+  closed_at: number | null;
+  resolved_by: string | null;
+}
+
+export interface FrameRow {
+  id: string;
+  opened_at: number;
+  closed_at: number | null;
+  topic_anchor: string;
+  device_hint: string | null;
+  model_in_use: string | null;
+  session_id: string | null;
+  status: 'ACTIVE' | 'PAUSED' | 'CLOSED' | string;
+  parent_frame_id: string | null;
+  confidence_floor: number;
+  last_activity_at: number;
+}
+
+export interface FrameTransitionRow {
+  id: number;
+  frame_id: string;
+  from_status: string | null;
+  to_status: string;
+  reason: string | null;
+  timestamp: number;
+}
+
+export interface UntrainLogRow {
+  id: number;
+  timestamp: number;
+  actor: string;
+  target_key: string;
+  target_value: string | null;
+  reason: string | null;
+  trigger_type: string | null;
 }
 
 interface HealthLog {

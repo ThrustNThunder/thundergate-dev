@@ -23,7 +23,8 @@
 
 import { existsSync, readFileSync, statSync, unwatchFile, watchFile } from 'fs';
 import { join } from 'path';
-import type { SessionDB } from '../session/database.js';
+import type { MemoryEntry, SessionDB } from '../session/database.js';
+import { ProvisionalMemoryService, PROVISIONAL_MARKER } from '../memory/provisional.js';
 
 const GHOST_FILES = [
   'GJ_GHOST_ADDENDUM.md', // shadow-role rules — must be first
@@ -143,20 +144,31 @@ function assembleStaticPrompt(): string {
  */
 function assembleMemoriesSection(): string {
   if (!ghostDB) return '';
-  let memories: Array<{ value: string; category: string | null; importance: string }>;
+  let memories: MemoryEntry[];
   try {
     memories = ghostDB.getRecentMemories(RECENT_MEMORIES_LIMIT);
   } catch {
     return '';
   }
   if (memories.length === 0) return '';
+  // Run provisional accounting: decrement use counters and prepend the
+  // verify-before-relying-on marker for provisional entries. Provisional
+  // rows that exhaust their counter on this surface are promoted in
+  // place and rendered clean.
+  const provisional = new ProvisionalMemoryService(ghostDB);
+  const decorated = provisional.useForPrompt(memories);
   const lines: string[] = ['## Recent Memories', ''];
-  for (const m of memories) {
+  for (let i = 0; i < memories.length; i++) {
+    const m = memories[i];
+    const d = decorated[i];
     const tag = m.category ? `[${m.category}/${m.importance}]` : `[${m.importance}]`;
-    lines.push(`- ${tag} ${m.value}`);
+    lines.push(`- ${tag} ${d.value}`);
   }
   return lines.join('\n');
 }
+
+/** Test seam — surfaces the provisional marker constant for asserts. */
+export const _PROVISIONAL_MARKER = PROVISIONAL_MARKER;
 
 function attachWatchers(): void {
   for (const name of GHOST_FILES) {

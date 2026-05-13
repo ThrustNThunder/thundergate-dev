@@ -22,6 +22,11 @@ import { GhostEvaluator } from '../ghost/evaluator.js';
 import { runLearnTests, formatReport } from '../ghost/learn-test.js';
 import { describeGhostContextFiles, getGhostContextDir } from '../ghost/context.js';
 import { ProvenanceLedger, type ProvenanceEvent } from '../provenance/ledger.js';
+import { SessionDB } from '../session/database.js';
+import { PromiseTracker } from '../memory/promises.js';
+import { FrameManager } from '../memory/frame.js';
+import { UntrainService } from '../memory/untrain.js';
+import { ProvisionalMemoryService } from '../memory/provisional.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -144,21 +149,21 @@ program
   .description('Run full diagnostic')
   .option('--watch', 'Continuous monitoring (refresh every 30s)')
   .option('--fix', 'Auto-fix known issues')
-  .action((opts) => {
+  .action(async (opts) => {
     if (opts.watch) {
       console.log('⚡ ThunderGate Doctor — Live Monitoring');
       console.log('Press Ctrl+C to stop\n');
 
-      const runCheck = () => {
+      const runCheck = async () => {
         console.clear();
-        runDiagnostic(opts.fix);
+        await runDiagnostic(opts.fix);
         console.log('\nNext check in 30s...');
       };
 
-      runCheck();
-      setInterval(runCheck, 30000);
+      await runCheck();
+      setInterval(() => { void runCheck(); }, 30000);
     } else {
-      runDiagnostic(opts.fix);
+      await runDiagnostic(opts.fix);
     }
   });
 
@@ -358,6 +363,291 @@ ghost
     console.log('   Edit ~/.thundergate/config.json to disable ghost and enable primary delivery.');
   });
 
+// ── promises ──────────────────────────────────────────────────────────────
+//
+// Build 28 persistent memory: surface and manage the open-promise list.
+// The CLI talks to the same context.db the runtime uses, so the gateway
+// doesn't need to be running for these commands to work.
+
+/**
+ * Synchronous Doctor render of persistent-memory state.
+ *
+ * `better-sqlite3` is synchronous; `SessionDB.initialize()` is async only
+ * because of mkdirSync semantics — the actual SQL is sync. We open the
+ * DB here, snapshot the four metrics Doctor cares about (open promises,
+ * current frame age, last transition, memory counts), and close.
+ *
+ * Returns formatted strings so the diagnostic loop can interleave them
+ * with the rest of the checks output without buffering.
+ */
+async function collectPersistentMemoryChecks(): Promise<string[]> {
+  const out: string[] = [];
+  try {
+    const cfg = ensureConfig();
+    const db = new SessionDB(cfg.database.path);
+    await db.initialize();
+    try {
+      const openCount = db.getOpenPromises(1000).length;
+      const frame = db.getActiveOrPausedFrame();
+      const transitions = db.getRecentFrameTransitions(1);
+      const provService = new ProvisionalMemoryService(db);
+      const memCounts = provService.counts();
+
+      out.push(`✅ Promises     ${openCount} open`);
+      if (frame) {
+        const ageMin = ((Date.now() / 1000) - frame.last_activity_at) / 60;
+        out.push(`✅ Frame        ${frame.status} ${frame.id.slice(0, 8)} (age ${ageMin.toFixed(1)}m)`);
+      } else {
+        out.push('✅ Frame        (no active frame — next inbound opens one)');
+      }
+      if (transitions.length > 0) {
+        const t = transitions[0];
+        const ts = new Date(t.timestamp * 1000).toLocaleString();
+        out.push(`✅ FrameLast    ${t.from_status ?? '∅'} → ${t.to_status} at ${ts}`);
+      } else {
+        out.push('✅ FrameLast    (no transitions yet)');
+      }
+      out.push(`✅ Memory       ${memCounts.provisional} provisional, ${memCounts.confirmed} confirmed`);
+    } finally {
+      await db.close();
+    }
+  } catch (err) {
+    out.push(`❌ PersistMem   ${(err as Error).message}`);
+  }
+  return out;
+}
+
+async function withDB<T>(fn: (db: SessionDB) => Promise<T> | T): Promise<T> {
+  const cfg = ensureConfig();
+  const db = new SessionDB(cfg.database.path);
+  await db.initialize();
+  try {
+    return await fn(db);
+  } finally {
+    await db.close();
+  }
+}
+
+const promisesCmd = program.command('promises').description('Promise tracker — open commitments + audit');
+
+promisesCmd
+  .command('list', { isDefault: true })
+  .description('Show all open promises')
+  .action(async () => {
+    await withDB(async (db) => {
+      const tracker = new PromiseTracker(db);
+      const open = tracker.surfaceOpen(100);
+      if (open.length === 0) {
+        console.log('No open promises.');
+        return;
+      }
+      console.log(`Open promises (${open.length}):`);
+      for (const p of open) {
+        const ts = new Date(p.created_at * 1000).toLocaleString();
+        console.log(`  • [${p.id.slice(0, 8)}] (${ts}) ${truncate(p.text, 100)}`);
+      }
+    });
+  });
+
+promisesCmd
+  .command('close <id>')
+  .description('Manually close a promise by id prefix')
+  .option('--dismiss', 'Mark as DISMISSED instead of FULFILLED')
+  .action(async (id: string, opts: { dismiss?: boolean }) => {
+    await withDB(async (db) => {
+      const open = db.getOpenPromises(1000);
+      const match = open.find((p) => p.id.startsWith(id));
+      if (!match) {
+        console.log(`No open promise matching id prefix ${id}`);
+        return;
+      }
+      const status = opts.dismiss ? 'DISMISSED' : 'FULFILLED';
+      db.closePromise(match.id, status, 'cli');
+      console.log(`✓ ${status} ${match.id.slice(0, 8)}: ${truncate(match.text, 80)}`);
+    });
+  });
+
+// ── memory ────────────────────────────────────────────────────────────────
+
+const memoryCmd = program.command('memory').description('Inspect the memory store (provisional + confirmed)');
+
+memoryCmd
+  .command('list')
+  .description('Show all memories with status')
+  .option('--limit <n>', 'Number of rows to show', '50')
+  .action(async (opts: { limit: string }) => {
+    await withDB(async (db) => {
+      const limit = parseInt(opts.limit, 10) || 50;
+      const rows = db.listMemories(limit);
+      if (rows.length === 0) {
+        console.log('No memories stored.');
+        return;
+      }
+      const provService = new ProvisionalMemoryService(db);
+      const counts = provService.counts();
+      console.log(`Memories (${counts.total} total — ${counts.provisional} provisional, ${counts.confirmed} confirmed):`);
+      for (const m of rows) {
+        const flag = m.status === 'provisional' ? `📜prov(${m.uses_remaining})` : '✓ conf';
+        const cat = m.category ? `[${m.category}]` : '';
+        console.log(`  ${flag} ${m.key} ${cat} — ${truncate(m.value, 80)}`);
+      }
+    });
+  });
+
+memoryCmd
+  .command('show <key>')
+  .description('Show a specific memory by key')
+  .action(async (key: string) => {
+    await withDB(async (db) => {
+      const m = db.getMemory(key);
+      if (!m) {
+        console.log(`No memory with key: ${key}`);
+        return;
+      }
+      const created = new Date(m.created_at * 1000).toLocaleString();
+      const updated = new Date(m.updated_at * 1000).toLocaleString();
+      console.log(`Key:        ${m.key}`);
+      console.log(`Status:     ${m.status}${m.status === 'provisional' ? ` (uses_remaining=${m.uses_remaining})` : ''}`);
+      console.log(`Importance: ${m.importance}`);
+      console.log(`Category:   ${m.category ?? '(none)'}`);
+      console.log(`Source:     ${m.source}`);
+      console.log(`Created:    ${created}`);
+      console.log(`Updated:    ${updated}`);
+      console.log('');
+      console.log('Value:');
+      console.log(m.value);
+    });
+  });
+
+// ── untrain ───────────────────────────────────────────────────────────────
+
+const untrainCmd = program.command('untrain').description('Remove learning entries (with audit)');
+
+untrainCmd
+  .command('remove <key>', { isDefault: true })
+  .description('Remove a specific learning entry by key')
+  .option('--actor <who>', "Who initiated the untrain ('michael' or 'jon')", 'michael')
+  .option('--reason <text>', 'Optional reason captured in the audit row')
+  .action(async (key: string, opts: { actor: string; reason?: string }) => {
+    await withDB(async (db) => {
+      const cfg = ensureConfig();
+      const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+      const svc = new UntrainService(db, ledger);
+      const actor = (opts.actor === 'jon' ? 'jon' : 'michael') as 'jon' | 'michael';
+      const existing = db.getMemory(key);
+      if (!existing) {
+        console.log(`No memory with key: ${key}`);
+        return;
+      }
+      const res = svc.untrainByKey({
+        key,
+        actor,
+        reason: opts.reason,
+        triggerType: 'cli'
+      });
+      if (res.deleted) {
+        console.log(`Removing behavior: ${key} — ${truncate(res.value ?? '', 80)}. Confirmed.`);
+      } else {
+        console.log(`✗ Untrain failed for key: ${key}`);
+      }
+    });
+  });
+
+untrainCmd
+  .command('log')
+  .description('Show recently untrained entries (audit trail)')
+  .option('--limit <n>', 'Number of rows to show', '20')
+  .action(async (opts: { limit: string }) => {
+    await withDB(async (db) => {
+      const limit = parseInt(opts.limit, 10) || 20;
+      const rows = db.getRecentUntrains(limit);
+      if (rows.length === 0) {
+        console.log('No untrain events recorded.');
+        return;
+      }
+      console.log(`Recent untrains (${rows.length}):`);
+      for (const r of rows) {
+        const ts = new Date(r.timestamp * 1000).toLocaleString();
+        const trig = r.trigger_type ? `(${r.trigger_type})` : '';
+        console.log(`  [${ts}] ${r.actor} ${trig} → ${r.target_key}`);
+        if (r.target_value) console.log(`      was: ${truncate(r.target_value, 100)}`);
+        if (r.reason) console.log(`      reason: ${r.reason}`);
+      }
+    });
+  });
+
+// ── frame ─────────────────────────────────────────────────────────────────
+
+const frameCmd = program.command('frame').description('Continuity frame — current/recent/transitions');
+
+frameCmd
+  .command('current', { isDefault: true })
+  .description('Show current frame info')
+  .action(async () => {
+    await withDB(async (db) => {
+      const mgr = new FrameManager(db);
+      const current = mgr.hydrate();
+      if (!current) {
+        console.log('No active or paused frame.');
+        return;
+      }
+      const opened = new Date(current.opened_at * 1000).toLocaleString();
+      const last = new Date(current.last_activity_at * 1000).toLocaleString();
+      const ageMin = ((Date.now() / 1000) - current.last_activity_at) / 60;
+      console.log(`Frame:         ${current.id}`);
+      console.log(`Status:        ${current.status}`);
+      console.log(`Topic anchor:  ${current.topic_anchor}`);
+      console.log(`Device hint:   ${current.device_hint ?? '(none)'}`);
+      console.log(`Model:         ${current.model_in_use ?? '(none)'}`);
+      console.log(`Parent frame:  ${current.parent_frame_id ?? '(none)'}`);
+      console.log(`Confidence:    ${current.confidence_floor}`);
+      console.log(`Opened:        ${opened}`);
+      console.log(`Last activity: ${last} (${ageMin.toFixed(1)}m ago)`);
+    });
+  });
+
+frameCmd
+  .command('recent')
+  .description('Show recent frames')
+  .option('--limit <n>', 'Number of frames to show', '10')
+  .action(async (opts: { limit: string }) => {
+    await withDB(async (db) => {
+      const limit = parseInt(opts.limit, 10) || 10;
+      const rows = db.getRecentFrames(limit);
+      if (rows.length === 0) {
+        console.log('No frames recorded.');
+        return;
+      }
+      console.log(`Recent frames (${rows.length}):`);
+      for (const f of rows) {
+        const opened = new Date(f.opened_at * 1000).toLocaleString();
+        const icon = f.status === 'ACTIVE' ? '●' : f.status === 'PAUSED' ? '◐' : '○';
+        console.log(`  ${icon} [${f.id.slice(0, 8)}] ${f.status.padEnd(7)} ${opened}  ${truncate(f.topic_anchor, 60)}`);
+      }
+    });
+  });
+
+frameCmd
+  .command('transitions')
+  .description('Show frame transitions (open/pause/close/rejoin log)')
+  .option('--limit <n>', 'Number of rows to show', '30')
+  .action(async (opts: { limit: string }) => {
+    await withDB(async (db) => {
+      const limit = parseInt(opts.limit, 10) || 30;
+      const rows = db.getRecentFrameTransitions(limit);
+      if (rows.length === 0) {
+        console.log('No frame transitions recorded.');
+        return;
+      }
+      console.log(`Frame transitions (${rows.length}, newest first):`);
+      for (const t of rows) {
+        const ts = new Date(t.timestamp * 1000).toLocaleString();
+        const from = t.from_status ?? '∅';
+        console.log(`  [${ts}] ${t.frame_id.slice(0, 8)}  ${from} → ${t.to_status}  ${t.reason ?? ''}`);
+      }
+    });
+  });
+
 function truncate(s: string, n: number = 120): string {
   const flat = s.replace(/\s+/g, ' ').trim();
   return flat.length > n ? flat.slice(0, n) + '…' : flat;
@@ -465,7 +755,7 @@ function portOpen(port: number): boolean {
   }
 }
 
-function runDiagnostic(autoFix: boolean = false): void {
+async function runDiagnostic(autoFix: boolean = false): Promise<void> {
   const timestamp = new Date().toLocaleString();
   console.log(`⚡ ThunderGate Doctor — ${timestamp}`);
   console.log('═══════════════════════════════════════');
@@ -614,12 +904,22 @@ function runDiagnostic(autoFix: boolean = false): void {
     });
   }
 
+  // Persistent-memory checks (Build 28): open promise count, current
+  // frame age, last frame transition, provisional/confirmed memory counts.
+  // We collect them as info-only rows (always pass) so a missing DB
+  // doesn't poison the rest of the diagnostic — Check 4 already reports
+  // DB presence as its own pass/fail.
+  const memChecks = await collectPersistentMemoryChecks();
+
   // Display results
   let allPass = true;
   for (const check of checks) {
     const icon = check.pass ? '✅' : '❌';
     console.log(`  ${icon} ${check.name.padEnd(12)} ${check.detail}`);
     if (!check.pass) allPass = false;
+  }
+  for (const line of memChecks) {
+    console.log(`  ${line}`);
   }
 
   console.log('');
