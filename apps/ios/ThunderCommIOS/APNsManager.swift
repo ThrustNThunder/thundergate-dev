@@ -222,10 +222,12 @@ public final class APNsManager: NSObject {
         // The push payload is intentionally tiny — it's a wakeup signal.
         // We always drain inbox; we do not trust the payload to carry the
         // message contents.
-        let newCount = UserDefaults.standard.integer(forKey: "apns.badgeCount") + 1
-        UserDefaults.standard.set(newCount, forKey: "apns.badgeCount")
-        UNUserNotificationCenter.current().setBadgeCount(newCount) { error in
-            if let error { NSLog("[APNs] setBadgeCount failed: \(error)") }
+        if UIApplication.shared.applicationState != .active {
+            let newCount = UserDefaults.standard.integer(forKey: "apns.badgeCount") + 1
+            UserDefaults.standard.set(newCount, forKey: "apns.badgeCount")
+            UNUserNotificationCenter.current().setBadgeCount(newCount) { error in
+                if let error { NSLog("[APNs] setBadgeCount failed: \(error)") }
+            }
         }
         Task {
             await DeliveryCore.shared.drainInbox()

@@ -737,13 +737,18 @@ actor InboxAPI {
         guard let account = await MainActor.run(body: { AccountStore.shared.current }) else {
             return []
         }
-        var comps = URLComponents(string: account.httpURL + "/api/inbox")!
+        guard var comps = URLComponents(string: account.httpURL + "/api/inbox") else {
+            throw NSError(domain: "InboxAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "invalid inbox URL"])
+        }
         comps.queryItems = [
             URLQueryItem(name: "since", value: String(ms)),
             URLQueryItem(name: "limit", value: String(limit)),
             URLQueryItem(name: "offset", value: String(offset))
         ]
-        var req = URLRequest(url: comps.url!)
+        guard let url = comps.url else {
+            throw NSError(domain: "InboxAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "invalid inbox URL components"])
+        }
+        var req = URLRequest(url: url)
         req.setValue("Bearer \(try await AuthManager.shared.currentToken())",
                      forHTTPHeaderField: "Authorization")
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -756,7 +761,9 @@ actor InboxAPI {
         guard let account = await MainActor.run(body: { AccountStore.shared.current }) else {
             return
         }
-        let url = URL(string: account.httpURL + "/api/inbox/ack")!
+        guard let url = URL(string: account.httpURL + "/api/inbox/ack") else {
+            throw NSError(domain: "InboxAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "invalid ack URL"])
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -771,7 +778,9 @@ actor InboxAPI {
         guard let account = await MainActor.run(body: { AccountStore.shared.current }) else {
             return
         }
-        let url = URL(string: account.httpURL + "/api/messages")!
+        guard let url = URL(string: account.httpURL + "/api/messages") else {
+            throw NSError(domain: "InboxAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "invalid messages URL"])
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
