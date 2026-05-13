@@ -617,6 +617,7 @@ public final class UserStore: ObservableObject {
         guard let payloads, !payloads.isEmpty else { return }
         let resolvedAgents = makeAgentConnections(from: payloads)
         guard !resolvedAgents.isEmpty else { return }
+        let defaultIdx = resolvedAgents.firstIndex(where: { $0.isDefault }) ?? 0
         for (index, agent) in resolvedAgents.enumerated() {
             let payloadToken = payloads.indices.contains(index) ? payloads[index].token : nil
             let account = Account(
@@ -626,7 +627,7 @@ public final class UserStore: ObservableObject {
                 httpURL: agent.httpURL,
                 token: payloadToken ?? ""
             )
-            AccountStore.shared.add(account, makeCurrent: index == 0)
+            AccountStore.shared.add(account, makeCurrent: index == defaultIdx)
         }
     }
     private struct ServerError: Decodable {
