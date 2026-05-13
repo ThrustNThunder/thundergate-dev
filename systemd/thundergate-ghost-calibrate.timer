@@ -1,0 +1,16 @@
+[Unit]
+Description=ThunderGate Ghost Jon — every-2h calibration cron
+Requires=thundergate-ghost-calibrate.service
+
+[Timer]
+# Fire 5 minutes after boot so the first round runs as soon as the
+# gateway settles, then every 2h on the wall clock. Persistent=true
+# carries a missed run forward across reboots so we don't silently
+# drop a 2h slot if the box was off.
+OnBootSec=5min
+OnUnitActiveSec=2h
+Persistent=true
+Unit=thundergate-ghost-calibrate.service
+
+[Install]
+WantedBy=timers.target

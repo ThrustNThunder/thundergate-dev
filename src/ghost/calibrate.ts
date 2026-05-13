@@ -18,7 +18,7 @@
  */
 
 import { execSync } from 'child_process';
-import { appendFileSync, existsSync, mkdirSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { dirname } from 'path';
 import type { Config } from '../config/loader.js';
 import {
@@ -28,7 +28,14 @@ import {
   type MatchResult
 } from './compare.js';
 import { getGhostSystemPrompt } from './context.js';
-import type { GhostEntry, GhostTurn } from './harness.js';
+import { GhostEvaluator } from './evaluator.js';
+import {
+  buildStateSnapshot,
+  isStatusQuery,
+  type GhostEntry,
+  type GhostTurn,
+  type StateSnapshotSource
+} from './harness.js';
 
 export type CalibrateCategory =
   | 'all'
@@ -77,6 +84,18 @@ const PAIR_PROMPT_TEMPLATE =
   'cli/technical. Return ONLY the JSON object, nothing else.';
 
 /**
+ * Extra instruction we splice into the pair-generation prompt for the
+ * `status` category. Without this, CLI Jon invents numbers for the
+ * ideal response while Ghost — now armed with real numbers — reports
+ * the actual state, and the two never tier-1 match. Pinning both sides
+ * to the same snapshot is what unlocks the exact-match score.
+ */
+const STATUS_GROUNDING_PREAMBLE =
+  "The prompt MUST be a 'how's it going / status / health' style ask. " +
+  "The response MUST quote the exact numbers from the snapshot below, " +
+  'in Jon voice. Do not invent figures.';
+
+/**
  * Max prior synthetic turns we feed Ghost on each round. 10 entries =
  * 5 user/assistant pairs — matches the "last 3-5 turns" framing in the
  * brief. Synthetic history is incoherent (independent pairs glued
@@ -89,12 +108,22 @@ export class GhostCalibrator {
   private config: Config;
   private embed: EmbeddingFn | undefined;
   private history: GhostTurn[] = [];
+  /**
+   * Process start for the calibration run. The cron fires a fresh
+   * `node ... ghost calibrate` each time, so this is the *calibration
+   * process* uptime, not the long-lived `thundergate` service.
+   * Reported under the `calibrator` service-uptime line so operators
+   * can tell the two apart.
+   */
+  private startedAt = Date.now();
+  private snapshotSource: StateSnapshotSource;
 
   constructor(config: Config) {
     this.config = config;
     if (config.voyageApiKey && config.voyageApiKey.length > 0) {
       this.embed = voyageEmbedder(config.voyageApiKey);
     }
+    this.snapshotSource = this.buildSnapshotSource();
   }
 
   async run(rounds: number, category: CalibrateCategory): Promise<CalibrationSummary> {
@@ -114,9 +143,16 @@ export class GhostCalibrator {
           ? ROTATING_CATEGORIES[(i - 1) % ROTATING_CATEGORIES.length]
           : category;
 
+      // Status rounds get a live snapshot threaded into BOTH the pair
+      // generator and Ghost's call. Generating the snapshot once per
+      // round keeps "ghost is asked the same question Jon was asked
+      // about the same state" coherent — Ghost reading newer numbers
+      // than CLI Jon would invent a synthetic mismatch.
+      const snapshot = cat === 'status' ? buildStateSnapshot(this.snapshotSource) : null;
+
       let pair: CalibrationPair;
       try {
-        pair = this.generatePair(cat);
+        pair = this.generatePair(cat, snapshot);
       } catch (err) {
         console.warn(`  ⚠ Round ${i} (${cat}): pair generation failed — ${(err as Error).message}`);
         continue;
@@ -126,7 +162,13 @@ export class GhostCalibrator {
       const started = Date.now();
       let ghostResponse = '';
       try {
-        ghostResponse = await this.callGhost(pair.prompt, historyForCall);
+        // Inject when (a) explicitly a status round and we built a
+        // snapshot, OR (b) CLI Jon produced a prompt the detector flags
+        // status-y under any category (covers the "tell me how things
+        // are going" prompt that lands under 'personal').
+        const useSnapshot =
+          snapshot ?? (isStatusQuery(pair.prompt) ? buildStateSnapshot(this.snapshotSource) : null);
+        ghostResponse = await this.callGhost(pair.prompt, historyForCall, useSnapshot ?? undefined);
       } catch (err) {
         ghostResponse = `[ghost error: ${(err as Error).message}]`;
       }
@@ -212,8 +254,15 @@ export class GhostCalibrator {
    * Sometimes CLI Jon wraps JSON in code fences or adds a preface; the
    * `extractJson` helper digs the object out regardless.
    */
-  private generatePair(category: string): CalibrationPair {
-    const prompt = PAIR_PROMPT_TEMPLATE.replace('[CATEGORY]', category);
+  private generatePair(category: string, stateSnapshot?: string | null): CalibrationPair {
+    let prompt = PAIR_PROMPT_TEMPLATE.replace('[CATEGORY]', category);
+    // Pin CLI Jon to real numbers on status rounds. The status-grounding
+    // preamble + the snapshot are appended *after* the template so the
+    // template's "Return ONLY the JSON object" instruction still anchors
+    // the end of the prompt.
+    if (stateSnapshot) {
+      prompt = `${STATUS_GROUNDING_PREAMBLE}\n\n${stateSnapshot}\n\n${prompt}`;
+    }
     const out = execSync(
       `${CLAUDE_BIN} --print --output-format json --dangerously-skip-permissions`,
       {
@@ -253,7 +302,11 @@ export class GhostCalibrator {
    * without a running gateway. Static system block is marked ephemeral
    * for prompt caching across the calibration run.
    */
-  private async callGhost(input: string, history: GhostTurn[]): Promise<string> {
+  private async callGhost(
+    input: string,
+    history: GhostTurn[],
+    stateSnapshot?: string
+  ): Promise<string> {
     const model = this.config.ghost.model;
     const apiKey = this.config.anthropicApiKey;
     if (!apiKey) throw new Error('anthropicApiKey not set');
@@ -265,17 +318,25 @@ export class GhostCalibrator {
     const chat = sanitizeHistory(history);
     chat.push({ role: 'user', content: input });
 
+    // Static system stays cacheable; snapshot rides in a second
+    // uncached block so each call sees fresh numbers without
+    // invalidating the heavy prefix.
+    const systemBlocks: Array<Record<string, unknown>> = [
+      {
+        type: 'text',
+        text: system,
+        cache_control: { type: 'ephemeral' }
+      }
+    ];
+    if (stateSnapshot) {
+      systemBlocks.push({ type: 'text', text: stateSnapshot });
+    }
+
     const body = {
       model: anthropicModel,
       max_tokens: this.config.ghost.maxTokens,
       temperature: this.config.ghost.temperature,
-      system: [
-        {
-          type: 'text',
-          text: system,
-          cache_control: { type: 'ephemeral' }
-        }
-      ],
+      system: systemBlocks,
       messages: chat
     };
 
@@ -301,6 +362,86 @@ export class GhostCalibrator {
   private ensureLogDir(): void {
     const dir = dirname(this.config.ghost.log_file);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  }
+
+  /**
+   * Build a best-effort snapshot source for the calibrator. The
+   * calibrator is a one-shot CLI process — it doesn't share state with
+   * the long-lived `thundergate` runtime, so we can't read WAL stats /
+   * promise counts / live frame directly. We pull what we *can* see
+   * from disk (the ghost score file) and from systemctl (service
+   * uptime), and leave the rest unpopulated. `buildStateSnapshot`
+   * skips lines whose source returned `null`, so the snapshot stays
+   * compact instead of advertising "wal=unknown".
+   */
+  private buildSnapshotSource(): StateSnapshotSource {
+    return {
+      ghostScore: () => {
+        try {
+          const evaluator = new GhostEvaluator(this.config);
+          const file = evaluator.loadScores();
+          if (!file || file.days.length === 0) return null;
+          const day = file.days[0];
+          return {
+            weightedScore: day.weighted_score,
+            samples: day.samples,
+            matchRate: day.match_rate
+          };
+        } catch {
+          return null;
+        }
+      },
+      serviceUptime: () => {
+        const tgUptime = systemctlUptimeMs('thundergate.service');
+        const relayUptime = systemctlUptimeMs('thundercomm-relay.service');
+        const bridgeUptime = systemctlUptimeMs('openclaw-gateway.service');
+        return [
+          { name: 'thundergate', uptimeMs: tgUptime },
+          { name: 'relay', uptimeMs: relayUptime },
+          { name: 'bridge', uptimeMs: bridgeUptime },
+          { name: 'calibrator', uptimeMs: Math.max(0, Date.now() - this.startedAt) }
+        ];
+      },
+      now: () => Date.now()
+    };
+  }
+}
+
+/**
+ * Best-effort service-uptime probe via `systemctl show -p
+ * ActiveEnterTimestampMonotonic`. Returns null on any failure so the
+ * snapshot renderer can omit the line cleanly. The monotonic stamp is
+ * microseconds since boot; we convert to ms-since-now using
+ * /proc/uptime to avoid wall-clock skew.
+ */
+function systemctlUptimeMs(unit: string): number | null {
+  try {
+    const raw = execSync(
+      `systemctl show -p ActiveEnterTimestampMonotonic --value ${unit} 2>/dev/null || true`,
+      { encoding: 'utf-8', timeout: 1500 }
+    ).trim();
+    const stamp = parseInt(raw, 10);
+    if (!Number.isFinite(stamp) || stamp <= 0) return null;
+    // /proc/uptime first field is seconds since boot, fractional. The
+    // monotonic timestamp is microseconds since boot.
+    const procUptime = readFileSyncSafe('/proc/uptime');
+    if (!procUptime) return null;
+    const bootSecs = parseFloat(procUptime.split(/\s+/)[0]);
+    if (!Number.isFinite(bootSecs)) return null;
+    const bootMs = bootSecs * 1000;
+    const activeMs = stamp / 1000;
+    const upMs = bootMs - activeMs;
+    return upMs > 0 ? Math.round(upMs) : null;
+  } catch {
+    return null;
+  }
+}
+
+function readFileSyncSafe(p: string): string | null {
+  try {
+    return readFileSync(p, 'utf-8');
+  } catch {
+    return null;
   }
 }
 

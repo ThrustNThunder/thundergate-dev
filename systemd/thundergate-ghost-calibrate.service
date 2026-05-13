@@ -1,0 +1,25 @@
+[Unit]
+Description=ThunderGate Ghost Jon — calibration round
+# Calibration uses the live ghost score file (~/.thundergate/ghost-scores.json)
+# and systemctl uptime probes. Running after the gateway is up keeps those
+# numbers fresh; failure to find the gateway is non-fatal.
+After=network.target thundergate.service
+Wants=thundergate.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/thundergate-dev
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/bin:/bin:/home/ubuntu/.npm-global/bin
+# 30 rounds × ~5 categories = ~6 per category per fire. Mixed across the
+# rotation. Logs go to the standard ghost log so the daily scoreboard
+# picks them up automatically.
+ExecStart=/home/linuxbrew/.linuxbrew/bin/node /home/ubuntu/thundergate-dev/dist/cli/main.js ghost calibrate --rounds 30 --category all
+# A failed calibration round must not retry-loop and burn through CLI
+# Jon's flat-rate quota. systemd's default behavior on Type=oneshot is
+# fine — the timer fires on schedule regardless.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

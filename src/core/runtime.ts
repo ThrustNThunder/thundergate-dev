@@ -21,7 +21,13 @@ import { ensureConfig } from '../config/index.js';
 import { ChannelRegistry, type ContextEntry, type OutboundDelivery } from '../channels/index.js';
 import { ThunderCommoChannel, newMessageId } from '../channels/thundercommo.js';
 import { BrowserBridgeChannel } from '../channels/browser.js';
-import { GhostHarness, type GhostTurn } from '../ghost/harness.js';
+import {
+  GhostHarness,
+  type GhostResponderOpts,
+  type GhostTurn,
+  type StateSnapshotSource
+} from '../ghost/harness.js';
+import { GhostEvaluator } from '../ghost/evaluator.js';
 import { getGhostSystemPrompt, setGhostContextDB } from '../ghost/context.js';
 import { WorldState, ProcessingMode } from '../world/state.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
@@ -71,6 +77,12 @@ export class ThunderGateRuntime {
   // Write-ahead log for every memory-affecting op. Built before the
   // memory subsystems so all of them can push intent rows through it.
   private wal!: MemoryWAL;
+  /**
+   * Wall-clock at runtime start, used by the Ghost state snapshot to
+   * report service uptime. Captured in the constructor (not start()) so
+   * `getStartedAt()` is non-null before `start()` resolves.
+   */
+  private startedAt: number = Date.now();
 
   constructor(configPath?: string) {
     // Phase 3: ensureConfig writes the default config.json on first run
@@ -288,8 +300,10 @@ export class ThunderGateRuntime {
     // Phase 3: start Ghost harness if configured. Failure is non-fatal.
     if (this.config.ghost.enabled) {
       try {
-        this.ghost = new GhostHarness(this.config, (input, history) =>
-          this.shadowResponse(input, history)
+        this.ghost = new GhostHarness(
+          this.config,
+          (input, history, opts) => this.shadowResponse(input, history, opts),
+          this.buildGhostStateSnapshotSource()
         );
         await this.ghost.start();
       } catch (err) {
@@ -467,9 +481,83 @@ export class ThunderGateRuntime {
    *   3. Return the text response to the harness for logging. We never
    *      deliver this to a channel and never write it to the session DB.
    */
-  private async shadowResponse(input: string, history: GhostTurn[]): Promise<string> {
+  private async shadowResponse(
+    input: string,
+    history: GhostTurn[],
+    opts?: GhostResponderOpts
+  ): Promise<string> {
     const system = getGhostSystemPrompt();
-    return this.callGhostLLM(system, input, history);
+    return this.callGhostLLM(system, input, history, opts?.stateSnapshot);
+  }
+
+  /**
+   * Build the snapshot-source the GhostHarness uses on status-type
+   * prompts. Each accessor is a cheap closure that swallows its own
+   * errors — a transient read failure must never break the shadow
+   * path. The harness only invokes these when `isStatusQuery(input)`
+   * is true, so non-status turns pay nothing.
+   */
+  private buildGhostStateSnapshotSource(): StateSnapshotSource {
+    return {
+      ghostScore: () => {
+        try {
+          const evaluator = new GhostEvaluator(this.config);
+          const file = evaluator.loadScores();
+          if (!file || file.days.length === 0) return null;
+          const day = file.days[0];
+          return {
+            weightedScore: day.weighted_score,
+            samples: day.samples,
+            matchRate: day.match_rate
+          };
+        } catch {
+          return null;
+        }
+      },
+      walStats: () => {
+        try {
+          if (!this.wal) return null;
+          const s = this.wal.stats();
+          return { hotRows: s.hotRows, lastRotationAt: s.lastRotationAt };
+        } catch {
+          return null;
+        }
+      },
+      openPromiseCount: () => {
+        try {
+          return this.promises ? this.promises.countOpen() : null;
+        } catch {
+          return null;
+        }
+      },
+      currentFrame: () => {
+        try {
+          const f = this.frames?.getCurrent();
+          if (!f) return null;
+          return { topic: f.topic_anchor, status: f.status };
+        } catch {
+          return null;
+        }
+      },
+      inferenceState: () => {
+        try {
+          const mode = this.world.effectiveMode();
+          const h = this.localInference?.getHealth();
+          return {
+            mode: mode === ProcessingMode.LOCAL_INFERENCE ? 'LOCAL_INFERENCE' : 'CLOUD',
+            breakerOpen: h?.circuitBreakerOpen ?? false,
+            reachable: h?.reachable ?? false
+          };
+        } catch {
+          return null;
+        }
+      },
+      serviceUptime: () => {
+        const tgUptime = Math.max(0, Date.now() - this.startedAt);
+        return [{ name: 'thundergate', uptimeMs: tgUptime }];
+      },
+      now: () => Date.now()
+    };
   }
 
   /**
@@ -487,7 +575,8 @@ export class ThunderGateRuntime {
   private async callGhostLLM(
     system: string,
     userInput: string,
-    history: GhostTurn[] = []
+    history: GhostTurn[] = [],
+    stateSnapshot?: string
   ): Promise<string> {
     const model = this.config.ghost.model;
     const maxTokens = this.config.ghost.maxTokens;
@@ -504,8 +593,9 @@ export class ThunderGateRuntime {
       // Ghost path is Anthropic-only — caching semantics differ per provider
       // and the brief locks Ghost on Haiku 4.5. Fall back to the shared
       // path for any non-Anthropic override so config typos don't 500.
+      const sys = stateSnapshot ? `${stateSnapshot}\n\n${system}` : system;
       return this.callLLM([
-        { role: 'system', content: system },
+        { role: 'system', content: sys },
         ...chat
       ]);
     }
@@ -517,17 +607,27 @@ export class ThunderGateRuntime {
     }
     const anthropicModel = model.replace(/^anthropic\//, '');
 
+    // Static system block keeps its ephemeral cache_control marker so
+    // the big SOUL/IDENTITY frame stays cacheable across calls. The
+    // per-turn state snapshot lands in a second, *uncached* block —
+    // every status query gets fresh numbers without invalidating the
+    // big cached prefix.
+    const systemBlocks: Array<Record<string, unknown>> = [
+      {
+        type: 'text',
+        text: system,
+        cache_control: { type: 'ephemeral' }
+      }
+    ];
+    if (stateSnapshot) {
+      systemBlocks.push({ type: 'text', text: stateSnapshot });
+    }
+
     const body = {
       model: anthropicModel,
       max_tokens: maxTokens,
       temperature,
-      system: [
-        {
-          type: 'text',
-          text: system,
-          cache_control: { type: 'ephemeral' }
-        }
-      ],
+      system: systemBlocks,
       messages: chat
     };
 

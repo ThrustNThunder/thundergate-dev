@@ -76,7 +76,191 @@ export interface GhostTurn {
   text: string;
 }
 
-export type GhostResponder = (input: string, history: GhostTurn[]) => Promise<string>;
+/**
+ * Optional extras for a single shadow call. Today this carries the
+ * "current system state" block we inject for status-type prompts so
+ * Ghost predicts the same numbers Jon would. Held as an options bag so
+ * future per-call signals (device hint, frame metadata, …) land without
+ * another signature break.
+ */
+export interface GhostResponderOpts {
+  /**
+   * Multi-line snapshot of live ThunderGate state — ghost score, WAL,
+   * promises, frame, services, inference mode. The implementer is
+   * expected to prepend this to the system prompt under a "Current
+   * System State" header so the LLM treats it as ground truth, not
+   * conversational context.
+   */
+  stateSnapshot?: string;
+}
+
+export type GhostResponder = (
+  input: string,
+  history: GhostTurn[],
+  opts?: GhostResponderOpts
+) => Promise<string>;
+
+/**
+ * Source of truth for a single state-snapshot rendering. The harness
+ * carries no direct refs to runtime substrate — runtime constructs one
+ * of these and passes it in. The calibrator builds a minimal variant
+ * from the evaluator + process uptime so calibration runs without a
+ * live gateway also benefit from real numbers.
+ *
+ * Every field is optional: snapshots degrade gracefully when a source
+ * is unavailable. Missing values render as `unknown` instead of being
+ * fabricated — Doctor must keep telling the truth.
+ */
+export interface StateSnapshotSource {
+  /** Latest weighted score + sample count for *today*. */
+  ghostScore?: () => { weightedScore: number; samples: number; matchRate: number } | null;
+  /** WAL counters: hot rows, last rotation epoch ms. */
+  walStats?: () => { hotRows: number; lastRotationAt: number | null } | null;
+  /** Count of currently open promises. */
+  openPromiseCount?: () => number | null;
+  /** Current frame topic + status (e.g. "ghost-tier1 / ACTIVE"). */
+  currentFrame?: () => { topic: string; status: string } | null;
+  /** LocalInference mode + breaker state. */
+  inferenceState?: () => { mode: string; breakerOpen: boolean; reachable: boolean } | null;
+  /** Service uptime breakdown — service name → uptime ms (or null if unknown). */
+  serviceUptime?: () => Array<{ name: string; uptimeMs: number | null }>;
+  /** Wall-clock at the moment the snapshot is built. */
+  now?: () => number;
+}
+
+/**
+ * Keywords that trip status-query detection. Matched case-insensitively
+ * against the user input. The list is small and conservative on
+ * purpose — false-positives turn ordinary turns into status briefings
+ * and tank semantic match; we'd rather miss a few than over-fire.
+ */
+const STATUS_QUERY_KEYWORDS = [
+  "how's",
+  "hows",
+  'ghost',
+  'status',
+  'score',
+  'health',
+  'update',
+  "what's running",
+  'whats running',
+  'any updates',
+  'wal',
+  'doctor',
+  'uptime'
+] as const;
+
+/**
+ * True when an inbound looks like a "what's the system doing right now"
+ * ask. Matched against a lowercased single-line normalization of the
+ * input. Word-bounded for short keywords so "scoreboard" doesn't fire
+ * "score", but multi-word phrases match by substring (they already
+ * carry enough specificity).
+ */
+export function isStatusQuery(input: string): boolean {
+  if (!input) return false;
+  const t = input.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  for (const kw of STATUS_QUERY_KEYWORDS) {
+    if (kw.includes(' ') || kw.includes("'")) {
+      if (t.includes(kw)) return true;
+    } else {
+      const re = new RegExp(`\\b${kw}\\b`);
+      if (re.test(t)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Render a "Current System State" snapshot from the available sources.
+ * The output is a Markdown block intended to be prepended to the Ghost
+ * system prompt under a `## Current System State` header. Lines a
+ * source cannot populate are omitted entirely (rather than rendered as
+ * "n/a") so the snapshot stays compact when the gateway is partially
+ * up.
+ *
+ * Returns `null` when no source contributes — callers can skip the
+ * prepend cleanly without producing an orphan header.
+ */
+export function buildStateSnapshot(source: StateSnapshotSource): string | null {
+  const lines: string[] = [];
+  const now = source.now ? source.now() : Date.now();
+
+  try {
+    const s = source.ghostScore?.();
+    if (s) {
+      lines.push(
+        `- ghost: weighted_score=${s.weightedScore.toFixed(2)} ` +
+        `samples=${s.samples} match_rate=${s.matchRate.toFixed(2)}`
+      );
+    }
+  } catch {
+    /* one bad source must not poison the whole snapshot */
+  }
+
+  try {
+    const w = source.walStats?.();
+    if (w) {
+      const rot = w.lastRotationAt
+        ? `${Math.round((now - w.lastRotationAt) / 60_000)}m ago`
+        : 'never';
+      lines.push(`- wal: hot_rows=${w.hotRows} last_rotation=${rot}`);
+    }
+  } catch {
+    /* swallow */
+  }
+
+  try {
+    const p = source.openPromiseCount?.();
+    if (typeof p === 'number') {
+      lines.push(`- promises: open=${p}`);
+    }
+  } catch {
+    /* swallow */
+  }
+
+  try {
+    const f = source.currentFrame?.();
+    if (f) {
+      lines.push(`- frame: ${f.topic} (${f.status})`);
+    }
+  } catch {
+    /* swallow */
+  }
+
+  try {
+    const i = source.inferenceState?.();
+    if (i) {
+      lines.push(
+        `- inference: mode=${i.mode} reachable=${i.reachable} ` +
+        `breaker=${i.breakerOpen ? 'OPEN' : 'closed'}`
+      );
+    }
+  } catch {
+    /* swallow */
+  }
+
+  try {
+    const services = source.serviceUptime?.();
+    if (services && services.length > 0) {
+      const rendered = services
+        .map((s) => {
+          if (s.uptimeMs == null) return `${s.name}=?`;
+          const mins = Math.round(s.uptimeMs / 60_000);
+          return `${s.name}=${mins}m`;
+        })
+        .join(' ');
+      lines.push(`- services: ${rendered}`);
+    }
+  } catch {
+    /* swallow */
+  }
+
+  if (lines.length === 0) return null;
+
+  return ['## Current System State', '', ...lines].join('\n');
+}
 
 interface ParsedOpenclawLine {
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -115,6 +299,7 @@ export class GhostHarness {
   private sessionsDir: string;
   private watchIntervalMs: number;
   private respond: GhostResponder;
+  private snapshotSource: StateSnapshotSource | null;
   private running = false;
   private sessions = new Map<string, SessionState>();
   private rescanTimer: NodeJS.Timeout | null = null;
@@ -125,12 +310,17 @@ export class GhostHarness {
   private embed: EmbeddingFn | undefined;
   private embeddingSkipLogged = false;
 
-  constructor(config: Config, respond: GhostResponder) {
+  constructor(
+    config: Config,
+    respond: GhostResponder,
+    snapshotSource?: StateSnapshotSource
+  ) {
     this.config = config;
     this.sessionsDir = config.ghost.sessions_dir;
     this.watchIntervalMs = config.ghost.watch_interval_ms;
     this.logFile = config.ghost.log_file;
     this.respond = respond;
+    this.snapshotSource = snapshotSource ?? null;
     // Tier-3 of the comparator hits Voyage's embeddings endpoint. If no
     // key is configured the comparator silently degrades to tier-2 and
     // tags the entry so doctor can see we skipped.
@@ -335,7 +525,16 @@ export class GhostHarness {
     const started = Date.now();
     let response = '';
     try {
-      response = await this.respond(input, history);
+      // Status-type prompts get a live state injection. Without it,
+      // Ghost invents numbers and can never tier-1 against Jon's real
+      // answer. Snapshot is built lazily — non-status turns pay
+      // nothing.
+      let opts: GhostResponderOpts | undefined;
+      if (this.snapshotSource && isStatusQuery(input)) {
+        const snap = buildStateSnapshot(this.snapshotSource);
+        if (snap) opts = { stateSnapshot: snap };
+      }
+      response = await this.respond(input, history, opts);
     } catch (err) {
       response = `[ghost error: ${(err as Error).message}]`;
     }
