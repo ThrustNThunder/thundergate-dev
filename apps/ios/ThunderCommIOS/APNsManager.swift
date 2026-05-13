@@ -182,6 +182,7 @@ public final class APNsManager: NSObject {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.assumesHTTP3Capable = false
         do {
             let bearer = try await AuthManager.shared.currentToken()
             NSLog("[APNs] uploadToken: auth token lookup succeeded")
