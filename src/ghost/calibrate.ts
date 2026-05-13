@@ -19,7 +19,8 @@
 
 import { execSync } from 'child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
-import { dirname } from 'path';
+import { dirname, resolve as pathResolve, dirname as pathDirname } from 'path';
+import { fileURLToPath } from 'url';
 import type { Config } from '../config/loader.js';
 import {
   compareResponses,
@@ -31,9 +32,10 @@ import { getGhostSystemPrompt } from './context.js';
 import { GhostEvaluator } from './evaluator.js';
 import {
   buildStateSnapshot,
-  isStatusQuery,
+  detectQueryType,
   type GhostEntry,
   type GhostTurn,
+  type QueryType,
   type StateSnapshotSource
 } from './harness.js';
 
@@ -96,6 +98,34 @@ const STATUS_GROUNDING_PREAMBLE =
   'in Jon voice. Do not invent figures.';
 
 /**
+ * CLI-flavor grounding: cross-agent envelopes, build/service plumbing,
+ * "what's the CLI doing right now" asks. The response has to quote the
+ * exact commit, service state, ghost score, frame, or last inbound from
+ * the snapshot. Same calibration trick as STATUS — pin both sides.
+ */
+const CLI_GROUNDING_PREAMBLE =
+  "The prompt MUST be a CLI-flavor cross-agent message — label:cli, " +
+  "TO:jon, or about build/service state, last commit, restarting a " +
+  "systemd unit, or a recent ThunderCommo inbound. The response MUST " +
+  "quote the exact build commit, service state, ghost score, frame, " +
+  "open promises, or last_inbound from the snapshot below, in Jon " +
+  "voice. Do not invent figures or commit hashes.";
+
+/**
+ * Technical/architecture grounding: questions about ThunderGate
+ * version, locked principles, processing mode, doctor verdict, or WAL
+ * plumbing. The response must quote the exact version, principle count,
+ * mode, and WAL stats from the snapshot.
+ */
+const TECHNICAL_GROUNDING_PREAMBLE =
+  "The prompt MUST be a technical or architecture question about " +
+  "ThunderGate — version, design principles, processing mode " +
+  "(CLOUD vs LOCAL_INFERENCE), doctor health, WAL plumbing, or world " +
+  "state. The response MUST quote the exact version, principle count, " +
+  "mode, doctor verdict, and WAL stats from the snapshot below, in Jon " +
+  "voice. Do not invent figures.";
+
+/**
  * Max prior synthetic turns we feed Ghost on each round. 10 entries =
  * 5 user/assistant pairs — matches the "last 3-5 turns" framing in the
  * brief. Synthetic history is incoherent (independent pairs glued
@@ -143,16 +173,24 @@ export class GhostCalibrator {
           ? ROTATING_CATEGORIES[(i - 1) % ROTATING_CATEGORIES.length]
           : category;
 
-      // Status rounds get a live snapshot threaded into BOTH the pair
-      // generator and Ghost's call. Generating the snapshot once per
-      // round keeps "ghost is asked the same question Jon was asked
-      // about the same state" coherent — Ghost reading newer numbers
-      // than CLI Jon would invent a synthetic mismatch.
-      const snapshot = cat === 'status' ? buildStateSnapshot(this.snapshotSource) : null;
+      // Status / cli / technical rounds each get a live snapshot
+      // threaded into BOTH the pair generator and Ghost's call.
+      // Generating the snapshot once per round keeps "ghost is asked
+      // the same question Jon was asked about the same state"
+      // coherent — Ghost reading newer numbers than CLI Jon would
+      // invent a synthetic mismatch.
+      const groundedType: QueryType | null =
+        cat === 'status' ? 'status' :
+        cat === 'cli' ? 'cli' :
+        cat === 'technical' ? 'technical' :
+        null;
+      const snapshot = groundedType
+        ? buildStateSnapshot(this.snapshotSource, groundedType)
+        : null;
 
       let pair: CalibrationPair;
       try {
-        pair = this.generatePair(cat, snapshot);
+        pair = this.generatePair(cat, snapshot, groundedType);
       } catch (err) {
         console.warn(`  ⚠ Round ${i} (${cat}): pair generation failed — ${(err as Error).message}`);
         continue;
@@ -162,12 +200,18 @@ export class GhostCalibrator {
       const started = Date.now();
       let ghostResponse = '';
       try {
-        // Inject when (a) explicitly a status round and we built a
-        // snapshot, OR (b) CLI Jon produced a prompt the detector flags
-        // status-y under any category (covers the "tell me how things
-        // are going" prompt that lands under 'personal').
-        const useSnapshot =
-          snapshot ?? (isStatusQuery(pair.prompt) ? buildStateSnapshot(this.snapshotSource) : null);
+        // Inject when (a) the round is grounded (status/cli/technical)
+        // and we built a snapshot, OR (b) CLI Jon produced a prompt
+        // the detector flags into a grounded type under any category
+        // (covers the "tell me how things are going" prompt that
+        // lands under 'personal').
+        let useSnapshot = snapshot;
+        if (!useSnapshot) {
+          const inferred = detectQueryType(pair.prompt);
+          if (inferred !== 'other') {
+            useSnapshot = buildStateSnapshot(this.snapshotSource, inferred);
+          }
+        }
         ghostResponse = await this.callGhost(pair.prompt, historyForCall, useSnapshot ?? undefined);
       } catch (err) {
         ghostResponse = `[ghost error: ${(err as Error).message}]`;
@@ -254,14 +298,24 @@ export class GhostCalibrator {
    * Sometimes CLI Jon wraps JSON in code fences or adds a preface; the
    * `extractJson` helper digs the object out regardless.
    */
-  private generatePair(category: string, stateSnapshot?: string | null): CalibrationPair {
+  private generatePair(
+    category: string,
+    stateSnapshot?: string | null,
+    groundedType?: QueryType | null
+  ): CalibrationPair {
     let prompt = PAIR_PROMPT_TEMPLATE.replace('[CATEGORY]', category);
-    // Pin CLI Jon to real numbers on status rounds. The status-grounding
+    // Pin CLI Jon to real numbers on grounded rounds. The grounding
     // preamble + the snapshot are appended *after* the template so the
-    // template's "Return ONLY the JSON object" instruction still anchors
-    // the end of the prompt.
+    // template's "Return ONLY the JSON object" instruction still
+    // anchors the end of the prompt. The preamble is keyed off the
+    // round's grounded type — falls back to the status preamble when a
+    // snapshot exists but the type wasn't passed (back-compat).
     if (stateSnapshot) {
-      prompt = `${STATUS_GROUNDING_PREAMBLE}\n\n${stateSnapshot}\n\n${prompt}`;
+      const preamble =
+        groundedType === 'cli' ? CLI_GROUNDING_PREAMBLE :
+        groundedType === 'technical' ? TECHNICAL_GROUNDING_PREAMBLE :
+        STATUS_GROUNDING_PREAMBLE;
+      prompt = `${preamble}\n\n${stateSnapshot}\n\n${prompt}`;
     }
     const out = execSync(
       `${CLAUDE_BIN} --print --output-format json --dangerously-skip-permissions`,
@@ -392,9 +446,14 @@ export class GhostCalibrator {
         }
       },
       serviceUptime: () => {
+        // CLI category brief lists thundergate, thundercomm-relay, and
+        // thundercomm-bridge. We probe all three with the canonical
+        // unit names so the snapshot matches what an operator would
+        // see in `systemctl status`. `calibrator` reports the
+        // standalone process so operators can tell the two apart.
         const tgUptime = systemctlUptimeMs('thundergate.service');
         const relayUptime = systemctlUptimeMs('thundercomm-relay.service');
-        const bridgeUptime = systemctlUptimeMs('openclaw-gateway.service');
+        const bridgeUptime = systemctlUptimeMs('thundercomm-bridge.service');
         return [
           { name: 'thundergate', uptimeMs: tgUptime },
           { name: 'relay', uptimeMs: relayUptime },
@@ -402,6 +461,25 @@ export class GhostCalibrator {
           { name: 'calibrator', uptimeMs: Math.max(0, Date.now() - this.startedAt) }
         ];
       },
+      serviceStatus: () => {
+        const units = [
+          { name: 'thundergate', unit: 'thundergate.service' },
+          { name: 'relay', unit: 'thundercomm-relay.service' },
+          { name: 'bridge', unit: 'thundercomm-bridge.service' }
+        ];
+        return units.map((u) => ({
+          name: u.name,
+          active: systemctlIsActive(u.unit)
+        }));
+      },
+      lastGitCommit: () => readLastGitCommit(repoRootGuess()),
+      version: () => readPackageVersion(repoRootGuess()),
+      principlesCount: () => readPrinciplesCount(repoRootGuess()),
+      // The calibrator runs as a standalone CLI process and doesn't
+      // share state with the long-lived runtime, so lastInbound and
+      // doctorSummary intentionally stay unset — the snapshot
+      // renderer skips lines whose source returned null rather than
+      // advertising "doctor=unknown".
       now: () => Date.now()
     };
   }
@@ -435,6 +513,90 @@ function systemctlUptimeMs(unit: string): number | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Mirror of the runtime's repoRootGuess. The calibrator can be launched
+ * from anywhere (the systemd timer cd's into the repo, but humans run
+ * it from wherever), so derive the repo root from this module's
+ * filesystem path rather than cwd. Memoized for cheap repeat calls.
+ */
+let _calibrateRepoRootCache: string | null = null;
+function repoRootGuess(): string {
+  if (_calibrateRepoRootCache) return _calibrateRepoRootCache;
+  try {
+    const here = fileURLToPath(import.meta.url);
+    // src/ghost/calibrate.ts → repo root is two dirs up.
+    const candidate = pathResolve(pathDirname(here), '..', '..');
+    if (existsSync(pathResolve(candidate, 'package.json'))) {
+      _calibrateRepoRootCache = candidate;
+      return candidate;
+    }
+  } catch {
+    /* fall through */
+  }
+  _calibrateRepoRootCache = process.cwd();
+  return _calibrateRepoRootCache;
+}
+
+function readLastGitCommit(repo: string): { hash: string; subject: string } | null {
+  try {
+    const out = execSync(`git -C ${shellQuote(repo)} log -1 --format=%h%x09%s`, {
+      encoding: 'utf-8',
+      timeout: 1500,
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim();
+    if (!out) return null;
+    const [hash, ...rest] = out.split('\t');
+    const subject = rest.join('\t').trim();
+    if (!hash) return null;
+    return { hash, subject };
+  } catch {
+    return null;
+  }
+}
+
+function readPackageVersion(repo: string): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(pathResolve(repo, 'package.json'), 'utf-8'));
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function readPrinciplesCount(repo: string): number | null {
+  const candidates = [
+    pathResolve(repo, 'docs/THUNDERGATE_DESIGN_PRINCIPLES.md'),
+    pathResolve(repo, 'THUNDERGATE_DESIGN_PRINCIPLES.md')
+  ];
+  for (const path of candidates) {
+    try {
+      if (!existsSync(path)) continue;
+      const text = readFileSync(path, 'utf-8');
+      const matches = text.match(/^##\s+\d+\.\s+/gm);
+      if (matches) return matches.length;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+function systemctlIsActive(unit: string): boolean {
+  try {
+    const out = execSync(`systemctl is-active ${shellQuote(unit)} 2>/dev/null || true`, {
+      encoding: 'utf-8',
+      timeout: 1500
+    }).trim();
+    return out === 'active';
+  } catch {
+    return false;
+  }
+}
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 function readFileSyncSafe(p: string): string | null {

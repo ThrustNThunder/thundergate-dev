@@ -124,9 +124,31 @@ export interface StateSnapshotSource {
   inferenceState?: () => { mode: string; breakerOpen: boolean; reachable: boolean } | null;
   /** Service uptime breakdown — service name → uptime ms (or null if unknown). */
   serviceUptime?: () => Array<{ name: string; uptimeMs: number | null }>;
+  /** Active/inactive flag per service — for the CLI snapshot. */
+  serviceStatus?: () => Array<{ name: string; active: boolean }>;
+  /** Last git commit on the thundergate-dev repo (CLI snapshot). */
+  lastGitCommit?: () => { hash: string; subject: string } | null;
+  /** Last ThunderCommo inbound seen by the runtime (CLI snapshot). */
+  lastInbound?: () => { sender: string; text: string; channel: string; ageMs: number } | null;
+  /** ThunderGate package version (technical snapshot). */
+  version?: () => string | null;
+  /** Count of locked design principles (technical snapshot). */
+  principlesCount?: () => number | null;
+  /** Doctor's last health verdict + consecutive-healthy count (technical snapshot). */
+  doctorSummary?: () => { status: string; consecutiveHealthy: number } | null;
   /** Wall-clock at the moment the snapshot is built. */
   now?: () => number;
 }
+
+/**
+ * Three flavors of state injection we route prompts into, plus 'other'
+ * for the no-snapshot path. Detection is keyword-based and conservative
+ * — see [[detect-query-type]] for the heuristic. Adding a new flavor
+ * means extending the keyword list, the rendering switch in
+ * [[buildStateSnapshot]], and (for parity) the calibrator's grounding
+ * preambles in src/ghost/calibrate.ts.
+ */
+export type QueryType = 'status' | 'cli' | 'technical' | 'other';
 
 /**
  * Keywords that trip status-query detection. Matched case-insensitively
@@ -151,18 +173,65 @@ const STATUS_QUERY_KEYWORDS = [
 ] as const;
 
 /**
- * True when an inbound looks like a "what's the system doing right now"
- * ask. Matched against a lowercased single-line normalization of the
- * input. Word-bounded for short keywords so "scoreboard" doesn't fire
- * "score", but multi-word phrases match by substring (they already
- * carry enough specificity).
+ * CLI-flavor keywords: cross-agent envelopes (label:, TO:, FROM:),
+ * build/service plumbing, and the names of the long-lived units that
+ * frame "what's the CLI doing right now" questions. Word-bounded for
+ * short tokens; substring for phrases that already carry specificity.
  */
-export function isStatusQuery(input: string): boolean {
-  if (!input) return false;
-  const t = input.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (!t) return false;
-  for (const kw of STATUS_QUERY_KEYWORDS) {
-    if (kw.includes(' ') || kw.includes("'")) {
+const CLI_QUERY_KEYWORDS = [
+  'label:cli',
+  'label: cli',
+  'to:jon',
+  'to: jon',
+  'from:cli',
+  'from: cli',
+  'cross-agent',
+  'build state',
+  'last commit',
+  'git commit',
+  'commit hash',
+  'systemctl',
+  'journalctl',
+  'thundergate.service',
+  'thundercomm-relay',
+  'thundercomm-bridge',
+  'restart',
+  'redeploy',
+  'rebuild'
+] as const;
+
+/**
+ * Technical/architecture keywords. These fire on questions about the
+ * principles doc, runtime mode, doctor verdict, WAL plumbing, or
+ * provenance ledger — the surface area Ghost has to discuss using the
+ * same numbers Jon would.
+ */
+const TECHNICAL_QUERY_KEYWORDS = [
+  'architecture',
+  'principle',
+  'principles',
+  'design principle',
+  'thundergate version',
+  'version',
+  'cloud mode',
+  'local inference',
+  'local_inference',
+  'processing mode',
+  'worldstate',
+  'world state',
+  'world-state',
+  'provenance',
+  'doctor check',
+  'doctor mode',
+  'wal',
+  'write-ahead log',
+  'write ahead log',
+  'memory wal'
+] as const;
+
+function matchesKeyword(t: string, keywords: readonly string[]): boolean {
+  for (const kw of keywords) {
+    if (kw.includes(' ') || kw.includes("'") || kw.includes(':') || kw.includes('-') || kw.includes('_')) {
       if (t.includes(kw)) return true;
     } else {
       const re = new RegExp(`\\b${kw}\\b`);
@@ -173,6 +242,32 @@ export function isStatusQuery(input: string): boolean {
 }
 
 /**
+ * Classify an inbound prompt as 'status', 'cli', 'technical', or
+ * 'other'. Status wins on tie because that path is the most-tested and
+ * carries the broadest set of grounded numbers. Detection is
+ * conservative on purpose — false positives turn ordinary turns into
+ * state-briefings and tank semantic match. We'd rather miss a few than
+ * over-fire.
+ */
+export function detectQueryType(input: string): QueryType {
+  if (!input) return 'other';
+  const t = input.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return 'other';
+  if (matchesKeyword(t, STATUS_QUERY_KEYWORDS)) return 'status';
+  if (matchesKeyword(t, CLI_QUERY_KEYWORDS)) return 'cli';
+  if (matchesKeyword(t, TECHNICAL_QUERY_KEYWORDS)) return 'technical';
+  return 'other';
+}
+
+/**
+ * Back-compat wrapper kept so older imports keep compiling. New code
+ * should call [[detectQueryType]] directly and switch on the result.
+ */
+export function isStatusQuery(input: string): boolean {
+  return detectQueryType(input) === 'status';
+}
+
+/**
  * Render a "Current System State" snapshot from the available sources.
  * The output is a Markdown block intended to be prepended to the Ghost
  * system prompt under a `## Current System State` header. Lines a
@@ -180,81 +275,155 @@ export function isStatusQuery(input: string): boolean {
  * "n/a") so the snapshot stays compact when the gateway is partially
  * up.
  *
+ * The set of lines rendered depends on `type`:
+ *   - 'status':    ghost score, WAL, promises, frame, inference, service uptime
+ *   - 'cli':       last git commit, service status, ghost score, open promises,
+ *                  current frame, last ThunderCommo inbound
+ *   - 'technical': version, principles count, processing mode + breaker,
+ *                  doctor verdict, WAL stats
+ *
  * Returns `null` when no source contributes — callers can skip the
  * prepend cleanly without producing an orphan header.
  */
-export function buildStateSnapshot(source: StateSnapshotSource): string | null {
+export function buildStateSnapshot(
+  source: StateSnapshotSource,
+  type: Exclude<QueryType, 'other'> = 'status'
+): string | null {
   const lines: string[] = [];
   const now = source.now ? source.now() : Date.now();
 
-  try {
-    const s = source.ghostScore?.();
-    if (s) {
-      lines.push(
-        `- ghost: weighted_score=${s.weightedScore.toFixed(2)} ` +
-        `samples=${s.samples} match_rate=${s.matchRate.toFixed(2)}`
-      );
+  const safe = <T,>(fn: (() => T) | undefined): T | null => {
+    if (!fn) return null;
+    try {
+      const v = fn();
+      return v == null ? null : v;
+    } catch {
+      // one bad source must not poison the whole snapshot
+      return null;
     }
-  } catch {
-    /* one bad source must not poison the whole snapshot */
-  }
+  };
 
-  try {
-    const w = source.walStats?.();
-    if (w) {
-      const rot = w.lastRotationAt
-        ? `${Math.round((now - w.lastRotationAt) / 60_000)}m ago`
-        : 'never';
-      lines.push(`- wal: hot_rows=${w.hotRows} last_rotation=${rot}`);
-    }
-  } catch {
-    /* swallow */
-  }
+  const ghostScoreLine = (): string | null => {
+    const s = safe(source.ghostScore);
+    if (!s) return null;
+    return (
+      `- ghost: weighted_score=${s.weightedScore.toFixed(2)} ` +
+      `samples=${s.samples} match_rate=${s.matchRate.toFixed(2)}`
+    );
+  };
 
-  try {
-    const p = source.openPromiseCount?.();
-    if (typeof p === 'number') {
-      lines.push(`- promises: open=${p}`);
-    }
-  } catch {
-    /* swallow */
-  }
+  const walLine = (): string | null => {
+    const w = safe(source.walStats);
+    if (!w) return null;
+    const rot = w.lastRotationAt
+      ? `${Math.round((now - w.lastRotationAt) / 60_000)}m ago`
+      : 'never';
+    return `- wal: hot_rows=${w.hotRows} last_rotation=${rot}`;
+  };
 
-  try {
-    const f = source.currentFrame?.();
-    if (f) {
-      lines.push(`- frame: ${f.topic} (${f.status})`);
-    }
-  } catch {
-    /* swallow */
-  }
+  const promiseLine = (): string | null => {
+    const p = safe(source.openPromiseCount);
+    if (typeof p !== 'number') return null;
+    return `- promises: open=${p}`;
+  };
 
-  try {
-    const i = source.inferenceState?.();
-    if (i) {
-      lines.push(
-        `- inference: mode=${i.mode} reachable=${i.reachable} ` +
-        `breaker=${i.breakerOpen ? 'OPEN' : 'closed'}`
-      );
-    }
-  } catch {
-    /* swallow */
-  }
+  const frameLine = (): string | null => {
+    const f = safe(source.currentFrame);
+    if (!f) return null;
+    return `- frame: ${f.topic} (${f.status})`;
+  };
 
-  try {
-    const services = source.serviceUptime?.();
-    if (services && services.length > 0) {
-      const rendered = services
-        .map((s) => {
-          if (s.uptimeMs == null) return `${s.name}=?`;
-          const mins = Math.round(s.uptimeMs / 60_000);
-          return `${s.name}=${mins}m`;
-        })
-        .join(' ');
-      lines.push(`- services: ${rendered}`);
-    }
-  } catch {
-    /* swallow */
+  const inferenceLine = (): string | null => {
+    const i = safe(source.inferenceState);
+    if (!i) return null;
+    return (
+      `- inference: mode=${i.mode} reachable=${i.reachable} ` +
+      `breaker=${i.breakerOpen ? 'OPEN' : 'closed'}`
+    );
+  };
+
+  const serviceUptimeLine = (): string | null => {
+    const services = safe(source.serviceUptime);
+    if (!services || services.length === 0) return null;
+    const rendered = services
+      .map((s) => {
+        if (s.uptimeMs == null) return `${s.name}=?`;
+        const mins = Math.round(s.uptimeMs / 60_000);
+        return `${s.name}=${mins}m`;
+      })
+      .join(' ');
+    return `- services: ${rendered}`;
+  };
+
+  const serviceStatusLine = (): string | null => {
+    const services = safe(source.serviceStatus);
+    if (!services || services.length === 0) return null;
+    const rendered = services
+      .map((s) => `${s.name}=${s.active ? 'active' : 'inactive'}`)
+      .join(' ');
+    return `- service_status: ${rendered}`;
+  };
+
+  const gitCommitLine = (): string | null => {
+    const g = safe(source.lastGitCommit);
+    if (!g) return null;
+    // Keep subject single-line; trim to avoid blowing the snapshot if
+    // someone commits a paragraph-style message.
+    const subj = g.subject.replace(/\s+/g, ' ').slice(0, 120);
+    return `- build: commit=${g.hash} "${subj}"`;
+  };
+
+  const lastInboundLine = (): string | null => {
+    const i = safe(source.lastInbound);
+    if (!i) return null;
+    const ageMin = Math.round(i.ageMs / 60_000);
+    const text = i.text.replace(/\s+/g, ' ').slice(0, 100);
+    return `- last_inbound: ${i.sender}@${i.channel} ${ageMin}m ago: "${text}"`;
+  };
+
+  const versionLine = (): string | null => {
+    const v = safe(source.version);
+    if (!v) return null;
+    return `- version: thundergate ${v}`;
+  };
+
+  const principlesLine = (): string | null => {
+    const c = safe(source.principlesCount);
+    if (typeof c !== 'number') return null;
+    return `- principles: ${c} locked`;
+  };
+
+  const doctorLine = (): string | null => {
+    const d = safe(source.doctorSummary);
+    if (!d) return null;
+    return `- doctor: status=${d.status} consecutive_healthy=${d.consecutiveHealthy}`;
+  };
+
+  const push = (line: string | null): void => {
+    if (line) lines.push(line);
+  };
+
+  if (type === 'status') {
+    push(ghostScoreLine());
+    push(walLine());
+    push(promiseLine());
+    push(frameLine());
+    push(inferenceLine());
+    push(serviceUptimeLine());
+  } else if (type === 'cli') {
+    push(gitCommitLine());
+    push(serviceStatusLine());
+    push(serviceUptimeLine());
+    push(ghostScoreLine());
+    push(promiseLine());
+    push(frameLine());
+    push(lastInboundLine());
+  } else if (type === 'technical') {
+    push(versionLine());
+    push(principlesLine());
+    push(inferenceLine());
+    push(doctorLine());
+    push(walLine());
   }
 
   if (lines.length === 0) return null;
@@ -525,14 +694,17 @@ export class GhostHarness {
     const started = Date.now();
     let response = '';
     try {
-      // Status-type prompts get a live state injection. Without it,
-      // Ghost invents numbers and can never tier-1 against Jon's real
-      // answer. Snapshot is built lazily — non-status turns pay
-      // nothing.
+      // Status / CLI / technical prompts each get a live state
+      // injection. Without it, Ghost invents numbers and can never
+      // tier-1 against Jon's real answer. Snapshot is built lazily —
+      // non-grounded turns pay nothing.
       let opts: GhostResponderOpts | undefined;
-      if (this.snapshotSource && isStatusQuery(input)) {
-        const snap = buildStateSnapshot(this.snapshotSource);
-        if (snap) opts = { stateSnapshot: snap };
+      if (this.snapshotSource) {
+        const queryType = detectQueryType(input);
+        if (queryType !== 'other') {
+          const snap = buildStateSnapshot(this.snapshotSource, queryType);
+          if (snap) opts = { stateSnapshot: snap };
+        }
       }
       response = await this.respond(input, history, opts);
     } catch (err) {

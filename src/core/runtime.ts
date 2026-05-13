@@ -12,6 +12,10 @@
  * - Doctor mode always running
  */
 
+import { execSync } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname as pathDirname, resolve as pathResolve } from 'path';
 import { SessionDB } from '../session/database.js';
 import { CheckpointData, saveCheckpoint, loadCheckpoint } from '../checkpoint/save.js';
 import { TriggerEngine } from '../learning/triggers.js';
@@ -556,6 +560,59 @@ export class ThunderGateRuntime {
         const tgUptime = Math.max(0, Date.now() - this.startedAt);
         return [{ name: 'thundergate', uptimeMs: tgUptime }];
       },
+      serviceStatus: () => {
+        // Best-effort `is-active` probe for the three units the CLI
+        // snapshot pins. systemctl may be absent inside non-systemd
+        // sandboxes — we report `inactive` rather than crash.
+        const units = [
+          { name: 'thundergate', unit: 'thundergate.service' },
+          { name: 'relay', unit: 'thundercomm-relay.service' },
+          { name: 'bridge', unit: 'thundercomm-bridge.service' }
+        ];
+        return units.map((u) => ({
+          name: u.name,
+          active: systemctlIsActive(u.unit)
+        }));
+      },
+      lastGitCommit: () => readLastGitCommit(repoRootGuess()),
+      lastInbound: () => {
+        // Pull the most recent inbound_message row directly from the
+        // WAL. Read-only, indexed by id, so cheap even with a hot
+        // table. Returns null when WAL is empty or unavailable.
+        try {
+          if (!this.db) return null;
+          const row = this.db.raw().prepare(
+            `SELECT created_at, payload FROM memory_wal
+             WHERE type = 'inbound_message'
+             ORDER BY id DESC LIMIT 1`
+          ).get() as { created_at: number; payload: string } | undefined;
+          if (!row) return null;
+          const payload = JSON.parse(row.payload);
+          return {
+            sender: String(payload.sender ?? 'unknown'),
+            channel: String(payload.channel ?? 'unknown'),
+            text: String(payload.text ?? ''),
+            ageMs: Math.max(0, Date.now() - row.created_at)
+          };
+        } catch {
+          return null;
+        }
+      },
+      version: () => readPackageVersion(repoRootGuess()),
+      principlesCount: () => readPrinciplesCount(repoRootGuess()),
+      doctorSummary: () => {
+        try {
+          if (!this.doctor) return null;
+          const s = this.doctor.getStatus();
+          if (!s) return null;
+          return {
+            status: s.status,
+            consecutiveHealthy: this.doctor.getConsecutiveHealthy()
+          };
+        } catch {
+          return null;
+        }
+      },
       now: () => Date.now()
     };
   }
@@ -1081,6 +1138,96 @@ interface Message {
 interface Response {
   content: string;
   type: 'normal' | 'surface' | 'deep';
+}
+
+/**
+ * Resolve the thundergate-dev repo root from the compiled module's own
+ * location. Falls back to cwd() if the URL math gives us something that
+ * doesn't look like a repo. Memoized for cheap repeat calls during a
+ * shadow run.
+ */
+let _repoRootCache: string | null = null;
+function repoRootGuess(): string {
+  if (_repoRootCache) return _repoRootCache;
+  try {
+    const here = fileURLToPath(import.meta.url);
+    // src/core/runtime.ts → repo root is two dirs up.
+    const candidate = pathResolve(pathDirname(here), '..', '..');
+    if (existsSync(pathResolve(candidate, 'package.json'))) {
+      _repoRootCache = candidate;
+      return candidate;
+    }
+  } catch {
+    /* fall through */
+  }
+  _repoRootCache = process.cwd();
+  return _repoRootCache;
+}
+
+function readLastGitCommit(repo: string): { hash: string; subject: string } | null {
+  try {
+    const out = execSync(`git -C ${shellQuote(repo)} log -1 --format=%h%x09%s`, {
+      encoding: 'utf-8',
+      timeout: 1500,
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim();
+    if (!out) return null;
+    const [hash, ...rest] = out.split('\t');
+    const subject = rest.join('\t').trim();
+    if (!hash) return null;
+    return { hash, subject };
+  } catch {
+    return null;
+  }
+}
+
+function readPackageVersion(repo: string): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(pathResolve(repo, 'package.json'), 'utf-8'));
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function readPrinciplesCount(repo: string): number | null {
+  // Count the numbered `## N. NAME` headers in the design-principles
+  // doc — that file is the source of truth for the locked-principles
+  // count Ghost has to quote on technical asks.
+  const candidates = [
+    pathResolve(repo, 'docs/THUNDERGATE_DESIGN_PRINCIPLES.md'),
+    pathResolve(repo, 'THUNDERGATE_DESIGN_PRINCIPLES.md')
+  ];
+  for (const path of candidates) {
+    try {
+      if (!existsSync(path)) continue;
+      const text = readFileSync(path, 'utf-8');
+      const matches = text.match(/^##\s+\d+\.\s+/gm);
+      if (matches) return matches.length;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+function systemctlIsActive(unit: string): boolean {
+  try {
+    const out = execSync(`systemctl is-active ${shellQuote(unit)} 2>/dev/null || true`, {
+      encoding: 'utf-8',
+      timeout: 1500
+    }).trim();
+    return out === 'active';
+  } catch {
+    return false;
+  }
+}
+
+function shellQuote(s: string): string {
+  // Conservative quoting for shell arguments we splice into execSync —
+  // single-quote and escape any embedded single quotes. The inputs here
+  // are repo paths and systemd unit names, both expected to be ASCII.
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 // Main entry point
