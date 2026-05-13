@@ -19,6 +19,7 @@ import { createInterface } from 'readline';
 import * as os from 'os';
 import { ensureConfig, validateConfig, getConfigPath } from '../config/index.js';
 import { GhostEvaluator } from '../ghost/evaluator.js';
+import { GhostCalibrator, type CalibrateCategory } from '../ghost/calibrate.js';
 import { runLearnTests, formatReport } from '../ghost/learn-test.js';
 import { describeGhostContextFiles, getGhostContextDir } from '../ghost/context.js';
 import { ProvenanceLedger, type ProvenanceEvent } from '../provenance/ledger.js';
@@ -377,6 +378,67 @@ ghost
       console.warn(`(could not persist learn-test result for Doctor check 7: ${(e as Error).message})`);
     }
     process.exit(report.gatePass ? 0 : 1);
+  });
+
+ghost
+  .command('calibrate')
+  .description('Free Ghost Jon training loop — CLI Jon generates pairs, Haiku predicts, log scores')
+  .option('--rounds <n>', 'Number of rounds to run', '20')
+  .option(
+    '--category <name>',
+    'all | slack | cli | status | technical | personal',
+    'all'
+  )
+  .action(async (opts: { rounds: string; category: string }) => {
+    const rounds = parseInt(opts.rounds, 10) || 20;
+    const allowed: CalibrateCategory[] = [
+      'all',
+      'slack',
+      'cli',
+      'status',
+      'technical',
+      'personal'
+    ];
+    const category = (allowed as string[]).includes(opts.category)
+      ? (opts.category as CalibrateCategory)
+      : 'all';
+    if (!(allowed as string[]).includes(opts.category)) {
+      console.warn(`  ⚠ Unknown category '${opts.category}', defaulting to 'all'`);
+    }
+
+    const cfg = ensureConfig();
+    if (!cfg.anthropicApiKey) {
+      console.error('  ✗ anthropicApiKey not set — calibration cannot call Ghost predictor');
+      process.exit(1);
+    }
+    if (!existsSync('/home/ubuntu/.npm-global/bin/claude')) {
+      console.error('  ✗ CLI Jon not found at /home/ubuntu/.npm-global/bin/claude');
+      process.exit(1);
+    }
+
+    console.log('⚡ Ghost Jon Calibration');
+    console.log('═══════════════════════════════════════');
+    console.log(`  Rounds:    ${rounds}`);
+    console.log(`  Category:  ${category}`);
+    console.log(`  Model:     ${cfg.ghost.model}`);
+    console.log(`  Log:       ${cfg.ghost.log_file}`);
+    console.log(`  Voyage:    ${cfg.voyageApiKey ? 'enabled' : 'disabled (tier-3 will skip)'}`);
+    console.log('');
+
+    const calibrator = new GhostCalibrator(cfg);
+    const summary = await calibrator.run(rounds, category);
+
+    console.log('');
+    console.log('───── Summary ──────────────────────────');
+    console.log(`  Rounds completed: ${summary.rounds}/${rounds}`);
+    console.log(`  Average score:    ${summary.avg_score.toFixed(3)}`);
+    console.log(
+      `  Tier breakdown:   tier1=${summary.tier_breakdown.tier1} ` +
+      `tier2=${summary.tier_breakdown.tier2} tier3=${summary.tier_breakdown.tier3}`
+    );
+    console.log(`  Voyage hit rate:  ${(summary.voyage_hit_rate * 100).toFixed(1)}%`);
+    console.log('');
+    process.exit(0);
   });
 
 ghost
