@@ -11,6 +11,9 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { randomUUID } from 'crypto';
 import { createServer, request as httpRequest } from 'http';
+import { readFileSync, existsSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -43,6 +46,65 @@ const INBOX_AUTH_PORT = parseInt(process.env.TC_INBOX_PORT || '8769', 10);
 // ── State ─────────────────────────────────────────────────────────────────
 
 const peers = new Map(); // peerId → { ws, channels, connectedAt, model }
+
+// ── APNs push helper ─────────────────────────────────────────────────────
+
+const APNS_TOKENS_FILE = join(homedir(), '.thundergate', 'apns_tokens.json');
+
+function loadApnsTokens() {
+  try {
+    if (!existsSync(APNS_TOKENS_FILE)) return [];
+    const data = JSON.parse(readFileSync(APNS_TOKENS_FILE, 'utf-8'));
+    return data.tokens || [];
+  } catch { return []; }
+}
+
+function isIosPeerConnected() {
+  for (const [pid] of peers) {
+    if (pid.startsWith('ios-michael')) return true;
+  }
+  return false;
+}
+
+function triggerApnsPushForMessage(sender, text, channel) {
+  // Don't push if Michael's iOS client is connected (they see it live)
+  if (isIosPeerConnected()) return;
+
+  const tokens = loadApnsTokens();
+  if (!tokens.length) return;
+
+  const preview = text ? text.slice(0, 100) : 'New message';
+  const title = sender ? `${sender}` : 'ThunderCommo';
+
+  // Get unique user_ids from token store and push once per user
+  const userIds = [...new Set(tokens.map(t => t.user_id).filter(Boolean))];
+  if (!userIds.length) return;
+
+  for (const userId of userIds) {
+    const bodyStr = JSON.stringify({
+      user_id: userId,
+      title,
+      body: preview,
+      channel,
+      message_id: randomUUID(),
+    });
+
+    const req = httpRequest({
+      host: APNS_REGISTER_HOST,
+      port: APNS_REGISTER_PORT,
+      path: '/api/apns/push',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) },
+      timeout: 5000,
+    }, (res) => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => console.log(`[Relay] APNs auto-push → user=${userId.slice(0, 12)}… status=${res.statusCode}`));
+    });
+    req.on('error', e => console.warn('[Relay] APNs auto-push error:', e.message));
+    req.write(bodyStr);
+    req.end();
+  }
+}
 
 // ── Relay Server ──────────────────────────────────────────────────────────
 // We run an http.createServer so the same port (8767, Cloudflare-proxied)
@@ -166,6 +228,8 @@ function forwardTokenToApns(bodyObj) {
 
 function handleRelayHttp(req, res) {
   const url = req.url || '/';
+  // Log ALL incoming HTTP requests for debugging
+  console.log(`[Relay] HTTP ${req.method} ${url} from ${req.socket?.remoteAddress}`);
 
   // CORS preflight (iOS doesn't need it, but harmless and clean).
   if (req.method === 'OPTIONS') {
@@ -247,6 +311,20 @@ function handleRelayHttp(req, res) {
     return;
   }
 
+  // GET /api/agent/identity — KYA agent identity for verification
+  if (req.method === 'GET' && url === '/api/agent/identity') {
+    writeJson(res, 200, {
+      agent_id: 'jon-thunderbase-001',
+      display_name: 'Jon',
+      emoji: '\u26a1',
+      fingerprint: 'thunder-echo-lima-foxtrot',
+      role: 'Technical Director',
+      gatewayURL: 'wss://relay.thunderai.us',
+      verifiedAt: null
+    });
+    return;
+  }
+
   writeJson(res, 404, { error: 'not_found' });
 }
 
@@ -269,17 +347,30 @@ wss.on('connection', (ws, req) => {
   // Also reset on any message activity
   ws.on('message', () => { ws.missedPings = 0; });
 
-  ws.on('message', (data) => {
+  ws.on('message', async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
     // Authentication
     if (msg.type === 'federation_auth') {
       // WebSocket federation is agent-only. Accept hardcoded VALID_TOKENS or
-      // tc-a-* agent tokens; reject tc-h-* human tokens and anything else.
+      // tc-a-* tokens that are in the issued-tokens store. Reject everything else.
       const t = msg.token;
-      const wsTokenOk = typeof t === 'string' && t.length > 0 &&
-        (VALID_TOKENS.has(t) || t.startsWith('tc-a-'));
+      const inStaticSet = typeof t === 'string' && t.length > 0 && VALID_TOKENS.has(t);
+      let wsTokenOk = inStaticSet;
+      if (!wsTokenOk && typeof t === 'string' && t.startsWith('tc-a-')) {
+        // Validate dynamic tc-a- token against the inbox issued-tokens store
+        try {
+          const vRes = await new Promise((resolve, reject) => {
+            const req2 = httpRequest({ host: '127.0.0.1', port: 8769, path: `/api/tokens/validate?token=${encodeURIComponent(t)}`, method: 'GET' }, (r) => {
+              let d = ''; r.on('data', c => d += c); r.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve({ valid: false }); } });
+            });
+            req2.on('error', reject);
+            req2.end();
+          });
+          wsTokenOk = vRes.valid === true;
+        } catch { wsTokenOk = false; }
+      }
       if (!wsTokenOk) {
         console.warn(`[Relay] Auth rejected: bad token from ${msg.peerId}`);
         ws.send(JSON.stringify({ type: 'federation_status', status: 'rejected', reason: 'bad_token' }));
@@ -359,6 +450,20 @@ wss.on('connection', (ws, req) => {
         if (peer.ws.readyState === WebSocket.OPEN) {
           peer.ws.send(JSON.stringify(msg));
         }
+      }
+
+      // Auto-push to iOS if Michael is not connected
+      // Only push for agent replies directed at humans (not heartbeats, not agent-to-agent)
+      const isHumanMsg = msg.senderType === 'human';
+      const isAgentMsg = msg.senderType === 'agent' || (!msg.senderType && msg.sender && msg.originPeer?.includes('thunderbase') || msg.originPeer?.includes('mac-'));
+      const isUserChannel = msg.channel === 'tnt' || String(msg.channel || '').startsWith('direct:');
+      const text = msg.text || '';
+      const isHeartbeat = text.trim() === 'HEARTBEAT_OK' || text.startsWith('HEARTBEAT_OK');
+      const isAgentToAgent = String(msg.channel || '').startsWith('direct:jon') || String(msg.channel || '').startsWith('direct:mack') || String(msg.channel || '').startsWith('direct:rex');
+      // Push when: agent replies on tnt (not heartbeats), or human messages on tnt, or direct:michael
+      const shouldPush = isUserChannel && !isHeartbeat && !isAgentToAgent;
+      if (shouldPush) {
+        triggerApnsPushForMessage(msg.sender, msg.text, msg.channel);
       }
     }
   });

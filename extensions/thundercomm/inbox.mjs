@@ -259,28 +259,6 @@ agentTokens.set(LEGACY_JON_AGENT_TOKEN, {
   revoked: false,
 });
 
-// Pre-seed Michael as admin
-const michaelSalt = randomBytes(16).toString('hex');
-users.set('thrustnthunder1@gmail.com', {
-  id: 'michael-lovell-admin',
-  email: 'thrustnthunder1@gmail.com',
-  displayName: 'Michael',
-  phone: '+17193388327',
-  role: 'admin',
-  emailVerified: true,
-  salt: michaelSalt,
-  passwordHash: hashPassword('RUsty1234!@#$', michaelSalt), // Updated May 10 2026
-  agents: [{
-    id: 'jon-agent',
-    agentName: 'Jon',
-    agentEmoji: '⚡',
-    wsURL: RELAY_WS_URL,
-    httpURL: RELAY_HTTP_URL,
-    token: LEGACY_JON_AGENT_TOKEN,
-    isDefault: true
-  }],
-  createdAt: new Date().toISOString()
-});
 
 function hashPassword(password, salt) {
   return createHash('sha256').update(password + salt).digest('hex');
@@ -365,9 +343,9 @@ export function handleAuthRequest(req, res, url) {
       try {
         const { email, password, displayName, phone } = JSON.parse(body);
 
-        if (!email || !password || !phone) {
+        if (!email || !password) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'email, password, phone required' }));
+          res.end(JSON.stringify({ error: 'email and password required' }));
           return;
         }
         const emailStr = String(email);
@@ -643,7 +621,16 @@ export function handleTokenRequest(req, res, url) {
     return true;
   }
 
-  // GET /api/tokens — list this user's active agent tokens
+  // GET /api/tokens/validate?token=<t> — internal relay validation (no auth required, localhost only)
+  if (req.method === 'GET' && url.pathname === '/api/tokens/validate') {
+    const t = url.searchParams.get('token') || '';
+    const valid = isKnownRelayToken(t);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ valid }));
+    return true;
+  }
+
+// GET /api/tokens — list this user's active agent tokens
   if (req.method === 'GET' && url.pathname === '/api/tokens') {
     const bearer = getBearer(req);
     const session = sessions.get(bearer);

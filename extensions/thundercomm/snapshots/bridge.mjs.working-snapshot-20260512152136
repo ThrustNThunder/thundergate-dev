@@ -33,11 +33,6 @@ const FEDERATION_RELAY = process.env.TC_FEDERATION_RELAY || 'ws://localhost:8767
 const FEDERATION_TOKEN = process.env.TC_FEDERATION_TOKEN || 'jmab-federation-2026';
 const AGENT_ID_SELF    = process.env.TC_AGENT_ID || 'jon';
 
-// APNs push (fire-and-forget when no WS clients are online).
-const APNS_TOKEN_STORE = process.env.TC_APNS_TOKEN_STORE || '/home/ubuntu/.thundergate/apns_tokens.json';
-const APNS_SERVER_SCRIPT = process.env.TC_APNS_SERVER_SCRIPT || '/home/ubuntu/.openclaw/workspace/scripts/apns_server.py';
-const APNS_PYTHON_BIN = process.env.TC_APNS_PYTHON || 'python3';
-
 // External user tokens — add new testers here
 // Format: token → display name
 const EXTERNAL_USERS = {
@@ -231,50 +226,6 @@ function broadcast(msg) {
   }
 }
 
-// Count of WS clients with an OPEN socket. If zero, treat the iOS user as offline
-// and APNs becomes responsible for surfacing the reply.
-function getOnlineDeviceCount() {
-  let n = 0;
-  for (const c of clients.values()) {
-    if (c.ws && c.ws.readyState === WebSocket.OPEN) n++;
-  }
-  return n;
-}
-
-// Fire APNs pushes for every registered device. Each token gets its own
-// short-lived python3 child — apns_server.py owns JWT signing and the
-// HTTP/2 call to Apple. Detached + unref so the bridge never waits on it.
-async function triggerApnsPush(channel, messagePreview) {
-  let tokenStore;
-  try {
-    tokenStore = JSON.parse(readFileSync(APNS_TOKEN_STORE, 'utf8'));
-  } catch (e) {
-    if (!e.message.includes('ENOENT')) {
-      console.warn('[Bridge] APNs token store read failed:', e.message);
-    }
-    return;
-  }
-  if (!tokenStore?.tokens || tokenStore.tokens.length === 0) return;
-
-  for (const record of tokenStore.tokens) {
-    if (!record?.device_token) continue;
-    try {
-      const child = spawn(APNS_PYTHON_BIN, [
-        APNS_SERVER_SCRIPT,
-        'push',
-        '--device-token', record.device_token,
-        '--title', 'Jon',
-        '--body', String(messagePreview || '').slice(0, 100),
-        '--channel', channel,
-        '--message-id', randomUUID(),
-      ], { detached: true, stdio: 'ignore' });
-      child.unref();
-    } catch (e) {
-      console.warn('[Bridge] APNs spawn failed:', e.message);
-    }
-  }
-}
-
 // Track recently broadcast message IDs to prevent duplicates
 const recentlyBroadcast = new Set();
 
@@ -334,19 +285,6 @@ function broadcastAgentMessage(id, text, timestamp) {
     } catch (e) {
       console.warn('[Bridge] typing(false) send failed:', e.message);
     }
-  }
-
-  // No WS clients online → fire APNs so the phone wakes up.
-  // Fire-and-forget; failures must never block message delivery.
-  try {
-    if (getOnlineDeviceCount() === 0 && text && shouldDisplayMessage(text)) {
-      const preview = text.replace(/\*\*/g, '').slice(0, 100);
-      triggerApnsPush(replyChannel.replace('direct:', ''), preview).catch(e =>
-        console.warn('[Bridge] APNs push failed:', e.message)
-      );
-    }
-  } catch (e) {
-    console.warn('[Bridge] APNs trigger errored:', e.message);
   }
 }
 
@@ -650,60 +588,13 @@ wss.on('connection', (ws, req) => {
           }));
         }
         
-        // TNT channel — route to Jon or federated agents based on mention
+        // TNT channel requires mention for Jon — or agentId targeting Jon
         if (channel === 'tnt') {
-          const jonPatterns = ['jon', '@jon', 'Jon', '@Jon'];
-          const mackPatterns = ['mack', '@mack', 'Mack', '@Mack'];
-          const rexPatterns = ['rex', '@rex', 'Rex', '@Rex'];
-          const hasJonMention = jonPatterns.some(p => text.includes(p));
-          const hasMackMention = mackPatterns.some(p => text.includes(p));
-          const hasRexMention = rexPatterns.some(p => text.includes(p));
+          const mentionPatterns = ['jon', '@jon', 'Jon', '@Jon'];
+          const hasMention = mentionPatterns.some(p => text.includes(p));
           const hasAgentId = msg.agentId && msg.agentId.toLowerCase() === 'jon';
-          const hasMackAgentId = msg.agentId && msg.agentId.toLowerCase() === 'mack';
-          const hasRexAgentId = msg.agentId && msg.agentId.toLowerCase() === 'rex';
-          console.log(`[Bridge] TNT mention check: text="${text.slice(0,50)}", jon=${hasJonMention}, mack=${hasMackMention}, rex=${hasRexMention}, agentId=${msg.agentId}`);
-
-          // Route to Mack via federation
-          if ((hasMackMention || hasMackAgentId) && !hasJonMention && !hasAgentId) {
-            broadcast({ type: 'thinking', agentId: 'mack' });
-            broadcast({ type: 'message', sender: 'Michael', channel, text, timestamp: Date.now(), idempotencyKey: msg.idempotencyKey });
-            ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.idempotencyKey, messageId: randomUUID() }));
-            if (federationWs && federationWs.readyState === WebSocket.OPEN) {
-              federationWs.send(JSON.stringify({
-                type: 'federation_message',
-                channel: 'direct:mack',
-                text,
-                sender: 'Michael',
-                senderType: 'human',
-                agentId: 'mack',
-                timestamp: Date.now(),
-              }));
-              console.log(`[Bridge] Routed to Mack via federation: ${text.slice(0,50)}`);
-            }
-            break;
-          }
-
-          // Route to Rex via federation
-          if ((hasRexMention || hasRexAgentId) && !hasJonMention && !hasAgentId) {
-            broadcast({ type: 'thinking', agentId: 'rex' });
-            broadcast({ type: 'message', sender: 'Michael', channel, text, timestamp: Date.now(), idempotencyKey: msg.idempotencyKey });
-            ws.send(JSON.stringify({ type: 'ack', idempotencyKey: msg.idempotencyKey, messageId: randomUUID() }));
-            if (federationWs && federationWs.readyState === WebSocket.OPEN) {
-              federationWs.send(JSON.stringify({
-                type: 'federation_message',
-                channel: 'direct:rex',
-                text,
-                sender: 'Michael',
-                senderType: 'human',
-                agentId: 'rex',
-                timestamp: Date.now(),
-              }));
-              console.log(`[Bridge] Routed to Rex via federation: ${text.slice(0,50)}`);
-            }
-            break;
-          }
-
-          if (!hasJonMention && !hasAgentId) {
+          console.log(`[Bridge] TNT mention check: text="${text.slice(0,50)}", hasMention=${hasMention}, agentId=${msg.agentId}`);
+          if (!hasMention && !hasAgentId) {
             // Broadcast human message for display, but don't invoke Jon
             broadcast({
               type: 'message',
@@ -767,20 +658,8 @@ if (transcriptPath) {
     transcriptSize = statSync(transcriptPath).size;
   } catch {}
   
-  // Initialize lastMessageId from existing transcript — scan ALL entry types
-  // so that on restart we never replay old messages, even if the last entry
-  // is a user message or tool result (not an assistant turn).
-  try {
-    const initContent = readFileSync(transcriptPath, 'utf8');
-    const initLines = initContent.split('\n').filter(l => l.trim());
-    for (const line of [...initLines].reverse()) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry.id) { lastMessageId = entry.id; break; }
-      } catch {}
-    }
-  } catch {}
-  if (!lastMessageId) loadHistory(1); // fallback
+  // Initialize lastMessageId from existing transcript
+  loadHistory(1); // just to set lastMessageId
   
   // Watch for changes (poll every 500ms — fs.watch can miss events on EC2)
   setInterval(checkTranscriptForNew, 500);
