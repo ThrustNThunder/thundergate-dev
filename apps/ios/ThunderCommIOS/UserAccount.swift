@@ -180,6 +180,14 @@ public final class UserStore: ObservableObject {
         guard isValidEmail(cleanedEmail) else { throw UserStoreError.invalidEmail }
         guard password.count >= 8         else { throw UserStoreError.weakPassword }
 
+        if let prior = currentUser, prior.email != cleanedEmail {
+            for agent in prior.agents {
+                AccountStore.shared.remove(id: agent.id.uuidString)
+                _ = deleteAgentToken(agentId: agent.id)
+            }
+            AuthManager.shared.clearToken()
+        }
+
         var body: [String: String] = [
             "email":       cleanedEmail,
             "password":    password,
@@ -193,16 +201,18 @@ public final class UserStore: ObservableObject {
             resp.token,
             expiresAtMs: resp.expires_at_ms ?? Self.defaultExpiryMs()
         )
-        let user = UserAccount(
-            email: cleanedEmail,
-            displayName: cleanedName,
-            phoneNumber: cleanedPhone,
-            role: .user
+        let user = makeUserAccount(
+            from: resp.user,
+            fallbackEmail: cleanedEmail,
+            fallbackDisplayName: cleanedName,
+            fallbackPhone: cleanedPhone,
+            fallbackUser: nil
         )
         currentUser = user
         isAuthenticated = true
         lastAuthenticatedAt = Date()
         persist()
+        syncAccountStore(from: resp.user?.agents)
         APNsManager.shared.retryTokenUploadIfNeeded()
     }
 
@@ -210,13 +220,16 @@ public final class UserStore: ObservableObject {
         let cleanedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard isValidEmail(cleanedEmail) else { throw UserStoreError.invalidEmail }
 
+        let priorUser = currentUser
+
         let body = ["email": cleanedEmail, "password": password]
         let resp = try await postAuth(path: "/api/auth/signin", body: body, bearer: nil)
 
         // Switching accounts: drop the prior user's per-agent tokens before we
         // overwrite currentUser, otherwise their keychain entries stay behind.
-        if let prior = currentUser, prior.email != cleanedEmail {
+        if let prior = priorUser, prior.email != cleanedEmail {
             for agent in prior.agents {
+                AccountStore.shared.remove(id: agent.id.uuidString)
                 _ = deleteAgentToken(agentId: agent.id)
             }
             AuthManager.shared.clearToken()
@@ -226,12 +239,18 @@ public final class UserStore: ObservableObject {
             resp.token,
             expiresAtMs: resp.expires_at_ms ?? Self.defaultExpiryMs()
         )
-        if currentUser?.email != cleanedEmail {
-            currentUser = UserAccount(email: cleanedEmail, displayName: cleanedEmail, role: .user)
-        }
+        let user = makeUserAccount(
+            from: resp.user,
+            fallbackEmail: cleanedEmail,
+            fallbackDisplayName: cleanedEmail,
+            fallbackPhone: priorUser?.phoneNumber,
+            fallbackUser: priorUser
+        )
+        currentUser = user
         isAuthenticated = true
         lastAuthenticatedAt = Date()
         persist()
+        syncAccountStore(from: resp.user?.agents)
         APNsManager.shared.retryTokenUploadIfNeeded()
     }
 
@@ -467,6 +486,86 @@ public final class UserStore: ObservableObject {
         // Optional: a server that omits this (older builds, partial deploys)
         // shouldn't break sign-in. Callers fall back to 30 days.
         let expires_at_ms: Int64?
+        let user: UserPayload?
+
+        struct UserPayload: Decodable {
+            let id: String?
+            let email: String?
+            let displayName: String?
+            let phoneNumber: String?
+            let role: UserRole?
+            let avatarURL: String?
+            let createdAtMs: Int64?
+            let biometricsEnabled: Bool?
+            let agents: [AuthResponse.AgentPayload]?
+
+            private enum CodingKeys: String, CodingKey {
+                case id, email, displayName, display_name, name, phoneNumber, phone, phone_number, role, avatarURL, avatarUrl, avatar_url, createdAtMs, created_at_ms, biometricsEnabled, agents
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                id = Self.firstString(c, keys: [.id])
+                email = Self.firstString(c, keys: [.email])
+                displayName = Self.firstString(c, keys: [.displayName, .display_name, .name])
+                phoneNumber = Self.firstString(c, keys: [.phoneNumber, .phone])
+                role = try c.decodeIfPresent(UserRole.self, forKey: .role)
+                avatarURL = Self.firstString(c, keys: [.avatarURL, .avatarUrl, .avatar_url])
+                createdAtMs = try c.decodeIfPresent(Int64.self, forKey: .createdAtMs)
+                    ?? c.decodeIfPresent(Int64.self, forKey: .created_at_ms)
+                biometricsEnabled = try c.decodeIfPresent(Bool.self, forKey: .biometricsEnabled)
+                agents = try c.decodeIfPresent([AuthResponse.AgentPayload].self, forKey: .agents)
+            }
+
+            private static func firstString(_ container: KeyedDecodingContainer<CodingKeys>, keys: [CodingKeys]) -> String? {
+                for key in keys {
+                    if let value = try? container.decodeIfPresent(String.self, forKey: key), !value.isEmpty {
+                        return value
+                    }
+                }
+                return nil
+            }
+        }
+
+        struct AgentPayload: Decodable {
+            let id: String?
+            let agentName: String?
+            let agentEmoji: String?
+            let wsURL: String?
+            let httpURL: String?
+            let token: String?
+            let deviceToken: String?
+            let createdAtMs: Int64?
+            let isDefault: Bool?
+
+            private enum CodingKeys: String, CodingKey {
+                case id, name, agentName, displayName, emoji, agentEmoji, wsURL, wsUrl, ws_url, httpURL, httpUrl, http_url, token, deviceToken, device_token, createdAtMs, created_at_ms, isDefault, defaultAgent
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                id = Self.firstString(c, keys: [.id])
+                agentName = Self.firstString(c, keys: [.agentName, .name, .displayName])
+                agentEmoji = Self.firstString(c, keys: [.agentEmoji, .emoji])
+                wsURL = Self.firstString(c, keys: [.wsURL, .wsUrl, .ws_url])
+                httpURL = Self.firstString(c, keys: [.httpURL, .httpUrl, .http_url])
+                token = Self.firstString(c, keys: [.token])
+                deviceToken = Self.firstString(c, keys: [.deviceToken, .device_token])
+                createdAtMs = try c.decodeIfPresent(Int64.self, forKey: .createdAtMs)
+                    ?? c.decodeIfPresent(Int64.self, forKey: .created_at_ms)
+                isDefault = try c.decodeIfPresent(Bool.self, forKey: .isDefault)
+                    ?? c.decodeIfPresent(Bool.self, forKey: .defaultAgent)
+            }
+
+            private static func firstString(_ container: KeyedDecodingContainer<CodingKeys>, keys: [CodingKeys]) -> String? {
+                for key in keys {
+                    if let value = try? container.decodeIfPresent(String.self, forKey: key), !value.isEmpty {
+                        return value
+                    }
+                }
+                return nil
+            }
+        }
     }
 
     /// 30 days from now, in ms. Used when the server response omits
@@ -474,6 +573,61 @@ public final class UserStore: ObservableObject {
     /// silently sitting on a never-expires credential.
     private static func defaultExpiryMs() -> Int64 {
         Int64(Date(timeIntervalSinceNow: 30 * 24 * 3600).timeIntervalSince1970 * 1000)
+    }
+
+    private func makeUserAccount(from payload: AuthResponse.UserPayload?,
+                                 fallbackEmail: String,
+                                 fallbackDisplayName: String,
+                                 fallbackPhone: String?,
+                                 fallbackUser: UserAccount?) -> UserAccount {
+        let agents = makeAgentConnections(from: payload?.agents)
+        let sameAccount = fallbackUser?.email == fallbackEmail
+        let fallbackAgents = sameAccount ? fallbackUser?.agents ?? [] : []
+        let resolvedAgents = agents.isEmpty ? fallbackAgents : agents
+        return UserAccount(
+            id: payload?.id.flatMap(UUID.init(uuidString:)) ?? (sameAccount ? fallbackUser?.id : nil) ?? UUID(),
+            email: payload?.email ?? fallbackEmail,
+            displayName: payload?.displayName ?? fallbackDisplayName,
+            phoneNumber: payload?.phoneNumber ?? fallbackPhone,
+            role: payload?.role ?? (sameAccount ? fallbackUser?.role : nil) ?? .user,
+            avatarURL: payload?.avatarURL ?? (sameAccount ? fallbackUser?.avatarURL : nil),
+            createdAt: payload?.createdAtMs.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+                ?? (sameAccount ? fallbackUser?.createdAt : nil) ?? Date(),
+            biometricsEnabled: payload?.biometricsEnabled ?? (sameAccount ? fallbackUser?.biometricsEnabled : nil) ?? false,
+            agents: resolvedAgents
+        )
+    }
+
+    private func makeAgentConnections(from payloads: [AuthResponse.AgentPayload]?) -> [AgentConnection] {
+        guard let payloads else { return [] }
+        return payloads.map { payload in
+            AgentConnection(
+                id: payload.id.flatMap(UUID.init(uuidString:)) ?? UUID(),
+                agentName: payload.agentName ?? "Agent",
+                agentEmoji: payload.agentEmoji ?? "⚡",
+                wsURL: payload.wsURL ?? Account.defaultRelayWSURL,
+                httpURL: payload.httpURL ?? Account.defaultRelayHTTPURL,
+                kya: nil,
+                isDefault: payload.isDefault ?? false
+            )
+        }
+    }
+
+    private func syncAccountStore(from payloads: [AuthResponse.AgentPayload]?) {
+        guard let payloads, !payloads.isEmpty else { return }
+        let resolvedAgents = makeAgentConnections(from: payloads)
+        guard !resolvedAgents.isEmpty else { return }
+        for (index, agent) in resolvedAgents.enumerated() {
+            let payloadToken = payloads.indices.contains(index) ? payloads[index].token : nil
+            let account = Account(
+                id: agent.id.uuidString,
+                name: agent.agentName,
+                wsURL: agent.wsURL,
+                httpURL: agent.httpURL,
+                token: payloadToken ?? ""
+            )
+            AccountStore.shared.add(account, makeCurrent: index == 0)
+        }
     }
     private struct ServerError: Decodable {
         let error: String?
