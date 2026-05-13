@@ -196,7 +196,7 @@ public final class APNsManager: NSObject {
             "device_token": hexToken,
             "platform": "ios",
             "bundle_id": Bundle.main.bundleIdentifier ?? "",
-            "account_id": account.id
+            "user_id": account.id
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         do {
