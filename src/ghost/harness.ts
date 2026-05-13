@@ -55,6 +55,14 @@ export interface GhostEntry {
   score?: number;
   /** Which tier produced the verdict — useful for doctor diagnostics. */
   match_tier?: 1 | 2 | 3;
+  /**
+   * Tier-3 (Voyage) status for this pair. `used` = real API call.
+   * `cached` = pair seen before, served from the LRU. `not_needed` =
+   * tier 1 or strong tier-2 short-circuited. `no_key` = embedder
+   * unavailable. `error` = call failed and tier-2 was returned. Lets
+   * Doctor compute tier-3 usage rate without re-streaming the log.
+   */
+  embedding_status?: 'not_needed' | 'no_key' | 'error' | 'used' | 'cached';
   latency_ms: number;
 }
 
@@ -391,6 +399,7 @@ export class GhostHarness {
       match: comparison ? comparison.match : false,
       score: comparison ? comparison.score : 0,
       match_tier: comparison ? comparison.tier : undefined,
+      embedding_status: comparison ? comparison.embedding_skipped : undefined,
       latency_ms: tg?.latency_ms ?? -1
     };
 

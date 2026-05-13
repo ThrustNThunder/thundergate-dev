@@ -593,11 +593,47 @@ export class ThunderGateRuntime {
       this.backgroundPreprocessStub(message);
     }
 
-    // Until ThunderMind has a confirmed routing target, the actual LLM
-    // call still goes through `callLLM`. The brief explicitly requires
-    // graceful fallback when the local endpoint isn't real — this is it.
-    const text = await this.callLLM([{ role: 'user', content: message.content }]);
-    return { content: text, type: 'normal' };
+    // In-flight tracking: bracket the inference call so the provider
+    // knows how many local-routed requests are mid-flight if the breaker
+    // trips during this call. Two outcomes if local is suddenly dead:
+    //   1. The real ThunderMind path errors → we retry on cloud below.
+    //   2. The stub path (today) just calls callLLM and returns.
+    // The retry is the seamless-failover guarantee: from the user's
+    // perspective, a single in-flight request never errors because the
+    // mode flipped.
+    this.localInference.beginRequest();
+    try {
+      const text = await this.callLLM([{ role: 'user', content: message.content }]);
+      // Empty content from callLLM means a transport failure on the
+      // local path. Today this only happens when callLLM's API errors,
+      // not on a ThunderMind-specific failure (since routing-to-local
+      // isn't wired yet), but the retry shape matches Michael's spec:
+      // local fails → retry on cloud → never drop the request.
+      if (!text || text.length === 0) {
+        this.provenance.append({
+          actor: 'runtime',
+          action: 'local_inference_retry_on_cloud',
+          target: 'message',
+          reason: 'local path returned empty — retrying on cloud',
+          data: { endpoint: this.config.localInference.endpoint }
+        });
+        const cloud = await this.processCloud(message);
+        return cloud;
+      }
+      return { content: text, type: 'normal' };
+    } catch (err) {
+      // Any throw from the inference call gets retried on cloud once.
+      // A second failure is the cloud's own problem and propagates.
+      this.provenance.append({
+        actor: 'runtime',
+        action: 'local_inference_threw_retry_on_cloud',
+        target: 'message',
+        reason: `local inference threw: ${(err as Error).message}`
+      });
+      return this.processCloud(message);
+    } finally {
+      this.localInference.endRequest();
+    }
   }
 
   /** Hook for aggressive RAG retrieval under LOCAL_INFERENCE mode. */

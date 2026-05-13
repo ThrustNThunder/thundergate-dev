@@ -214,6 +214,13 @@ ghost
       ? (cfg.openaiApiKey ? '✅ OpenAI key present' : '❌ OpenAI key missing')
       : (cfg.anthropicApiKey ? '✅ Anthropic key present' : '❌ Anthropic key missing');
     console.log(`  Provider auth:     ${provider}`);
+    // Voyage drives the tier-3 semantic comparator. Absence → tier-3 silently
+    // skipped (entries fall back to tier-1/2). Show explicitly so an empty
+    // tier-3 column in scoring isn't mysterious.
+    const voyage = cfg.voyageApiKey
+      ? '✅ Voyage key present (tier-3 semantic compare active)'
+      : '⚠️  Voyage key missing — tier-3 semantic compare disabled (see: ~/.thundergate/voyage-key, env VOYAGE_API_KEY, or openclaw auth-profile voyage:default)';
+    console.log(`  Embeddings:        ${voyage}`);
     // Watches the *whole* sessions directory, not a single legacy file. Show
     // the dir plus the count of active *.jsonl sessions so operators can
     // confirm the harness is attached to everything OpenClaw is writing.
@@ -242,6 +249,30 @@ ghost
 
     const evaluator = new GhostEvaluator(cfg);
     const scores = await evaluator.computeScores();
+    // Tier breakdown across the in-memory entries we just scanned. This
+    // is the answer to "is tier-3 actually firing?" — a healthy run with
+    // Voyage configured has non-zero tier-3, even if it's a minority.
+    try {
+      const { entries } = await evaluator.readEntries();
+      const recent = entries.slice(-500);
+      const t1 = recent.filter((e) => e.match_tier === 1).length;
+      const t2 = recent.filter((e) => e.match_tier === 2).length;
+      const t3 = recent.filter((e) => e.match_tier === 3).length;
+      const emb = {
+        used: recent.filter((e) => e.embedding_status === 'used').length,
+        cached: recent.filter((e) => e.embedding_status === 'cached').length,
+        skipNoKey: recent.filter((e) => e.embedding_status === 'no_key').length,
+        skipErr: recent.filter((e) => e.embedding_status === 'error').length,
+        skipNotNeeded: recent.filter((e) => e.embedding_status === 'not_needed').length
+      };
+      console.log('');
+      console.log(`  Last ${recent.length} scored:  tier1=${t1}  tier2=${t2}  tier3=${t3}`);
+      console.log(
+        `  Voyage usage:      used=${emb.used}  cached=${emb.cached}  no_key=${emb.skipNoKey}  error=${emb.skipErr}  not_needed=${emb.skipNotNeeded}`
+      );
+    } catch {
+      /* non-fatal — status keeps rendering */
+    }
     console.log('');
     console.log(`  Consecutive clean days: ${scores.consecutive_clean_days}`);
     console.log(`  Cutover ready: ${scores.consecutive_clean_days >= 7 ? '🏆 YES' : `${7 - scores.consecutive_clean_days} more clean days needed`}`);
@@ -875,16 +906,48 @@ async function runDiagnostic(autoFix: boolean = false): Promise<void> {
       const port = u && u.port ? parseInt(u.port, 10) : null;
       const portUp = u && u.hostname === 'localhost' && port ? portOpen(port) : null;
       const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
-      const events: ProvenanceEvent[] = ledger.tail(50);
-      const last = [...events].reverse().find(
+      const events: ProvenanceEvent[] = ledger.tail(100);
+      const reversed = [...events].reverse();
+      const last = reversed.find(
         (e) => e.actor === 'local-inference' && (
           e.action === 'liveness_ok' ||
           e.action === 'liveness_lost' ||
+          e.action === 'liveness_miss' ||
           e.action === 'first_check_missed'
         )
       );
+      const lastModeChange = reversed.find(
+        (e) => e.actor === 'local-inference' && e.action === 'mode_change'
+      );
+      const lastBreakerOpen = reversed.find(
+        (e) => e.actor === 'local-inference' && e.action === 'circuit_breaker_opened'
+      );
+      const lastBreakerClose = reversed.find(
+        (e) => e.actor === 'local-inference' && e.action === 'circuit_breaker_closed'
+      );
+      const breakerOpen =
+        lastBreakerOpen != null &&
+        (lastBreakerClose == null || lastBreakerClose.timestamp < lastBreakerOpen.timestamp);
+      let consecFail = 0;
+      for (const e of reversed) {
+        if (e.actor !== 'local-inference') continue;
+        if (e.action === 'liveness_ok') break;
+        if (
+          e.action === 'liveness_miss' ||
+          e.action === 'liveness_lost' ||
+          e.action === 'first_check_missed'
+        ) {
+          consecFail++;
+        }
+      }
       const reachable = last?.action === 'liveness_ok' || portUp === true;
       const lastAt = last ? formatLedgerAge(last.timestamp) : '(no probe yet)';
+      const currentMode =
+        lastModeChange?.data && typeof (lastModeChange.data as any).to === 'string'
+          ? (lastModeChange.data as any).to
+          : reachable ? 'LOCAL_INFERENCE' : 'CLOUD';
+      const reason = lastModeChange?.reason ?? '(no transition yet)';
+      const tail = ` | mode=${currentMode} | breaker=${breakerOpen ? 'OPEN' : 'closed'} | consec_fail=${consecFail} | reason: ${reason.length > 90 ? reason.slice(0, 89) + '…' : reason}`;
       checks.push({
         name: 'LocalInfer',
         // Today ThunderMind isn't built — unreachable is expected, so
@@ -892,8 +955,8 @@ async function runDiagnostic(autoFix: boolean = false): Promise<void> {
         // graceful-fallback intent. Operators see the detail string.
         pass: true,
         detail: reachable
-          ? `${endpoint} reachable, last check ${lastAt}`
-          : `${endpoint} unreachable, last check ${lastAt} — cloud fallback active`
+          ? `${endpoint} reachable, last check ${lastAt}${tail}`
+          : `${endpoint} unreachable, last check ${lastAt} — cloud fallback active${tail}`
       });
     }
   } catch (err) {

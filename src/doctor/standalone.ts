@@ -325,24 +325,72 @@ function checkLocalInference(): HealthCheck {
 
   // Read provenance ledger for the daemon's view — its last health check
   // is more authoritative than this synchronous port probe, which only
-  // tells us "something is listening on the port".
+  // tells us "something is listening on the port". For the new
+  // seamless-failover architecture we also pull the latest mode_change
+  // and circuit_breaker events so the row can answer "what mode are we
+  // in, why, and what's the breaker doing right now."
   const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
-  const events: ProvenanceEvent[] = ledger.tail(50);
-  const last = [...events].reverse().find(
-    (e) => e.actor === 'local-inference' && (e.action === 'liveness_ok' || e.action === 'liveness_lost' || e.action === 'first_check_missed')
+  const events: ProvenanceEvent[] = ledger.tail(100);
+  const reversed = [...events].reverse();
+
+  const last = reversed.find(
+    (e) => e.actor === 'local-inference' && (
+      e.action === 'liveness_ok' ||
+      e.action === 'liveness_lost' ||
+      e.action === 'liveness_miss' ||
+      e.action === 'first_check_missed'
+    )
   );
+  const lastModeChange = reversed.find(
+    (e) => e.actor === 'local-inference' && e.action === 'mode_change'
+  );
+  const lastBreakerOpen = reversed.find(
+    (e) => e.actor === 'local-inference' && e.action === 'circuit_breaker_opened'
+  );
+  const lastBreakerClose = reversed.find(
+    (e) => e.actor === 'local-inference' && e.action === 'circuit_breaker_closed'
+  );
+  const breakerOpen =
+    lastBreakerOpen != null &&
+    (lastBreakerClose == null || lastBreakerClose.timestamp < lastBreakerOpen.timestamp);
+
+  // Compute the consecutive-failure tail by scanning the recent events
+  // newest-first until we hit a healthy probe. This survives a Doctor
+  // run with no live runtime (the in-memory counter isn't queryable).
+  let consecutiveFailures = 0;
+  for (const e of reversed) {
+    if (e.actor !== 'local-inference') continue;
+    if (e.action === 'liveness_ok') break;
+    if (e.action === 'liveness_miss' || e.action === 'liveness_lost' || e.action === 'first_check_missed') {
+      consecutiveFailures++;
+    }
+  }
+
   const lastCheckedAt = last ? formatAge(last.timestamp) : null;
   const daemonReachable = last?.action === 'liveness_ok';
+  const currentMode =
+    lastModeChange?.data && typeof (lastModeChange.data as any).to === 'string'
+      ? (lastModeChange.data as any).to
+      : (daemonReachable ? 'LOCAL_INFERENCE' : 'CLOUD');
+  const transitionReason = lastModeChange?.reason ?? '(no transition yet)';
 
-  // Synthesize the row. Operator wants to see all three: configured,
-  // currently reachable, when the last health check fired.
+  // Build a status-line tail that's always informative regardless of
+  // pass/warn. Operators get the four observability fields Michael asked
+  // for: current mode, last transition reason, consecutive failures,
+  // breaker state.
+  const tail =
+    ` | mode=${currentMode}` +
+    ` | breaker=${breakerOpen ? 'OPEN' : 'closed'}` +
+    ` | consec_fail=${consecutiveFailures}` +
+    ` | reason: ${truncateLine(transitionReason, 90)}`;
+
   if (portUp === false && !daemonReachable) {
     // Configured but not reachable. Expected today since ThunderMind
     // isn't built — warn rather than fail.
     return {
       name: 'LocalInfer',
       status: 'warn',
-      detail: `${endpoint} unreachable${lastCheckedAt ? ` (last check ${lastCheckedAt} ago)` : ' (no probe yet)'}`,
+      detail: `${endpoint} unreachable${lastCheckedAt ? ` (last ${lastCheckedAt} ago)` : ' (no probe yet)'}${tail}`,
       fix: 'Start ThunderMind / Ollama on the configured endpoint, or set localInference.enabled=false'
     };
   }
@@ -350,7 +398,7 @@ function checkLocalInference(): HealthCheck {
     return {
       name: 'LocalInfer',
       status: 'pass',
-      detail: `${endpoint} reachable${lastCheckedAt ? ` (last check ${lastCheckedAt} ago)` : ''}`
+      detail: `${endpoint} reachable${lastCheckedAt ? ` (last ${lastCheckedAt} ago)` : ''}${tail}`
     };
   }
   // Non-localhost endpoint with no daemon probe yet — can't tell from
@@ -358,8 +406,13 @@ function checkLocalInference(): HealthCheck {
   return {
     name: 'LocalInfer',
     status: 'warn',
-    detail: `${endpoint} — unknown (daemon hasn't probed yet)`
+    detail: `${endpoint} — unknown (daemon hasn't probed yet)${tail}`
   };
+}
+
+function truncateLine(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1) + '…';
 }
 
 function parseEndpoint(endpoint: string): { host: string; port: number } | null {

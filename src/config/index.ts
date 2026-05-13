@@ -72,6 +72,33 @@ function readOpenclawAnthropicKey(): string | null {
 }
 
 /**
+ * Mirror for Voyage. Voyage (Anthropic-owned) uses a separate API key;
+ * OpenClaw's auth-profiles store it under `voyage:default` when present.
+ * If it isn't, we fall back to the `~/.thundergate/voyage-key` file —
+ * an operator-friendly drop-in that avoids editing config.json with a
+ * secret and surviving `git status` cleanly.
+ */
+function readOpenclawVoyageKey(): string | null {
+  try {
+    const raw = JSON.parse(readFileSync(OPENCLAW_AUTH_FILE, 'utf-8'));
+    const key = raw?.profiles?.['voyage:default']?.key;
+    if (typeof key === 'string' && key.length > 0) return key;
+  } catch {
+    /* ignore */
+  }
+  const dropIn = join(THUNDERGATE_DIR, 'voyage-key');
+  try {
+    if (existsSync(dropIn)) {
+      const txt = readFileSync(dropIn, 'utf-8').trim();
+      if (txt.length > 0) return txt;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
  * Write the Phase 3 default config to disk if no config file exists yet.
  * Returns the resolved config either way.
  */
@@ -87,6 +114,14 @@ export function ensureConfig(): Config {
   if (!cfg.anthropicApiKey) {
     const fromOpenclaw = readOpenclawAnthropicKey();
     if (fromOpenclaw) cfg.anthropicApiKey = fromOpenclaw;
+  }
+
+  // Same fallback chain for Voyage. Ghost Jon's tier-3 semantic comparator
+  // wants this key — when missing, tier-3 silently degrades but Doctor
+  // surfaces the absence (see ghost status command).
+  if (!cfg.voyageApiKey) {
+    const fromOpenclaw = readOpenclawVoyageKey();
+    if (fromOpenclaw) cfg.voyageApiKey = fromOpenclaw;
   }
 
   return cfg;

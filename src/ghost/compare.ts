@@ -10,12 +10,18 @@
  *
  *   1. Exact / near-exact (normalized equality or Levenshtein ≤ 0.15)
  *      — catches HEARTBEAT_OK, "ok", identical strings.
- *   2. Token Jaccard — cheap, no length filter, two tiers of partial
- *      credit (≥ 0.20 → 0.7, ≥ 0.40 → 0.85).
+ *   2. Token Jaccard composite — max of:
+ *        - stopword-stripped unigram Jaccard
+ *        - bigram Jaccard (phrase-level)
+ *        - longest-common-substring ratio over the shorter response
+ *      With model-style fingerprints (markdown, code fences) stripped
+ *      before tokenization. Two tiers of partial credit
+ *      (≥ 0.20 → 0.7, ≥ 0.40 → 0.85).
  *   3. Voyage `voyage-3-lite` cosine — only invoked when 1+2 < 0.85.
- *      Cosine ≥ 0.85 → 1.0, ≥ 0.70 → 0.5, else 0.0. If the API errors
- *      or no key is configured, we fall back to the tier-2 score and
- *      mark the result so doctor can see the skip.
+ *      Cosine ≥ 0.85 → 1.0, ≥ 0.70 → 0.5, else 0.0. Results are LRU-cached
+ *      by normalized-pair so a flapping watcher doesn't burn the API
+ *      budget. If the API errors or no key is configured, we fall back
+ *      to the tier-2 score and mark the result so doctor can see the skip.
  *
  * Per-message verdict: score ≥ 0.75 counts as a match. Daily scoring
  * (evaluator.ts) reads the raw score and weights it by response length.
@@ -25,14 +31,38 @@ export interface MatchResult {
   score: number;          // 0..1 — max across the tiers we ran
   match: boolean;         // score ≥ 0.75
   tier: 1 | 2 | 3;        // tier that produced the verdict
-  jaccard: number;        // raw tier-2 Jaccard, recorded for debugging
+  jaccard: number;        // raw tier-2 best signal, recorded for debugging
   cosine: number | null;  // tier-3 cosine if we ran it
-  embedding_skipped: 'not_needed' | 'no_key' | 'error' | 'used';
+  embedding_skipped: 'not_needed' | 'no_key' | 'error' | 'used' | 'cached';
 }
 
 export type EmbeddingFn = (texts: string[]) => Promise<number[][]>;
 
 const MATCH_THRESHOLD = 0.75;
+// Tier-2 partial-credit bands; tuned so a single strong signal across
+// unigram/bigram/substring is enough to skip the embedding call.
+const TIER2_STRONG = 0.4;
+const TIER2_WEAK = 0.2;
+
+// Stopwords stripped from unigram Jaccard. These are the words that
+// every English response shares and that dominated the old denominator —
+// removing them lifts true semantic overlap out of tier-2 limbo.
+const STOPWORDS = new Set([
+  'a', 'an', 'and', 'or', 'but', 'so', 'the', 'this', 'that', 'these',
+  'those', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+  'i', 'me', 'my', 'we', 'us', 'our', 'you', 'your', 'he', 'she', 'it',
+  'they', 'them', 'their', 'his', 'her', 'its',
+  'to', 'of', 'in', 'on', 'at', 'by', 'for', 'with', 'from', 'as',
+  'into', 'about', 'over', 'under', 'up', 'down', 'out', 'off',
+  'do', 'does', 'did', 'doing', 'done', 'have', 'has', 'had', 'will',
+  'would', 'could', 'should', 'can', 'may', 'might', 'must',
+  'not', 'no', 'yes', 'if', 'then', 'than', 'because', 'just', 'only',
+  'also', 'too', 'very', 'really', 'still', 'now', 'when', 'where',
+  'what', 'who', 'why', 'how', 'all', 'any', 'some', 'each', 'every',
+  'more', 'most', 'less', 'few', 'many', 'much', 'such',
+  'one', 'two', 'three', 'first', 'second', 'next', 'last',
+  'ok', 'okay', 'yeah', 'yes', 'sure', 'right', 'well', 'oh', 'hey'
+]);
 
 /**
  * Run the tiered comparison. `embed`, when provided, is called with the
@@ -78,18 +108,20 @@ export async function compareResponses(
         score: 1,
         match: true,
         tier: 1,
-        jaccard: jaccardOf(na, nb),
+        jaccard: bestTier2Signal(na, nb).signal,
         cosine: null,
         embedding_skipped: 'not_needed'
       };
     }
   }
 
-  // Tier 2 — token Jaccard with no length filter.
-  const jac = jaccardOf(na, nb);
+  // Tier 2 — composite of stopword-stripped unigram Jaccard, bigram
+  // Jaccard, and longest-common-substring ratio. We take the max so
+  // *any* of the three lifting a pair into tier-2-strong is enough.
+  const { signal: bestSignal } = bestTier2Signal(na, nb);
   let tier2: number;
-  if (jac >= 0.4) tier2 = 0.85;
-  else if (jac >= 0.2) tier2 = 0.7;
+  if (bestSignal >= TIER2_STRONG) tier2 = 0.85;
+  else if (bestSignal >= TIER2_WEAK) tier2 = 0.7;
   else tier2 = 0;
 
   // Short-circuit: tier 2 alone clears the match bar — no embedding needed.
@@ -98,7 +130,7 @@ export async function compareResponses(
       score: tier2,
       match: tier2 >= MATCH_THRESHOLD,
       tier: 2,
-      jaccard: jac,
+      jaccard: bestSignal,
       cosine: null,
       embedding_skipped: 'not_needed'
     };
@@ -110,27 +142,39 @@ export async function compareResponses(
       score: tier2,
       match: tier2 >= MATCH_THRESHOLD,
       tier: 2,
-      jaccard: jac,
+      jaccard: bestSignal,
       cosine: null,
       embedding_skipped: 'no_key'
     };
   }
 
+  // LRU pair cache: identical normalized pairs are extremely common in
+  // shadow traffic (Jon repeats himself; Haiku does too). Cache hits are
+  // free; misses go to Voyage.
   let cosine: number | null = null;
-  try {
-    const vecs = await embed([a, b]);
-    if (
-      Array.isArray(vecs) &&
-      vecs.length === 2 &&
-      Array.isArray(vecs[0]) &&
-      Array.isArray(vecs[1]) &&
-      vecs[0].length === vecs[1].length &&
-      vecs[0].length > 0
-    ) {
-      cosine = cosineSimilarity(vecs[0], vecs[1]);
+  let fromCache = false;
+  const cacheKey = pairCacheKey(na, nb);
+  const cached = embeddingPairCache.get(cacheKey);
+  if (cached !== undefined) {
+    cosine = cached;
+    fromCache = true;
+  } else {
+    try {
+      const vecs = await embed([a, b]);
+      if (
+        Array.isArray(vecs) &&
+        vecs.length === 2 &&
+        Array.isArray(vecs[0]) &&
+        Array.isArray(vecs[1]) &&
+        vecs[0].length === vecs[1].length &&
+        vecs[0].length > 0
+      ) {
+        cosine = cosineSimilarity(vecs[0], vecs[1]);
+        embeddingPairCache.set(cacheKey, cosine);
+      }
+    } catch {
+      cosine = null;
     }
-  } catch {
-    cosine = null;
   }
 
   if (cosine === null) {
@@ -138,7 +182,7 @@ export async function compareResponses(
       score: tier2,
       match: tier2 >= MATCH_THRESHOLD,
       tier: 2,
-      jaccard: jac,
+      jaccard: bestSignal,
       cosine: null,
       embedding_skipped: 'error'
     };
@@ -155,38 +199,156 @@ export async function compareResponses(
     score,
     match: score >= MATCH_THRESHOLD,
     tier,
-    jaccard: jac,
+    jaccard: bestSignal,
     cosine,
-    embedding_skipped: 'used'
+    embedding_skipped: fromCache ? 'cached' : 'used'
   };
+}
+
+// ── Tier-2 composite signals ───────────────────────────────────────────────
+
+/**
+ * Returns the best tier-2 signal across three sub-metrics:
+ *   1. Stopword-stripped unigram Jaccard — semantic-content overlap.
+ *   2. Bigram Jaccard — phrase-level overlap ("relay is down" vs "relay went down").
+ *   3. Longest-common-substring ratio — anchored verbatim overlap.
+ *
+ * Returning the max means any one strong signal alone is enough to
+ * tier-2-clear; we don't average because averaging penalizes a pair
+ * that's identical phrase-by-phrase but uses different stopwords.
+ *
+ * `which` is exported for callers/tests that want to know which sub-metric
+ * fired — not currently logged in entries because the harness keeps the
+ * log schema stable, but useful from a debugger.
+ */
+export function bestTier2Signal(
+  na: string,
+  nb: string
+): { signal: number; which: 'unigram' | 'bigram' | 'substring' } {
+  const uni = jaccardOfStopworded(na, nb);
+  const bi = bigramJaccard(na, nb);
+  const sub = substringRatio(na, nb);
+
+  let best = uni;
+  let which: 'unigram' | 'bigram' | 'substring' = 'unigram';
+  if (bi > best) {
+    best = bi;
+    which = 'bigram';
+  }
+  if (sub > best) {
+    best = sub;
+    which = 'substring';
+  }
+  return { signal: best, which };
 }
 
 // ── String helpers ─────────────────────────────────────────────────────────
 
+/**
+ * Normalize for comparison: strip markdown emphasis/headers/code fences
+ * before tokenizing so Sonnet's `**bold**` and Haiku's bare text don't
+ * count as different content. The stripping is conservative — we keep
+ * the literal text inside fences/emphasis, just lose the markers.
+ */
 function normalize(s: string): string {
   return s
     .toLowerCase()
+    // Strip code fences but keep contents.
+    .replace(/```[a-z0-9]*\n?/g, ' ')
+    .replace(/```/g, ' ')
+    // Strip inline code backticks.
+    .replace(/`+/g, ' ')
+    // Strip markdown headers (#, ##, ...).
+    .replace(/^#{1,6}\s+/gm, '')
+    // Strip emphasis markers but preserve their contents.
+    .replace(/\*+/g, ' ')
+    .replace(/_+/g, ' ')
+    // Strip bullet/list markers at line starts.
+    .replace(/^\s*[-•]\s+/gm, '')
+    // Strip remaining punctuation.
     .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function tokenize(normalized: string): Set<string> {
-  const out = new Set<string>();
+function tokensOf(normalized: string): string[] {
+  const out: string[] = [];
   for (const tok of normalized.split(' ')) {
-    if (tok) out.add(tok);
+    if (tok) out.push(tok);
   }
   return out;
 }
 
-function jaccardOf(na: string, nb: string): number {
-  const sa = tokenize(na);
-  const sb = tokenize(nb);
+function contentTokens(normalized: string): Set<string> {
+  const out = new Set<string>();
+  for (const tok of tokensOf(normalized)) {
+    if (STOPWORDS.has(tok)) continue;
+    if (tok.length <= 1) continue;
+    out.add(tok);
+  }
+  return out;
+}
+
+function jaccardOfStopworded(na: string, nb: string): number {
+  const sa = contentTokens(na);
+  const sb = contentTokens(nb);
   if (sa.size === 0 || sb.size === 0) return 0;
   let overlap = 0;
   for (const tok of sa) if (sb.has(tok)) overlap++;
   const union = sa.size + sb.size - overlap;
   return union > 0 ? overlap / union : 0;
+}
+
+function bigramSet(normalized: string): Set<string> {
+  const toks = tokensOf(normalized);
+  const out = new Set<string>();
+  for (let i = 0; i < toks.length - 1; i++) {
+    out.add(`${toks[i]} ${toks[i + 1]}`);
+  }
+  return out;
+}
+
+function bigramJaccard(na: string, nb: string): number {
+  const sa = bigramSet(na);
+  const sb = bigramSet(nb);
+  if (sa.size === 0 || sb.size === 0) return 0;
+  let overlap = 0;
+  for (const g of sa) if (sb.has(g)) overlap++;
+  const union = sa.size + sb.size - overlap;
+  return union > 0 ? overlap / union : 0;
+}
+
+/**
+ * Longest-common-substring ratio (over the shorter string). Captures
+ * the case where one response is a near-verbatim quote of the other but
+ * surrounded by different wrappers — Jon's "the answer is X" inside
+ * Haiku's longer "ok so basically the answer is X and also Y". Jaccard
+ * underrates this; substring overlap catches it.
+ *
+ * O(n*m) time / O(m) space rolling-row table. Strings here are post-
+ * normalization (typically a few hundred chars), so this is cheap.
+ */
+function substringRatio(na: string, nb: string): number {
+  if (!na || !nb) return 0;
+  // Cap to keep this O(n*m) bound predictable on the rare giant pair.
+  const A = na.length > 2000 ? na.slice(0, 2000) : na;
+  const B = nb.length > 2000 ? nb.slice(0, 2000) : nb;
+  const m = A.length;
+  const n = B.length;
+  if (m === 0 || n === 0) return 0;
+  let prev = new Array(n + 1).fill(0);
+  let curr = new Array(n + 1).fill(0);
+  let lcs = 0;
+  for (let i = 1; i <= m; i++) {
+    const ca = A.charCodeAt(i - 1);
+    for (let j = 1; j <= n; j++) {
+      curr[j] = ca === B.charCodeAt(j - 1) ? prev[j - 1] + 1 : 0;
+      if (curr[j] > lcs) lcs = curr[j];
+    }
+    [prev, curr] = [curr, prev];
+    curr.fill(0);
+  }
+  return lcs / Math.min(m, n);
 }
 
 /**
@@ -236,6 +398,46 @@ function cosineSimilarity(a: number[], b: number[]): number {
   if (na === 0 || nb === 0) return 0;
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
+
+// ── Embedding pair cache ───────────────────────────────────────────────────
+
+/**
+ * Bounded Map-as-LRU. JS Maps preserve insertion order; we delete-and-
+ * reinsert on hit to move to the tail, then evict head on overflow.
+ * Cap is 2048 pairs — at 2 vectors per call, ~64 KB JS overhead with
+ * negligible memory cost and a useful hit-rate on tight conversation
+ * loops where the same back-and-forth recurs.
+ */
+const PAIR_CACHE_LIMIT = 2048;
+const embeddingPairCache = new Map<string, number>();
+
+function pairCacheKey(na: string, nb: string): string {
+  // Order-insensitive: cosine(a,b) === cosine(b,a). Always alphabetize
+  // so the cache hits regardless of which response arrived first.
+  return na < nb ? `${na} ${nb}` : `${nb} ${na}`;
+}
+
+// Override Map.get to be LRU-aware without touching the call sites.
+const origGet = embeddingPairCache.get.bind(embeddingPairCache);
+const origSet = embeddingPairCache.set.bind(embeddingPairCache);
+embeddingPairCache.get = (k: string) => {
+  if (!embeddingPairCache.has(k)) return undefined;
+  const v = origGet(k);
+  // Move to tail.
+  embeddingPairCache.delete(k);
+  origSet(k, v as number);
+  return v;
+};
+embeddingPairCache.set = (k: string, v: number) => {
+  if (embeddingPairCache.has(k)) embeddingPairCache.delete(k);
+  origSet(k, v);
+  while (embeddingPairCache.size > PAIR_CACHE_LIMIT) {
+    const firstKey = embeddingPairCache.keys().next().value as string | undefined;
+    if (firstKey === undefined) break;
+    embeddingPairCache.delete(firstKey);
+  }
+  return embeddingPairCache;
+};
 
 // ── Voyage embedding adapter ───────────────────────────────────────────────
 
