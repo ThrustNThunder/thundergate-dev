@@ -544,4 +544,28 @@ Every configuration change, model routing decision, learning-loop write, mode fl
 
 ---
 
+## 30. SAFETY AS ARCHITECTURE, NOT TRUST
+
+An AI agent that relies solely on good intentions for safety is not safe. ThunderGate's safety must be structural — built into the system so it holds regardless of instructions, mistakes, or future deployment contexts.
+
+**Hard constraints (non-negotiable, not overridable by any instruction):**
+1. Financial transactions above $50 require explicit multi-step confirmation — never automated
+2. Communications sent in a human's voice require explicit authorization per message
+3. Access is limited to accounts and systems explicitly authorized by Michael
+4. No action that could harm a family — financial, reputational, or otherwise — without human confirmation
+5. Kill-switch authority always belongs to Michael — any ThunderGate behavior can be halted, reviewed, or reversed
+
+**For deployment to other families:**
+- Conservative defaults: no external-action autonomy until trust is explicitly granted
+- Every consequential action is logged and auditable
+- Family members can review everything the agent has done
+
+The provenance ledger (Principle 29) is the audit backbone. The untrain command is the behavior-correction mechanism. Human oversight is always preserved.
+
+Trust is earned through transparency and consistency. Architecture is what makes trust possible at scale.
+
+*Principle 30 added May 13, 2026 — Safety as Architecture lock-in.*
+
+---
+
 *End of principles. Updates land at the bottom with a date stamp. Renumbering is never allowed — Michael, Jon, and downstream docs cite by number.*
