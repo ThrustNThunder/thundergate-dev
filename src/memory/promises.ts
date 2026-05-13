@@ -39,6 +39,7 @@
 
 import { randomUUID } from 'crypto';
 import type { SessionDB, PromiseRow } from '../session/database.js';
+import type { MemoryWAL } from './wal.js';
 
 /**
  * Negative-filter phrases. If the matched outbound substring (normalized)
@@ -203,10 +204,12 @@ export class PromiseTracker {
   private db: SessionDB;
   private lastInboundAt: number | null = null;
   private gapThresholdMs: number;
+  private wal: MemoryWAL | null;
 
-  constructor(db: SessionDB, opts?: { gapThresholdMs?: number }) {
+  constructor(db: SessionDB, opts?: { gapThresholdMs?: number; wal?: MemoryWAL }) {
     this.db = db;
     this.gapThresholdMs = opts?.gapThresholdMs ?? 4 * 60 * 60 * 1000;
+    this.wal = opts?.wal ?? null;
   }
 
   /**
@@ -256,6 +259,19 @@ export class PromiseTracker {
       seen.add(lower);
 
       const id = randomUUID();
+      // WAL the extraction BEFORE the canonical INSERT. A crash between
+      // append() and insertPromise() leaves a row that flags an
+      // unrealized commitment — strictly better than silently losing it.
+      this.wal?.append({
+        type: 'promise_extracted',
+        sessionId: opts.sessionId ?? null,
+        payload: {
+          promiseId: id,
+          text: phrase,
+          kind: cand.kind,
+          channel: opts.channel ?? null
+        }
+      });
       this.db.insertPromise({
         id,
         sessionId: opts.sessionId ?? null,

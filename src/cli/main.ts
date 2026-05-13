@@ -27,6 +27,7 @@ import { PromiseTracker } from '../memory/promises.js';
 import { FrameManager } from '../memory/frame.js';
 import { UntrainService } from '../memory/untrain.js';
 import { ProvisionalMemoryService } from '../memory/provisional.js';
+import { MemoryWAL } from '../memory/wal.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -439,6 +440,34 @@ async function collectPersistentMemoryChecks(): Promise<string[]> {
         out.push('✅ FrameLast    (no transitions yet)');
       }
       out.push(`✅ Memory       ${memCounts.provisional} provisional, ${memCounts.confirmed} confirmed`);
+
+      // WAL surfaces — Build 28+: durable replay log size, oldest
+      // unplayed-row age (signal that replay didn't sweep something),
+      // last-rotation timestamp, and a recent-corruption percentage.
+      // We render >10% recent corruption as a warning icon per the spec.
+      const wal = new MemoryWAL(db);
+      const ws = wal.stats();
+      const oldestAge = ws.oldestUnplayedAgeMs !== null
+        ? `${(ws.oldestUnplayedAgeMs / 60000).toFixed(1)}m`
+        : '∅';
+      const lastRot = ws.lastRotationAt
+        ? new Date(ws.lastRotationAt).toLocaleString()
+        : '(never)';
+      const corruptionPct = ws.recentSampleSize > 0
+        ? (ws.corruptedRecent / ws.recentSampleSize) * 100
+        : 0;
+      const walIcon = corruptionPct > 10 ? '⚠️' : '✅';
+      out.push(
+        `${walIcon} WAL          ${ws.hotRows} hot rows (${ws.unplayedRows} unplayed, oldest ${oldestAge}), ` +
+        `${ws.archiveRows} archived`
+      );
+      out.push(`${walIcon} WALrotation  last: ${lastRot}`);
+      if (ws.recentSampleSize > 0) {
+        out.push(
+          `${walIcon} WALintegrity ${ws.corruptedRecent}/${ws.recentSampleSize} recent rows corrupted ` +
+          `(${corruptionPct.toFixed(1)}%)`
+        );
+      }
     } finally {
       await db.close();
     }

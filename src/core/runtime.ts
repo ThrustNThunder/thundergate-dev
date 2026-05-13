@@ -30,6 +30,7 @@ import { PromiseTracker } from '../memory/promises.js';
 import { FrameManager } from '../memory/frame.js';
 import { UntrainService, detectUntrainTrigger } from '../memory/untrain.js';
 import { ProvisionalMemoryService } from '../memory/provisional.js';
+import { MemoryWAL } from '../memory/wal.js';
 
 // Runtime state
 interface RuntimeState {
@@ -67,6 +68,9 @@ export class ThunderGateRuntime {
   private frames!: FrameManager;
   private untrain!: UntrainService;
   private provisional!: ProvisionalMemoryService;
+  // Write-ahead log for every memory-affecting op. Built before the
+  // memory subsystems so all of them can push intent rows through it.
+  private wal!: MemoryWAL;
 
   constructor(configPath?: string) {
     // Phase 3: ensureConfig writes the default config.json on first run
@@ -112,6 +116,10 @@ export class ThunderGateRuntime {
 
   getProvisionalService(): ProvisionalMemoryService | undefined {
     return this.provisional;
+  }
+
+  getMemoryWAL(): MemoryWAL | undefined {
+    return this.wal;
   }
 
   /** DB accessor — CLI needs it for read-only memory list. */
@@ -173,16 +181,51 @@ export class ThunderGateRuntime {
     this.doctor.startMonitoring();
     console.log('  ✓ Doctor mode active');
 
-    // Initialize learning trigger engine
-    this.learning = new TriggerEngine(this.db, this.config.learning.backstopTurns);
-    console.log('  ✓ Learning loop ready');
+    // Write-ahead log boot sequence. Must come before promise/frame/
+    // untrain wiring so each subsystem can route intent rows through
+    // it during processing. The order matters:
+    //   1. Construct WAL (no I/O — just binds the DB handle).
+    //   2. Replay unplayed rows — recover from any prior crash.
+    //   3. Rotate the hot table once on boot — archive anything >7d old.
+    //   4. Schedule the daily rotation cron.
+    this.wal = new MemoryWAL(this.db);
+    const replay = this.wal.replay();
+    if (replay.recovered === 0 && replay.corrupted === 0) {
+      console.log('  ✓ WAL replay: 0 rows recovered (clean boot)');
+    } else {
+      const counts = Object.entries(replay.byType)
+        .filter(([, n]) => n > 0)
+        .map(([t, n]) => `${t}=${n}`)
+        .join(' ');
+      console.log(
+        `  ✓ WAL replay: ${replay.recovered} rows recovered ` +
+        `(${counts || 'none'})` +
+        (replay.corrupted > 0 ? `, ${replay.corrupted} corrupted skipped` : '') +
+        (replay.orphanedInbound > 0 ? `, ${replay.orphanedInbound} orphaned inbound (in-flight at crash)` : '')
+      );
+      if (replay.lastTurns.length > 0) {
+        console.log(`  ✓ WAL replay: reconstructed last ${replay.lastTurns.length} turn(s) of context`);
+      }
+    }
+    const rotated = this.wal.rotate();
+    if (rotated.archived > 0) {
+      console.log(`  ✓ WAL boot rotation: archived ${rotated.archived} row(s)`);
+    }
+    this.wal.startDailyRotation();
 
     // Persistent-memory subsystems. Order matters: provenance must
     // already exist (constructed above) so UntrainService can append.
-    this.promises = new PromiseTracker(this.db);
-    this.frames = new FrameManager(this.db);
-    this.untrain = new UntrainService(this.db, this.provenance);
+    // WAL is passed in so each subsystem can write its intent row
+    // BEFORE the canonical table mutation it performs.
+    this.promises = new PromiseTracker(this.db, { wal: this.wal });
+    this.frames = new FrameManager(this.db, { wal: this.wal });
+    this.untrain = new UntrainService(this.db, this.provenance, { wal: this.wal });
     this.provisional = new ProvisionalMemoryService(this.db);
+
+    // Learning trigger engine. Constructed after WAL so correction +
+    // learning_extracted events get durably logged on capture.
+    this.learning = new TriggerEngine(this.db, this.config.learning.backstopTurns, this.wal);
+    console.log('  ✓ Learning loop ready');
 
     // Hydrate the most recent ACTIVE/PAUSED frame so the conversation
     // survives the restart. If nothing exists, the first inbound will
@@ -276,6 +319,21 @@ export class ThunderGateRuntime {
       timestamp: new Date(entry.timestamp)
     };
 
+    // WAL the inbound BEFORE we touch any processing. If we crash
+    // before producing an outbound, replay will surface this row as an
+    // orphaned inbound so Doctor can flag it on the next boot.
+    this.wal.append({
+      type: 'inbound_message',
+      sessionId: this.state.sessionId || null,
+      payload: {
+        messageId: entry.id,
+        channel: channelId,
+        sender: entry.sender,
+        text: entry.text,
+        timestamp: entry.timestamp
+      }
+    });
+
     // ── Frame lifecycle: advance/transition based on this inbound ──
     let frameDecision: ReturnType<FrameManager['onInbound']> | null = null;
     try {
@@ -367,6 +425,26 @@ export class ThunderGateRuntime {
       timestamp: Date.now(),
       model: this.config.runtime.model
     };
+
+    // WAL the outbound BEFORE handing it to the channel. The inbound
+    // messageId is carried in the payload so replay can pair the two
+    // and identify orphans (inbound with no matching outbound = crash
+    // mid-LLM-call).
+    this.wal.append({
+      type: 'outbound_message',
+      sessionId: this.state.sessionId || null,
+      payload: {
+        messageId: delivery.id,
+        inboundMessageId: entry.id,
+        channel: channelId,
+        agentId: delivery.agentId,
+        sender: delivery.sender,
+        text: composedText,
+        timestamp: delivery.timestamp,
+        model: delivery.model
+      }
+    });
+
     this.channels.broadcast(delivery);
   }
 
@@ -849,6 +927,9 @@ export class ThunderGateRuntime {
     // Stop doctor
     this.doctor.stopMonitoring();
     console.log('  ✓ Doctor stopped');
+
+    // Stop WAL daily rotation timer so the process can exit cleanly.
+    try { this.wal?.stopDailyRotation(); } catch { /* ignore */ }
 
     // Close database
     await this.db.close();

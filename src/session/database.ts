@@ -11,7 +11,7 @@ import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { mkdirSync } from 'fs';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA_SQL = `
 -- Schema version tracking
@@ -133,6 +133,39 @@ CREATE TABLE IF NOT EXISTS frame_transitions (
   timestamp REAL NOT NULL
 );
 
+-- Memory WAL — write-ahead log of every memory-affecting operation.
+-- Rows land here BEFORE the operation is processed so a crash mid-flight
+-- can be replayed on the next boot. Canonical state lives in the
+-- subsystem tables (promises, frames, memory, untrain_log); the WAL is
+-- the durable history of intent + the recovery surface.
+--   type — discriminator. See WALEventType in src/memory/wal.ts.
+--   payload — JSON-encoded type-specific body.
+--   checksum — sha256 over the payload string. Verified on replay.
+--   replayed — 0 until the boot replay sweeps the row, then 1.
+CREATE TABLE IF NOT EXISTS memory_wal (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  session_id TEXT,
+  payload TEXT NOT NULL,
+  replayed INTEGER NOT NULL DEFAULT 0,
+  checksum TEXT NOT NULL
+);
+
+-- WAL archive — rows older than the retention window (default 7 days)
+-- AND already replayed are moved here on rotation. Same shape as
+-- memory_wal so it can be queried with the same code paths.
+CREATE TABLE IF NOT EXISTS memory_wal_archive (
+  id INTEGER PRIMARY KEY,
+  created_at INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  session_id TEXT,
+  payload TEXT NOT NULL,
+  replayed INTEGER NOT NULL DEFAULT 1,
+  checksum TEXT NOT NULL,
+  archived_at INTEGER NOT NULL
+);
+
 -- Untrain audit — rows for every untrain operation, regardless of trigger.
 -- The provenance ledger has the primary audit trail; this table is the
 -- query-friendly view for the CLI 'untrain log' command.
@@ -156,6 +189,9 @@ CREATE INDEX IF NOT EXISTS idx_promises_status ON promises(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_frames_status ON frames(status, opened_at);
 CREATE INDEX IF NOT EXISTS idx_frame_transitions_frame ON frame_transitions(frame_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_untrain_log_ts ON untrain_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_memory_wal_replayed ON memory_wal(replayed, created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_wal_type ON memory_wal(type, created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_wal_archive_ts ON memory_wal_archive(created_at);
 `;
 
 const FTS_SQL = `
@@ -196,9 +232,18 @@ export class SessionDB {
     mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new Database(this.dbPath);
     
-    // Enable WAL mode for concurrent access
+    // SQLite WAL journaling — separate from our memory_wal table.
+    // This pragma ensures the DB file itself survives crashes at the
+    // filesystem layer; combined with the application-level memory_wal
+    // table, every memory-affecting op is durable end-to-end.
+    // synchronous=NORMAL is the safe-for-WAL setting: fsync happens at
+    // checkpoint boundaries, not every commit. Much faster than FULL,
+    // and the only failure mode it admits is losing the last few
+    // transactions on hard power loss — which is exactly what the
+    // memory_wal replay path is designed to recover from.
     this.db.pragma('journal_mode = WAL');
-    
+    this.db.pragma('synchronous = NORMAL');
+
     // Create schema
     this.db.exec(SCHEMA_SQL);
     this.db.exec(FTS_SQL);

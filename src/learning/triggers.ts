@@ -16,6 +16,7 @@ import { execFile } from 'child_process';
 import { join } from 'path';
 import * as os from 'os';
 import { MEMORY_REVIEW_PROMPT, SKILL_REVIEW_PROMPT, extractKeywords } from './review_prompts.js';
+import type { MemoryWAL } from '../memory/wal.js';
 
 interface TriggerEvent {
   type: 'task_complete' | 'correction' | 'session_end' | 'failure' | 'backstop';
@@ -47,10 +48,12 @@ export class TriggerEngine {
   // it without paying the cost of a real throttle (failures *should*
   // burn in immediately, not be coalesced).
   private monotonicSeq: number = 0;
+  private wal: MemoryWAL | null;
 
-  constructor(db: SessionDB, backstopInterval: number = 20) {
+  constructor(db: SessionDB, backstopInterval: number = 20, wal?: MemoryWAL) {
     this.db = db;
     this.backstopInterval = backstopInterval;
+    this.wal = wal ?? null;
     // Seed the 'current' sessions row up-front. storeMessage() writes
     // every turn with session_id='current', and messages.session_id FKs
     // to sessions(id) — without this, every turn throws FOREIGN KEY
@@ -180,8 +183,13 @@ export class TriggerEngine {
     // Store as critical memory. Append a monotonic suffix so two
     // corrections fired inside the same ms get distinct keys instead
     // of one silently overwriting the other.
+    const key = this.uniqueKey('correction');
+    this.wal?.append({
+      type: 'correction',
+      payload: { key, correction, importance: 'critical', source: 'michael' }
+    });
     this.db.storeMemory({
-      key: this.uniqueKey('correction'),
+      key,
       value: correction,
       category: 'corrections',
       importance: 'critical',
@@ -320,8 +328,13 @@ export class TriggerEngine {
         if (pattern.test(msg.content)) {
           // Inferred memories enter as provisional — they only earn
           // 'confirmed' status after 3 uses without a correction.
+          const key = `preference_${this.uniqueKey('pref')}_${memories}`;
+          this.wal?.append({
+            type: 'learning_extracted',
+            payload: { kind: 'memory', key, category: 'preferences', value: msg.content, status: 'provisional' }
+          });
           this.db.storeMemory({
-            key: `preference_${this.uniqueKey('pref')}_${memories}`,
+            key,
             value: msg.content,
             category: 'preferences',
             importance: 'normal',
@@ -338,8 +351,13 @@ export class TriggerEngine {
 
       for (const pattern of factPatterns) {
         if (pattern.test(msg.content)) {
+          const key = `fact_${this.uniqueKey('fact')}_${memories}`;
+          this.wal?.append({
+            type: 'learning_extracted',
+            payload: { kind: 'memory', key, category: 'facts', value: msg.content, status: 'provisional' }
+          });
           this.db.storeMemory({
-            key: `fact_${this.uniqueKey('fact')}_${memories}`,
+            key,
             value: msg.content,
             category: 'facts',
             importance: 'normal',

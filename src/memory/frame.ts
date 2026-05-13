@@ -26,6 +26,7 @@
 
 import { randomUUID } from 'crypto';
 import type { SessionDB, FrameRow } from '../session/database.js';
+import type { MemoryWAL } from './wal.js';
 
 export const DEFAULT_GAP_MS = 30 * 60 * 1000;
 // Brief: ">20% overlap → REJOIN". Stored as a fraction.
@@ -69,11 +70,13 @@ export class FrameManager {
   private current: FrameRow | null = null;
   private gapMs: number;
   private confidenceFloor: number;
+  private wal: MemoryWAL | null;
 
-  constructor(db: SessionDB, opts?: { gapMs?: number; confidenceFloor?: number }) {
+  constructor(db: SessionDB, opts?: { gapMs?: number; confidenceFloor?: number; wal?: MemoryWAL }) {
     this.db = db;
     this.gapMs = opts?.gapMs ?? DEFAULT_GAP_MS;
     this.confidenceFloor = opts?.confidenceFloor ?? DEFAULT_CONFIDENCE_FLOOR;
+    this.wal = opts?.wal ?? null;
   }
 
   /**
@@ -125,6 +128,16 @@ export class FrameManager {
       to: 'PAUSED',
       reason: `gap ${(gap / 60000).toFixed(1)}m exceeded ${(this.gapMs / 60000).toFixed(1)}m`
     });
+    this.wal?.append({
+      type: 'frame_closed',
+      sessionId: ctx.sessionId ?? null,
+      payload: {
+        frameId: this.current.id,
+        fromStatus: this.current.status,
+        toStatus: 'PAUSED',
+        reason: `gap ${(gap / 60000).toFixed(1)}m exceeded`
+      }
+    });
 
     const pausedFrame = { ...this.current, status: 'PAUSED' as const };
     const similarity = this.evaluateSimilarity(ctx.text, pausedFrame.topic_anchor);
@@ -137,6 +150,16 @@ export class FrameManager {
         from: 'PAUSED',
         to: 'ACTIVE',
         reason: `frame rejoined (similarity ${(similarity * 100).toFixed(0)}%)`
+      });
+      this.wal?.append({
+        type: 'frame_opened',
+        sessionId: ctx.sessionId ?? null,
+        payload: {
+          frameId: pausedFrame.id,
+          transition: 'rejoined',
+          similarity,
+          topicAnchor: pausedFrame.topic_anchor
+        }
       });
       this.current = this.db.getFrame(pausedFrame.id) ?? pausedFrame;
       return {
@@ -182,6 +205,16 @@ export class FrameManager {
       to: 'CLOSED',
       reason
     });
+    this.wal?.append({
+      type: 'frame_closed',
+      sessionId: this.current.session_id ?? null,
+      payload: {
+        frameId: this.current.id,
+        fromStatus: prev,
+        toStatus: 'CLOSED',
+        reason
+      }
+    });
     const closed = this.db.getFrame(this.current.id);
     this.current = null;
     return closed;
@@ -209,6 +242,19 @@ export class FrameManager {
       from: null,
       to: 'ACTIVE',
       reason
+    });
+    this.wal?.append({
+      type: 'frame_opened',
+      sessionId: ctx.sessionId ?? null,
+      payload: {
+        frameId: id,
+        transition: 'opened',
+        topicAnchor: anchor,
+        deviceHint: ctx.deviceHint ?? null,
+        modelInUse: ctx.modelInUse ?? null,
+        parentFrameId,
+        reason
+      }
     });
     this.current = this.db.getFrame(id);
     return {

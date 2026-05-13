@@ -22,6 +22,7 @@
 
 import type { SessionDB, MemoryEntry } from '../session/database.js';
 import type { ProvenanceLedger } from '../provenance/ledger.js';
+import type { MemoryWAL } from './wal.js';
 
 const RECENT_USAGE_CAPACITY = 32;
 
@@ -41,10 +42,12 @@ export class UntrainService {
   private db: SessionDB;
   private ledger?: ProvenanceLedger;
   private recentUsage: string[] = [];
+  private wal: MemoryWAL | null;
 
-  constructor(db: SessionDB, ledger?: ProvenanceLedger) {
+  constructor(db: SessionDB, ledger?: ProvenanceLedger, opts?: { wal?: MemoryWAL }) {
     this.db = db;
     this.ledger = ledger;
+    this.wal = opts?.wal ?? null;
   }
 
   /** Called by anything that surfaces a memory into a prompt. */
@@ -79,6 +82,19 @@ export class UntrainService {
   }): { deleted: boolean; value: string | null } {
     const existing = this.db.getMemory(opts.key);
     const value = existing?.value ?? null;
+    // WAL the intent BEFORE deletion — a crash between this row and the
+    // deleteMemory() call leaves audit-trail evidence that we wanted
+    // this memory gone, even if the row is still physically present.
+    this.wal?.append({
+      type: 'untrain',
+      payload: {
+        key: opts.key,
+        value,
+        actor: opts.actor,
+        reason: opts.reason ?? null,
+        triggerType: opts.triggerType ?? 'cli'
+      }
+    });
     const deleted = this.db.deleteMemory(opts.key);
     if (deleted) {
       this.db.logUntrain({
