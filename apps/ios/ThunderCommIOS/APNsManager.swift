@@ -222,9 +222,23 @@ public final class APNsManager: NSObject {
         // The push payload is intentionally tiny — it's a wakeup signal.
         // We always drain inbox; we do not trust the payload to carry the
         // message contents.
+        let newCount = UserDefaults.standard.integer(forKey: "apns.badgeCount") + 1
+        UserDefaults.standard.set(newCount, forKey: "apns.badgeCount")
+        UNUserNotificationCenter.current().setBadgeCount(newCount) { error in
+            if let error { NSLog("[APNs] setBadgeCount failed: \(error)") }
+        }
         Task {
             await DeliveryCore.shared.drainInbox()
             completion(.newData)
+        }
+    }
+
+    /// Reset the unread badge to zero. Called when the app becomes active so
+    /// the user sees a clean dock icon after opening the app.
+    public func clearBadge() {
+        UserDefaults.standard.set(0, forKey: "apns.badgeCount")
+        UNUserNotificationCenter.current().setBadgeCount(0) { error in
+            if let error { NSLog("[APNs] clearBadge failed: \(error)") }
         }
     }
 

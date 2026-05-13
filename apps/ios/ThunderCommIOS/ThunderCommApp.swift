@@ -24,6 +24,7 @@ struct ThunderCommApp: App {
             DeliveryCore.shared.handleScenePhase(phase)
             if phase == .active {
                 AuthManager.shared.handleScenePhaseActive()
+                APNsManager.shared.clearBadge()
             }
             if phase == .background {
                 APNsManager.shared.scheduleNextBackgroundRefresh()
