@@ -21,6 +21,29 @@ export enum ProcessingMode {
   LOCAL_INFERENCE = 'LOCAL_INFERENCE'
 }
 
+/**
+ * A vault unlock request that has been emitted to a channel and is
+ * waiting for the user's response. `mode` decides how the next inbound
+ * is interpreted:
+ *   - 'password'  : the entire message body is fed to VaultService.unlock
+ *                   as the password.
+ *   - 'biometric' : the message body must match an approval keyword
+ *                   ('approve' | 'yes' | 'approved') — placeholder for
+ *                   the LocalAuthentication signal Mack will wire on iOS.
+ */
+export interface PendingVaultRequest {
+  request_id: string;
+  channel: string;
+  field_label: string;
+  purpose: string;
+  agent_id: string;
+  user: string;
+  mode: 'password' | 'biometric';
+  ttl_ms: number;
+  requested_at: number;
+  expires_at: number;
+}
+
 export interface LocalInferenceLiveness {
   /** True if the last health check reached the endpoint AND it responded healthy. */
   reachable: boolean;
@@ -68,6 +91,16 @@ export class WorldState {
   browserCurrentUrl: string = '';
   browserPortalState: string | null = null;
   browserLastActionAt: number | null = null;
+
+  /**
+   * Vault unlock requests currently awaiting a response, keyed by the
+   * channel id that issued the prompt. Inbound traffic on the same
+   * channel within the pending TTL is interpreted as the unlock answer
+   * (password text on CLI/direct channels, 'approve' / 'yes' on
+   * ThunderCommo as the biometric-stub placeholder). VaultProtocol
+   * owns the lifecycle — runtime only reads.
+   */
+  pendingVaultRequests: Map<string, PendingVaultRequest> = new Map();
 
   /**
    * Convenience: returns the mode the runtime should branch on. Kept as a

@@ -38,6 +38,8 @@ import {
   type VaultCategory,
   type DisclosureMode
 } from '../vault/vault.js';
+import { VaultProtocol } from '../vault/protocol.js';
+import { WorldState } from '../world/state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1154,6 +1156,111 @@ vaultCmd
     });
   });
 
+// ── vault test-request ────────────────────────────────────────────────────
+//
+// End-to-end exerciser for the live VaultProtocol. Walks the full
+// request → prompt → unlock → access → re-lock cycle in-process so the
+// flow can be verified without standing up a channel + paired device.
+//
+// Modes:
+//   --channel cli (default)      : password seam. Prompts the operator
+//                                   for the password on stdin and
+//                                   resolves through VaultProtocol.
+//   --channel <anything-else>    : biometric seam. Synthesizes an
+//                                   'approve' inbound and walks the same
+//                                   approval path the ThunderCommo iOS
+//                                   handler will use. Requires the
+//                                   stub-password env var.
+vaultCmd
+  .command('test-request')
+  .description('Drive the full VaultProtocol request/response flow end-to-end (testing only).')
+  .requiredOption('--field <label>', 'Vault field label to request (must already exist in vault)')
+  .requiredOption('--purpose <text>', 'Purpose recorded on the grant + receipt')
+  .option('--channel <name>', 'Channel id — `cli` walks the password path; anything else walks biometric', 'cli')
+  .option('--password <text>', 'Vault password (otherwise prompted)')
+  .option(
+    '--biometric-reply <text>',
+    "For non-cli channels: the simulated user reply ('approve' / 'yes' / 'deny'). Default 'approve'.",
+    'approve'
+  )
+  .action(async (opts: {
+    field: string;
+    purpose: string;
+    channel: string;
+    password?: string;
+    biometricReply?: string;
+  }) => {
+    await withVault(async (vault) => {
+      const cfg = ensureConfig();
+      const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+      const world = new WorldState();
+      const protocol = new VaultProtocol(vault, world, ledger);
+      const channel = opts.channel || 'cli';
+      const isCli = channel === 'cli';
+
+      console.log('⚡ Vault Protocol Test-Request');
+      console.log('═══════════════════════════════════════');
+      console.log(`  channel : ${channel} (${isCli ? 'password' : 'biometric'} path)`);
+      console.log(`  field   : ${opts.field}`);
+      console.log(`  purpose : ${opts.purpose}`);
+      console.log();
+
+      // Step 1 — issue the access request. Vault is locked on every CLI
+      // invocation (withVault opens a fresh handle and never unlocks),
+      // so this will always come back as pending_unlock.
+      const result = protocol.requestAccess({
+        field_label: opts.field,
+        purpose: opts.purpose,
+        channel,
+        agent_id: `cli-test:${process.env.USER ?? 'jon'}`,
+        user: process.env.USER ?? 'jon',
+        disclosure_mode: 'raw',
+        raw_policy_reason: 'vault protocol test-request CLI'
+      });
+
+      if (result.status === 'resolved') {
+        // Highly unusual — vault was somehow already unlocked. Print
+        // the response and bail.
+        console.log('  ↪ vault was already unlocked — resolved inline');
+        printAccessResponse(result.response);
+        return;
+      }
+
+      console.log(`  → Emitted vault_unlock_request ${result.request_id.slice(0, 8)} (mode=${result.mode})`);
+      console.log('  → Prompt the user would see:');
+      console.log('  ┌──────────────────────────────────────');
+      for (const line of result.prompt.composed_text.split('\n')) {
+        console.log(`  │ ${line}`);
+      }
+      console.log('  └──────────────────────────────────────');
+      console.log();
+
+      // Step 2 — simulate the user response.
+      let unlockReply: string;
+      if (isCli) {
+        unlockReply = opts.password ?? (await promptHidden('Enter vault password: '));
+      } else {
+        unlockReply = opts.biometricReply ?? 'approve';
+        console.log(`  ← Simulated user reply: '${unlockReply}'`);
+      }
+
+      // Step 3 — feed it through the protocol exactly as the runtime would.
+      const outcome = protocol.handleInbound(channel, unlockReply);
+      console.log();
+      console.log(`  ← Outcome: ${outcome.status}`);
+      if (outcome.status === 'unlocked') {
+        printAccessResponse(outcome.response);
+        // Step 4 — re-lock immediately to round-trip the lifecycle.
+        vault.lock('test-request cycle complete');
+        console.log('  ✓ Vault re-locked (test cycle complete)');
+      } else {
+        console.error(`  ✗ ${protocol.formatOutcome(outcome)}`);
+        console.error(`    reason: ${outcome.reason}`);
+        process.exit(1);
+      }
+    });
+  });
+
 /**
  * Hidden-input prompt for passwords/secrets. Falls back to plain readline
  * when stdin isn't a TTY (e.g., piped input in tests).
@@ -1210,6 +1317,33 @@ async function promptHidden(prompt: string): Promise<string> {
 function truncate(s: string, n: number = 120): string {
   const flat = s.replace(/\s+/g, ' ').trim();
   return flat.length > n ? flat.slice(0, n) + '…' : flat;
+}
+
+/**
+ * Pretty-print the result of a successful protocol access. Plaintext
+ * is only emitted under raw disclosure_mode — for claim/blinded_match
+ * we surface metadata only, exactly like `vault access` does.
+ */
+function printAccessResponse(resp: import('../vault/vault.js').AccessResponse): void {
+  switch (resp.mode) {
+    case 'raw':
+      console.log(`  ✓ Access granted (raw)`);
+      console.log(`    grant_id   : ${resp.grant_id}`);
+      console.log(`    receipt_id : ${resp.receipt_id}`);
+      console.log(`    value      : ${resp.value}`);
+      break;
+    case 'claim':
+      console.log(`  ✓ Access granted (claim — value present, not disclosed)`);
+      console.log(`    grant_id   : ${resp.grant_id}`);
+      console.log(`    receipt_id : ${resp.receipt_id}`);
+      break;
+    case 'blinded_match':
+      console.log(`  ✓ Access granted (blinded_match)`);
+      console.log(`    matches    : ${resp.matches}`);
+      console.log(`    grant_id   : ${resp.grant_id}`);
+      console.log(`    receipt_id : ${resp.receipt_id}`);
+      break;
+  }
 }
 
 // ── Helper functions ───────────────────────────────────────────────────────

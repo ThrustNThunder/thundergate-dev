@@ -42,6 +42,8 @@ import { FrameManager } from '../memory/frame.js';
 import { UntrainService, detectUntrainTrigger } from '../memory/untrain.js';
 import { ProvisionalMemoryService } from '../memory/provisional.js';
 import { MemoryWAL } from '../memory/wal.js';
+import { VaultService } from '../vault/vault.js';
+import { VaultProtocol } from '../vault/protocol.js';
 
 // Runtime state
 interface RuntimeState {
@@ -89,6 +91,13 @@ export class ThunderGateRuntime {
   // Write-ahead log for every memory-affecting op. Built before the
   // memory subsystems so all of them can push intent rows through it.
   private wal!: MemoryWAL;
+  // PII vault + the live request/response shell that turns "I need
+  // field X" into either an inline response (vault already unlocked)
+  // or a vault_unlock_request prompt on the active channel. The vault
+  // is constructed early in start() so doctor + CLI can read status,
+  // but it is never auto-unlocked: every protocol cycle re-prompts.
+  private vault: VaultService | null = null;
+  private vaultProtocol: VaultProtocol | null = null;
   /**
    * Wall-clock at runtime start, used by the Ghost state snapshot to
    * report service uptime. Captured in the constructor (not start()) so
@@ -155,6 +164,14 @@ export class ThunderGateRuntime {
     return this.wal;
   }
 
+  getVault(): VaultService | undefined {
+    return this.vault ?? undefined;
+  }
+
+  getVaultProtocol(): VaultProtocol | undefined {
+    return this.vaultProtocol ?? undefined;
+  }
+
   /** DB accessor — CLI needs it for read-only memory list. */
   getDB(): SessionDB | undefined {
     return this.db;
@@ -203,6 +220,22 @@ export class ThunderGateRuntime {
     this.provenance = new ProvenanceLedger(this.config.localInference.provenanceFile);
     this.localInference = new LocalInferenceProvider(this.config, this.world, this.provenance);
     this.localInference.start();
+
+    // Vault service + protocol orchestrator. Vault starts locked (per
+    // its constructor). The protocol is the seam every channel inbound
+    // checks before falling through to normal processing. Failure to
+    // initialize is non-fatal — vault features just won't be available
+    // until the next restart.
+    try {
+      this.vault = new VaultService(this.provenance);
+      this.vault.initialize();
+      this.vaultProtocol = new VaultProtocol(this.vault, this.world, this.provenance);
+      console.log('  ✓ Vault initialized (locked)');
+    } catch (err) {
+      console.warn('  ⚠ Vault init failed (non-fatal):', (err as Error).message);
+      this.vault = null;
+      this.vaultProtocol = null;
+    }
     if (this.config.localInference.enabled) {
       console.log(`  ✓ Local inference probe started (${this.config.localInference.endpoint})`);
     } else {
@@ -389,6 +422,50 @@ export class ThunderGateRuntime {
         timestamp: entry.timestamp
       }
     });
+
+    // ── Vault protocol short-circuit ────────────────────────────────────
+    // If a vault unlock request is pending on this channel and the
+    // inbound looks like the user's answer, divert *before* any other
+    // processing so the password text never enters the LLM path, the
+    // promise tracker, or the WAL outbound (we still log the outcome).
+    if (this.vaultProtocol && this.vaultProtocol.looksLikeUnlockResponse(channelId, entry.text)) {
+      try {
+        const result = this.vaultProtocol.handleInbound(channelId, entry.text);
+        const replyText = this.vaultProtocol.formatOutcome(result);
+        const delivery: OutboundDelivery = {
+          id: newMessageId(),
+          agentId: 'jon',
+          sender: 'Jon',
+          channel: channelId,
+          text: replyText,
+          timestamp: Date.now(),
+          model: this.config.runtime.model
+        };
+        // WAL the synthetic outbound so the audit trail pairs the
+        // unlock attempt with its response. The body deliberately
+        // does NOT include the password the user typed.
+        this.wal.append({
+          type: 'outbound_message',
+          sessionId: this.state.sessionId || null,
+          payload: {
+            messageId: delivery.id,
+            inboundMessageId: entry.id,
+            channel: channelId,
+            agentId: delivery.agentId,
+            sender: delivery.sender,
+            text: replyText,
+            timestamp: delivery.timestamp,
+            model: delivery.model,
+            vault_unlock_outcome: result.status
+          }
+        });
+        this.channels.broadcast(delivery);
+        return;
+      } catch (err) {
+        console.warn('  ⚠ vault unlock response handling failed:', (err as Error).message);
+        // fall through to normal processing if the protocol exploded
+      }
+    }
 
     // ── Frame lifecycle: advance/transition based on this inbound ──
     let frameDecision: ReturnType<FrameManager['onInbound']> | null = null;
@@ -1147,6 +1224,15 @@ export class ThunderGateRuntime {
 
     // Stop WAL daily rotation timer so the process can exit cleanly.
     try { this.wal?.stopDailyRotation(); } catch { /* ignore */ }
+
+    // Close the vault — locks the in-memory key and closes the SQLite
+    // handle. Drops any pending unlock requests since they are
+    // process-local state.
+    try {
+      this.vault?.close();
+      this.vault = null;
+      this.vaultProtocol = null;
+    } catch { /* ignore */ }
 
     // Close database
     await this.db.close();
