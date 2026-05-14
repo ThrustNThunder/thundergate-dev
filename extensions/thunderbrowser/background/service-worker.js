@@ -57,6 +57,12 @@ alarms.onAlarm.addListener((alarm) => {
     console.log('WSS: not connected');
     wssClient.connect();
   }
+  if (bridgeClient.isConnected()) {
+    console.log('Bridge: connected');
+  } else {
+    console.log('Bridge: not connected');
+    bridgeClient.connect();
+  }
 });
 
 export function getSwBootTs() {
@@ -67,6 +73,20 @@ export function getSwBootTs() {
 
 const WSS_URL = 'ws://localhost:9876/browser';
 const WSS_RECONNECT_MS = 5000;
+
+// ── TB-NB-1 — Native BrowserBridge dial (port 8770) ────────────────────────
+//
+// Parallel client to the channel-shaped 9876 socket above. The native
+// BrowserBridge (src/browser/bridge.ts on the ThunderGate side) treats
+// the extension as a tool the runtime calls directly — request/response
+// with correlation_ids, not a queued channel.
+//
+// Both sockets stay live so this addition is 100% additive — the
+// existing channel flow keeps working. If 8770 isn't bound (older
+// ThunderGate build, or runtime down), reconnect just keeps retrying;
+// no extension state is gated on it.
+const BRIDGE_URL = 'ws://localhost:8770';
+const BRIDGE_RECONNECT_MS = 5000;
 
 const wssClient = (() => {
   let ws = null;
@@ -152,6 +172,168 @@ const wssClient = (() => {
   return { connect, isConnected, send };
 })();
 
+// ── TB-NB-1 — Native BrowserBridge client ──────────────────────────────────
+//
+// Connects to the ThunderGate-side BrowserBridge listener (port 8770).
+// On open: sends `{type: 'browser_ready', url, state}`. On every
+// `command` envelope: executes via the same `executeCommand` machinery
+// the channel path uses, then replies with
+// `{type: 'command_result', correlation_id, success, data, error}`.
+//
+// Survives ThunderGate restarts via reconnect timer. Unlike the channel
+// client, there's no queue — if the runtime is down, commands haven't
+// been sent and there's nothing to flush.
+
+const bridgeClient = (() => {
+  let ws = null;
+  let reconnectTimer = null;
+  let connected = false;
+
+  function clearReconnectTimer() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnect() {
+    clearReconnectTimer();
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, BRIDGE_RECONNECT_MS);
+  }
+
+  async function detectCurrentUrl() {
+    try {
+      const list = await tabs.query({ active: true, currentWindow: true });
+      const tab = Array.isArray(list) && list[0] ? list[0] : null;
+      return tab && tab.url ? tab.url : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function connect() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    clearReconnectTimer();
+    try {
+      ws = new WebSocket(BRIDGE_URL);
+    } catch (e) {
+      console.log('ThunderBrowser bridge construct error', e && e.message ? e.message : String(e));
+      scheduleReconnect();
+      return;
+    }
+    ws.addEventListener('open', async () => {
+      connected = true;
+      console.log('ThunderBrowser bridge connected');
+      const url = await detectCurrentUrl();
+      try {
+        ws.send(JSON.stringify({
+          type: 'browser_ready',
+          url,
+          state: null,
+        }));
+      } catch (_) { /* harmless if send races close */ }
+    });
+    ws.addEventListener('close', (ev) => {
+      connected = false;
+      console.log('ThunderBrowser bridge disconnected', {
+        code: ev.code,
+        reason: ev.reason || null,
+      });
+      scheduleReconnect();
+    });
+    ws.addEventListener('error', (ev) => {
+      console.log('ThunderBrowser bridge error', {
+        readyState: ws ? ws.readyState : null,
+        type: ev && ev.type ? ev.type : 'error',
+      });
+    });
+    ws.addEventListener('message', (ev) => {
+      const raw = typeof ev.data === 'string' ? ev.data : '[binary]';
+      handleBridgeInbound(raw);
+    });
+  }
+
+  function isConnected() {
+    return connected && ws !== null && ws.readyState === WebSocket.OPEN;
+  }
+
+  function send(obj) {
+    if (!isConnected()) return false;
+    try {
+      ws.send(JSON.stringify(obj));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  return { connect, isConnected, send };
+})();
+
+function handleBridgeInbound(raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch (_) { return; }
+  if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') return;
+  if (msg.type !== 'command') return;
+
+  const correlationId = msg.correlation_id || null;
+  const action = typeof msg.action === 'string' ? msg.action : null;
+  const args = (msg.args && typeof msg.args === 'object') ? msg.args : {};
+
+  void executeBridgeCommand(correlationId, action, args);
+}
+
+async function executeBridgeCommand(correlationId, action, args) {
+  // Map the BrowserBridge action vocabulary onto the existing
+  // SW_ACTIONS/CS_ACTIONS handlers so we don't fork a second
+  // executor. `get_state` is bridge-native — no channel equivalent.
+  let result;
+  try {
+    if (!action) {
+      result = { ok: false, error: 'missing_action' };
+    } else if (action === 'get_state') {
+      result = await collectBrowserState();
+    } else if (action === 'navigate') {
+      result = await dispatchSwAction('navigate', args);
+    } else if (action === 'click' || action === 'fill') {
+      result = await dispatchContentScriptAction(action, args, { id: correlationId || 'bridge', body: { runId: null } });
+    } else {
+      result = { ok: false, error: 'unknown_action', action };
+    }
+  } catch (e) {
+    result = { ok: false, error: 'handler_threw', detail: e && e.message ? e.message : String(e) };
+  }
+
+  const success = result && result.ok === true;
+  bridgeClient.send({
+    type: 'command_result',
+    correlation_id: correlationId,
+    success,
+    data: success ? result : undefined,
+    error: success ? undefined : (result && (result.error || result.detail)) || 'unknown_error',
+  });
+}
+
+async function collectBrowserState() {
+  try {
+    const list = await tabs.query({ active: true, currentWindow: true });
+    const tab = Array.isArray(list) && list[0] ? list[0] : null;
+    return {
+      ok: true,
+      url: tab && tab.url ? tab.url : '',
+      portalState: null,         // populated once portal-state detection lands
+      capturedAt: Date.now(),
+    };
+  } catch (e) {
+    return { ok: false, error: 'state_collect_failed', detail: e && e.message ? e.message : String(e) };
+  }
+}
+
 function handleInbound(raw) {
   let msg;
   try { msg = JSON.parse(raw); } catch (_) { return; }
@@ -191,6 +373,7 @@ function handleInbound(raw) {
 }
 
 wssClient.connect();
+bridgeClient.connect();
 
 // ── TB-1-2 — action dispatcher (SW-side actions + content-script relay) ──
 //
@@ -461,6 +644,7 @@ runtime.onStartup.addListener(() => {
   console.log('ThunderBrowser SW onStartup');
   ensureHeartbeatAlarm();
   wssClient.connect();
+  bridgeClient.connect();
 });
 
 ensureHeartbeatAlarm();

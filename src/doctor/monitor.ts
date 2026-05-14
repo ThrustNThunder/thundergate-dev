@@ -300,7 +300,29 @@ export class Doctor {
       recentLogs: healthLogs,
       stability,
       uptime: Date.now() - this.startTime.getTime(),
-      recommendations: this.generateRecommendations(status, healthLogs)
+      recommendations: this.generateRecommendations(status, healthLogs),
+      browser: this.browserSnapshot()
+    };
+  }
+
+  /**
+   * Pull the BrowserBridge surface for the doctor report. Read-only —
+   * we never block the diagnostic on bridge availability and degrade to
+   * `listening: false / connected: false` if the runtime hasn't wired
+   * the bridge yet (or it failed to bind).
+   */
+  private browserSnapshot(): BrowserDiagnostic {
+    const bridge: any = typeof this.runtime?.getBrowser === 'function' ? this.runtime.getBrowser() : null;
+    const world: any = typeof this.runtime?.getWorldState === 'function' ? this.runtime.getWorldState() : null;
+    const stats = bridge?.getStats?.() ?? null;
+    return {
+      listening: stats?.listening === true,
+      connected: stats?.connected === true,
+      port: stats?.port ?? null,
+      currentUrl: world?.browserCurrentUrl ?? '',
+      portalState: world?.browserPortalState ?? null,
+      lastActionAt: world?.browserLastActionAt ?? null,
+      pendingCommands: stats?.pending ?? 0
     };
   }
 
@@ -342,4 +364,15 @@ interface DiagnosticReport {
   stability: { stable: boolean; healthyDays: number };
   uptime: number;
   recommendations: string[];
+  browser: BrowserDiagnostic;
+}
+
+interface BrowserDiagnostic {
+  listening: boolean;
+  connected: boolean;
+  port: number | null;
+  currentUrl: string;
+  portalState: string | null;
+  lastActionAt: number | null;
+  pendingCommands: number;
 }

@@ -58,6 +58,18 @@ export class WorldState {
   };
 
   /**
+   * BrowserBridge liveness — mirrors what `src/browser/bridge.ts` knows
+   * about the connected ThunderBrowser extension. Consumers (Doctor,
+   * CLI, runtime planning) read these fields rather than reaching into
+   * the bridge itself, so a non-running bridge degrades to "no browser
+   * connected" without anyone needing a reference.
+   */
+  browserConnected: boolean = false;
+  browserCurrentUrl: string = '';
+  browserPortalState: string | null = null;
+  browserLastActionAt: number | null = null;
+
+  /**
    * Convenience: returns the mode the runtime should branch on. Kept as a
    * method (not just a field) so future logic — manual override pins,
    * cost-budget kill-switch, etc. — can hook in without every caller

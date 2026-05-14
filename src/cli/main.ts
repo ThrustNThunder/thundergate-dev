@@ -29,6 +29,7 @@ import { FrameManager } from '../memory/frame.js';
 import { UntrainService } from '../memory/untrain.js';
 import { ProvisionalMemoryService } from '../memory/provisional.js';
 import { MemoryWAL } from '../memory/wal.js';
+import { DEFAULT_BROWSER_BRIDGE_PORT } from '../browser/bridge.js';
 import {
   VaultService,
   VaultLockedError,
@@ -1494,6 +1495,50 @@ async function runDiagnostic(autoFix: boolean = false): Promise<void> {
     });
   }
 
+  // Check 11: BrowserBridge native infrastructure. Listening port
+  // (default 8770) holds open for the ThunderBrowser extension to dial
+  // in. "No extension connected" is a healthy steady state — most
+  // operators don't have the extension running. We pass when the
+  // listener is up; the detail string carries connection + portal state
+  // so operators see exactly what the runtime can reach right now.
+  if (running) {
+    try {
+      const browserPort = DEFAULT_BROWSER_BRIDGE_PORT;
+      const portUp = portOpen(browserPort);
+      const ledger = new ProvenanceLedger(ensureConfig().localInference.provenanceFile);
+      const events: ProvenanceEvent[] = ledger.tail(200);
+      const reversed = [...events].reverse();
+      const lastReady = reversed.find(
+        (e) => e.actor === 'browser-bridge' && e.action === 'extension_ready'
+      );
+      const lastDisc = reversed.find(
+        (e) => e.actor === 'browser-bridge' && e.action === 'extension_disconnected'
+      );
+      const connected =
+        lastReady != null &&
+        (lastDisc == null || lastDisc.timestamp < lastReady.timestamp);
+      const url = (lastReady?.data as any)?.url ?? '';
+      const portalState = (lastReady?.data as any)?.portalState ?? null;
+      const lastReadyAt = lastReady ? formatLedgerAge(lastReady.timestamp) : '(never)';
+      const tail = connected
+        ? ` | ext connected at ${lastReadyAt}${url ? ` | url=${truncate(url, 60)}` : ''}${portalState ? ` | state=${portalState}` : ''}`
+        : ` | no extension currently connected`;
+      checks.push({
+        name: 'Browser',
+        pass: portUp,
+        detail: portUp
+          ? `Listening on ws://0.0.0.0:${browserPort}${tail}`
+          : `Not listening on ${browserPort} — port bind failed or runtime old build${tail}`
+      });
+    } catch (err) {
+      checks.push({
+        name: 'Browser',
+        pass: false,
+        detail: `unknown: ${(err as Error).message}`
+      });
+    }
+  }
+
   // Persistent-memory checks (Build 28): open promise count, current
   // frame age, last frame transition, provisional/confirmed memory counts.
   // We collect them as info-only rows (always pass) so a missing DB
@@ -1522,5 +1567,84 @@ async function runDiagnostic(autoFix: boolean = false): Promise<void> {
     }
   }
 }
+
+// ── browser ────────────────────────────────────────────────────────────────
+//
+// Native BrowserBridge surface. The runtime exposes the bridge as a
+// direct tool — `browser.click()` etc. — and this command is the
+// operator's window into "is the arm currently attached to the brain?"
+// Reads the same provenance ledger the runtime writes to, so it works
+// without an in-process handle.
+
+const browserCmd = program.command('browser').description('ThunderBrowser native bridge — connection + last action');
+
+browserCmd
+  .command('status')
+  .description('Show extension connection, current URL, portal state, last action')
+  .action(() => {
+    const cfg = ensureConfig();
+    const browserPort = DEFAULT_BROWSER_BRIDGE_PORT;
+    const portUp = portOpen(browserPort);
+
+    console.log('⚡ ThunderBrowser Bridge Status');
+    console.log('═══════════════════════════════════════');
+    console.log(`  Listening:        ${portUp ? `✅ ws://0.0.0.0:${browserPort}` : `❌ port ${browserPort} not bound`}`);
+    if (!portUp) {
+      console.log('');
+      console.log('  Bridge listener not bound. Most likely causes:');
+      console.log('   • ThunderGate runtime is not running (run: thundergate start)');
+      console.log('   • Runtime is on an older build that predates the BrowserBridge wiring');
+      console.log('   • Port already in use by another process');
+      return;
+    }
+
+    let events: ProvenanceEvent[] = [];
+    try {
+      const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+      events = ledger.tail(500);
+    } catch {
+      // ledger missing → no history yet, fall through with empty events
+    }
+    const reversed = [...events].reverse();
+    const lastReady = reversed.find(
+      (e) => e.actor === 'browser-bridge' && e.action === 'extension_ready'
+    );
+    const lastDisc = reversed.find(
+      (e) => e.actor === 'browser-bridge' && e.action === 'extension_disconnected'
+    );
+    const lastAction = reversed.find(
+      (e) => e.actor === 'browser-bridge' && typeof e.action === 'string' && e.action.startsWith('browser_')
+    );
+
+    const connected =
+      lastReady != null &&
+      (lastDisc == null || lastDisc.timestamp < lastReady.timestamp);
+    console.log(`  Extension:        ${connected ? '✅ connected' : '❌ not connected'}`);
+
+    if (lastReady) {
+      const url = (lastReady.data as any)?.url ?? '';
+      const portalState = (lastReady.data as any)?.portalState ?? null;
+      console.log(`  Last ready:       ${formatLedgerAge(lastReady.timestamp)}`);
+      if (url) console.log(`  Current URL:      ${url}`);
+      if (portalState) console.log(`  Portal state:     ${portalState}`);
+    } else {
+      console.log('  Last ready:       (no extension has ever connected)');
+    }
+
+    if (lastDisc) {
+      console.log(`  Last disconnect:  ${formatLedgerAge(lastDisc.timestamp)}${lastDisc.reason ? ` — ${lastDisc.reason}` : ''}`);
+    }
+
+    if (lastAction) {
+      const verb = lastAction.action.replace(/^browser_/, '');
+      const data = (lastAction.data as any) || {};
+      const success = data.success === true ? '✅' : '❌';
+      const lat = typeof data.latencyMs === 'number' ? `${data.latencyMs}ms` : '?';
+      console.log(`  Last action:      ${success} ${verb}  (${lat}, ${formatLedgerAge(lastAction.timestamp)})`);
+      if (lastAction.reason) console.log(`     reason:        ${lastAction.reason}`);
+    } else {
+      console.log('  Last action:      (none recorded)');
+    }
+  });
 
 program.parse();

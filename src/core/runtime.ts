@@ -35,6 +35,7 @@ import { GhostEvaluator } from '../ghost/evaluator.js';
 import { getGhostSystemPrompt, setGhostContextDB } from '../ghost/context.js';
 import { WorldState, ProcessingMode } from '../world/state.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
+import { BrowserBridge, DEFAULT_BROWSER_BRIDGE_PORT } from '../browser/bridge.js';
 import { LocalInferenceProvider } from '../inference/local_provider.js';
 import { PromiseTracker } from '../memory/promises.js';
 import { FrameManager } from '../memory/frame.js';
@@ -70,6 +71,13 @@ export class ThunderGateRuntime {
   private world: WorldState;
   private provenance!: ProvenanceLedger;
   private localInference!: LocalInferenceProvider;
+  // Native runtime bridge to the ThunderBrowser extension. Listens on a
+  // dedicated port (default 8770) and exposes browser.click()/fill()/
+  // getState() as direct async calls — the brain commanding the arm.
+  // Unlike `BrowserBridgeChannel`, this is not a channel: there's no
+  // queueing, no per-peer audit chain, just request/response over a
+  // single live extension socket. Absence of an extension is a no-op.
+  private browser!: BrowserBridge;
   // Persistent-memory subsystems wired in Build 28 — promise tracker,
   // continuity frame manager, untrain audit, and the provisional-memory
   // promoter. All four read/write to context.db so they survive
@@ -115,6 +123,15 @@ export class ThunderGateRuntime {
 
   getProvenanceLedger(): ProvenanceLedger | undefined {
     return this.provenance;
+  }
+
+  /**
+   * Native BrowserBridge accessor. Used by tools/agents that want to
+   * drive the connected ThunderBrowser extension directly. Returns
+   * undefined only before `start()` has bound the listener.
+   */
+  getBrowser(): BrowserBridge | undefined {
+    return this.browser;
   }
 
   /** Accessors for CLI + Doctor. */
@@ -190,6 +207,27 @@ export class ThunderGateRuntime {
       console.log(`  ✓ Local inference probe started (${this.config.localInference.endpoint})`);
     } else {
       console.log('  ℹ Local inference disabled in config — staying on cloud mode');
+    }
+
+    // BrowserBridge — native runtime infrastructure for the ThunderBrowser
+    // extension. Comes up before Doctor so the first health tick already
+    // sees a stable listening/not-listening state. `start()` swallows bind
+    // failure (port in use → existing functionality keeps running, browser
+    // calls just see "not connected"). The Ghost Jon 7-day gate clock
+    // takes priority over any new feature errors.
+    this.browser = new BrowserBridge(this.world, this.provenance, {
+      port: DEFAULT_BROWSER_BRIDGE_PORT
+    });
+    try {
+      await this.browser.start();
+      const stats = this.browser.getStats();
+      if (stats.listening) {
+        console.log(`  ✓ BrowserBridge listening on ws://0.0.0.0:${stats.port} (extension dial-in)`);
+      } else {
+        console.log(`  ℹ BrowserBridge not listening on :${stats.port} — bind failed, see provenance (browser calls will fail-fast)`);
+      }
+    } catch (err) {
+      console.warn('  ⚠ BrowserBridge start error (non-fatal):', (err as Error).message);
     }
 
     // Start doctor monitoring
@@ -1068,6 +1106,10 @@ export class ThunderGateRuntime {
 
     // Stop local inference probe.
     try { this.localInference?.stop(); } catch { /* ignore */ }
+
+    // Stop the native BrowserBridge — closes the extension socket and
+    // rejects any in-flight commands so awaiting callers fail fast.
+    try { await this.browser?.stop(); } catch { /* ignore */ }
 
     // Stop channels — drain client connections.
     try { await this.channels.stopAll(); } catch { /* ignore */ }
