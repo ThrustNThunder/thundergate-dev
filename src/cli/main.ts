@@ -29,6 +29,12 @@ import { FrameManager } from '../memory/frame.js';
 import { UntrainService } from '../memory/untrain.js';
 import { ProvisionalMemoryService } from '../memory/provisional.js';
 import { MemoryWAL } from '../memory/wal.js';
+import {
+  VaultService,
+  VaultLockedError,
+  VaultBadPasswordError,
+  type VaultCategory
+} from '../vault/vault.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -769,6 +775,247 @@ frameCmd
       }
     });
   });
+
+// ── vault ─────────────────────────────────────────────────────────────────
+//
+// Encrypted PII store. vault.db is separate from context.db so a leak of
+// the chat database doesn't surrender SSNs/cards/medical IDs. Locked on
+// every CLI invocation; password unlock only (biometric path is stubbed
+// pending ThunderCommo iOS LocalAuthentication — see PROTOCOL_VAULT.md).
+
+async function withVault<T>(fn: (vault: VaultService) => Promise<T> | T): Promise<T> {
+  const cfg = ensureConfig();
+  const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+  const vault = new VaultService(ledger);
+  vault.initialize();
+  try {
+    return await fn(vault);
+  } finally {
+    vault.close();
+  }
+}
+
+const vaultCmd = program.command('vault').description('Encrypted PII vault — separate from context.db');
+
+vaultCmd
+  .command('status')
+  .description('Show lock state and TTL remaining')
+  .action(async () => {
+    await withVault(async (vault) => {
+      const s = vault.status();
+      console.log('⚡ Vault Status');
+      console.log('═══════════════════════════════════════');
+      console.log(`  DB path:     ${s.dbPath}`);
+      console.log(`  Entries:     ${s.entryCount}`);
+      console.log(`  State:       ${s.locked ? '🔒 LOCKED' : '🔓 UNLOCKED'}`);
+      if (!s.locked) {
+        const mins = Math.floor(s.ttlRemainingMs / 60000);
+        const secs = Math.floor((s.ttlRemainingMs % 60000) / 1000);
+        const unlockedTs = s.unlockedAt ? new Date(s.unlockedAt).toLocaleString() : '(unknown)';
+        console.log(`  Unlocked at: ${unlockedTs}`);
+        console.log(`  TTL left:    ${mins}m ${secs}s`);
+        console.log(`  Source:      ${s.source}`);
+      }
+    });
+  });
+
+vaultCmd
+  .command('add <category> <label>')
+  .description('Add a new entry (prompts for value). Categories: identity | financial | medical | auth')
+  .option('--value <text>', 'Provide value inline (skips prompt — use only for scripts/tests)')
+  .option('--password <text>', 'Vault password (otherwise prompted)')
+  .action(async (category: string, label: string, opts: { value?: string; password?: string }) => {
+    await withVault(async (vault) => {
+      if (!vault.isUnlocked()) {
+        const password = opts.password ?? (await promptHidden('Vault password: '));
+        try {
+          vault.unlock({ source: 'password', password });
+        } catch (err) {
+          if (err instanceof VaultBadPasswordError) {
+            console.error('  ✗ Bad password — vault stays locked.');
+            process.exit(1);
+          }
+          throw err;
+        }
+      }
+      const value = opts.value ?? (await promptHidden(`Value for '${label}': `));
+      try {
+        const id = vault.add(category, label, value);
+        console.log(`  ✓ Added ${category}:${label} (id ${id.slice(0, 8)})`);
+      } catch (err) {
+        console.error(`  ✗ Add failed: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+  });
+
+vaultCmd
+  .command('list')
+  .description('List labels (never values)')
+  .action(async () => {
+    await withVault(async (vault) => {
+      const rows = vault.list();
+      if (rows.length === 0) {
+        console.log('Vault is empty.');
+        return;
+      }
+      console.log(`Vault entries (${rows.length}):`);
+      let lastCategory = '';
+      for (const r of rows) {
+        if (r.category !== lastCategory) {
+          console.log(`\n  [${r.category}]`);
+          lastCategory = r.category;
+        }
+        const last = r.last_accessed_at
+          ? new Date(r.last_accessed_at * 1000).toLocaleString()
+          : 'never';
+        console.log(`    • ${r.label.padEnd(28)} (last access: ${last})`);
+      }
+    });
+  });
+
+vaultCmd
+  .command('unlock')
+  .description('Unlock the vault (password OR biometric stub via --biometric-token)')
+  .option('--password <text>', 'Vault password (otherwise prompted)')
+  .option('--biometric-token <text>', 'Approval token from paired device — uses biometric source')
+  .option('--ttl <minutes>', 'Session TTL in minutes', '30')
+  .action(async (opts: { password?: string; biometricToken?: string; ttl?: string }) => {
+    await withVault(async (vault) => {
+      const ttlMin = parseInt(opts.ttl ?? '30', 10);
+      const ttlMs = (Number.isFinite(ttlMin) && ttlMin > 0 ? ttlMin : 30) * 60 * 1000;
+      const password = opts.password ?? (await promptHidden('Vault password: '));
+      try {
+        if (opts.biometricToken) {
+          vault.unlock({
+            source: 'biometric',
+            password,
+            biometricToken: opts.biometricToken,
+            ttlMs
+          });
+        } else {
+          vault.unlock({ source: 'password', password, ttlMs });
+        }
+      } catch (err) {
+        if (err instanceof VaultBadPasswordError) {
+          console.error('  ✗ Bad password — vault stays locked.');
+          process.exit(1);
+        }
+        throw err;
+      }
+      const s = vault.status();
+      const mins = Math.floor(s.ttlRemainingMs / 60000);
+      console.log(`  ✓ Vault unlocked (${s.source}, ${mins}m TTL)`);
+    });
+  });
+
+vaultCmd
+  .command('lock')
+  .description('Force-lock immediately')
+  .action(async () => {
+    await withVault(async (vault) => {
+      vault.lock('cli');
+      console.log('  ✓ Vault locked');
+    });
+  });
+
+vaultCmd
+  .command('access <label>')
+  .description('Read a value (vault must be unlocked). Records the task in provenance.')
+  .requiredOption('--task <description>', 'What is this access for? Captured in the audit trail.')
+  .option('--task-id <id>', 'Optional task id for cross-referencing')
+  .option('--password <text>', 'Vault password if currently locked')
+  .action(async (label: string, opts: { task: string; taskId?: string; password?: string }) => {
+    await withVault(async (vault) => {
+      if (!vault.isUnlocked()) {
+        if (!opts.password) {
+          // Emit an unlock-request envelope so a paired device could
+          // respond. We still need an interactive password to proceed in
+          // CLI mode until the iOS biometric path lands.
+          const env = vault.buildUnlockRequest(opts.task, `cli access of ${label}`);
+          console.error(
+            `  ⚠ Vault is locked. Emitted vault_unlock_request ${env.request_id} ` +
+              '(paired device handler pending). Re-run with --password to unlock from the CLI.'
+          );
+          process.exit(2);
+        }
+        try {
+          vault.unlock({ source: 'password', password: opts.password });
+        } catch (err) {
+          if (err instanceof VaultBadPasswordError) {
+            console.error('  ✗ Bad password — vault stays locked.');
+            process.exit(1);
+          }
+          throw err;
+        }
+      }
+      try {
+        const value = vault.access({ label, task: opts.task, taskId: opts.taskId });
+        process.stdout.write(value);
+        if (process.stdout.isTTY) process.stdout.write('\n');
+      } catch (err) {
+        if (err instanceof VaultLockedError) {
+          console.error('  ✗ Vault locked between unlock and access (TTL expired).');
+          process.exit(1);
+        }
+        console.error(`  ✗ Access failed: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+  });
+
+/**
+ * Hidden-input prompt for passwords/secrets. Falls back to plain readline
+ * when stdin isn't a TTY (e.g., piped input in tests).
+ */
+async function promptHidden(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const line: string = await new Promise((resolve) => rl.question(prompt, resolve));
+    rl.close();
+    return line;
+  }
+  process.stdout.write(prompt);
+  return new Promise<string>((resolve, reject) => {
+    const chunks: string[] = [];
+    const stdin = process.stdin;
+    const onData = (buf: Buffer) => {
+      const s = buf.toString('utf8');
+      for (const ch of s) {
+        const code = ch.charCodeAt(0);
+        if (ch === '\r' || ch === '\n') {
+          stdin.setRawMode(false);
+          stdin.removeListener('data', onData);
+          stdin.pause();
+          process.stdout.write('\n');
+          resolve(chunks.join(''));
+          return;
+        }
+        if (code === 3) {
+          // Ctrl-C — abort
+          stdin.setRawMode(false);
+          stdin.removeListener('data', onData);
+          stdin.pause();
+          reject(new Error('aborted'));
+          return;
+        }
+        if (code === 127 || code === 8) {
+          // Backspace / DEL
+          if (chunks.length > 0) chunks.pop();
+          continue;
+        }
+        if (code < 32) {
+          // Other control chars — ignore
+          continue;
+        }
+        chunks.push(ch);
+      }
+    };
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('data', onData);
+  });
+}
 
 function truncate(s: string, n: number = 120): string {
   const flat = s.replace(/\s+/g, ' ').trim();
