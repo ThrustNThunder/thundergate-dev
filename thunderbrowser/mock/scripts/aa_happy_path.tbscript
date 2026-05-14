@@ -1,0 +1,15 @@
+# aa_happy_path — walks the AA fixture states end-to-end on the dev fixture
+# server (localhost:7860). No real AA traffic; precision-click on the confirm
+# button is simulated (Phase 2 will gate it on ThunderCommo).
+EXPECT_READY
+SEND_COMMAND navigate {"url":"http://localhost:7860/aa/dashboard","new_tab":true,"wait_for":"load"}
+EXPECT_EVENT cs_ready within 10s
+EXPECT_EVENT state_detected aa.dashboard within 10s
+SEND_COMMAND query {"tab_id":-1,"role":"link","name":"Travel planner"}
+SEND_COMMAND navigate {"url":"http://localhost:7860/aa/travel-planner","wait_for":"load"}
+EXPECT_EVENT state_detected aa.travel_planner_empty within 10s
+SEND_COMMAND navigate {"url":"http://localhost:7860/aa/travel-planner/results","wait_for":"load"}
+EXPECT_EVENT state_detected aa.search_results within 10s
+SEND_COMMAND navigate {"url":"http://localhost:7860/aa/travel-planner/confirm","wait_for":"load"}
+EXPECT_EVENT state_detected aa.confirm_review within 10s
+ASSERT no_errors

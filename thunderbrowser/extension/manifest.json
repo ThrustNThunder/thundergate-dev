@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "ThunderBrowser (dev)",
+  "version": "0.1.0",
+  "description": "ThunderGate's browser surface — DOM action dispatch with full audit trail. Dev build.",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "src/icons/icon-16.png",
+    "32": "src/icons/icon-32.png",
+    "48": "src/icons/icon-48.png",
+    "128": "src/icons/icon-128.png"
+  },
+  "background": {
+    "service_worker": "src/background/sw.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "src/icons/icon-16.png",
+      "32": "src/icons/icon-32.png",
+      "48": "src/icons/icon-48.png"
+    },
+    "default_title": "ThunderBrowser (dev)"
+  },
+  "options_page": "src/options/options.html",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "alarms",
+    "cookies",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "http://localhost:7860/*",
+    "https://*.aa.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["http://localhost:7860/*", "https://*.aa.com/*"],
+      "js": ["src/content/content.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

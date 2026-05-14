@@ -1,0 +1,157 @@
+{
+  "pack_id": "aa-v1",
+  "version": 1,
+  "description": "AA portal state pack — 9 fixture states + interstitial variants. Detectors are URL/DOM/text patterns scored against the live page.",
+  "states": [
+    {
+      "id": "aa.unauth",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/login(\\?|$|/)", "weight": 0.5 },
+        { "kind": "dom", "selector": "form[data-aa-login]", "weight": 0.4 },
+        { "kind": "text", "pattern": "sign in to your aadvantage account", "weight": 0.3 }
+      ],
+      "min_confidence": 0.5,
+      "expected_actions": ["snapshot_dom", "query", "is_logged_in"],
+      "exits": []
+    },
+    {
+      "id": "aa.dashboard",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/(dashboard|account)(\\?|$|/)", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-user]", "weight": 0.5 },
+        { "kind": "text", "pattern": "welcome.*aadvantage", "weight": 0.2 }
+      ],
+      "min_confidence": 0.8,
+      "expected_actions": ["click", "snapshot_dom", "query"],
+      "exits": [
+        { "to": "aa.travel_planner_empty", "trigger": "click on role=link name='Travel planner'" }
+      ]
+    },
+    {
+      "id": "aa.travel_planner_empty",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner(\\?|$|/)$", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-travel-planner]", "weight": 0.4 },
+        { "kind": "text", "pattern": "plan your trip|where to|origin", "weight": 0.2 }
+      ],
+      "min_confidence": 0.7,
+      "expected_actions": ["fill", "select", "click", "snapshot_dom"],
+      "exits": [
+        { "to": "aa.search_loading", "trigger": "click on role=button name='Search'" }
+      ]
+    },
+    {
+      "id": "aa.search_loading",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner/(searching|loading)", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-loading], .aa-search-spinner", "weight": 0.4 }
+      ],
+      "min_confidence": 0.7,
+      "expected_actions": ["detect_loading", "snapshot_dom"],
+      "exits": [
+        { "to": "aa.search_results", "trigger": "loading complete" }
+      ]
+    },
+    {
+      "id": "aa.search_results",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner/results", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-result-row]", "weight": 0.5 }
+      ],
+      "min_confidence": 0.8,
+      "expected_actions": ["click", "query", "scroll_to"],
+      "exits": [
+        { "to": "aa.fare_selection", "trigger": "click on role=button name=/select fare/i" }
+      ]
+    },
+    {
+      "id": "aa.fare_selection",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner/fare", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-fare-option]", "weight": 0.5 }
+      ],
+      "min_confidence": 0.8,
+      "expected_actions": ["click", "snapshot_dom"],
+      "exits": [
+        { "to": "aa.passenger_info", "trigger": "click continue" }
+      ]
+    },
+    {
+      "id": "aa.passenger_info",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner/passenger", "weight": 0.5 },
+        { "kind": "dom", "selector": "input[name=first_name], input[name=last_name]", "weight": 0.5 }
+      ],
+      "min_confidence": 0.8,
+      "expected_actions": ["fill", "click", "snapshot_dom"],
+      "exits": [
+        { "to": "aa.payment", "trigger": "click continue" }
+      ]
+    },
+    {
+      "id": "aa.payment",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner/payment", "weight": 0.5 },
+        { "kind": "dom", "selector": "input[autocomplete^=cc-]", "weight": 0.5 }
+      ],
+      "min_confidence": 0.8,
+      "expected_actions": ["snapshot_dom"],
+      "exits": [
+        { "to": "aa.confirm_review", "trigger": "michael fills payment + continue" }
+      ]
+    },
+    {
+      "id": "aa.confirm_review",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner/confirm", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-confirm-button]", "weight": 0.5 }
+      ],
+      "min_confidence": 0.8,
+      "expected_actions": ["snapshot_dom"],
+      "exits": [
+        { "to": "aa.confirmed", "trigger": "precision-click on data-aa-confirm-button (Phase 2: require_user_confirmation_for)" }
+      ]
+    },
+    {
+      "id": "aa.confirmed",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/travel-planner/confirmed", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-confirmation-code]", "weight": 0.5 }
+      ],
+      "min_confidence": 0.8,
+      "expected_actions": ["snapshot_dom", "get_text"],
+      "exits": []
+    },
+    {
+      "id": "aa.password_change",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/(password/change|security/password|password-expired)", "weight": 0.6 },
+        { "kind": "text", "pattern": "your password (has |is )?expired", "weight": 0.4 }
+      ],
+      "min_confidence": 0.6,
+      "expected_actions": ["snapshot_dom"],
+      "exits": []
+    },
+    {
+      "id": "aa.captcha_blocked",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/captcha", "weight": 0.4 },
+        { "kind": "dom", "selector": "iframe[src*=recaptcha], iframe[src*=hcaptcha], [data-aa-captcha]", "weight": 0.6 }
+      ],
+      "min_confidence": 0.6,
+      "expected_actions": ["snapshot_dom"],
+      "exits": []
+    },
+    {
+      "id": "aa.timeout",
+      "entry_detectors": [
+        { "kind": "url", "pattern": "/timeout", "weight": 0.3 },
+        { "kind": "text", "pattern": "session.*timed out|session has expired", "weight": 0.5 },
+        { "kind": "dom", "selector": "[data-aa-timeout-modal]", "weight": 0.3 }
+      ],
+      "min_confidence": 0.5,
+      "expected_actions": ["snapshot_dom"],
+      "exits": []
+    }
+  ]
+}

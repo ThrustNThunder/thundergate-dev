@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>ThunderBrowser — Options</title>
+    <style>
+      body { font: 14px -apple-system, BlinkMacSystemFont, sans-serif; max-width: 640px; margin: 24px auto; padding: 0 16px; }
+      h1 { font-size: 18px; }
+      label { display: block; margin: 12px 0 4px; font-weight: 600; }
+      input[type=text] { width: 100%; padding: 6px; font-family: monospace; }
+      button { padding: 6px 12px; }
+      .small { color: #666; font-size: 12px; }
+      pre { background: #f4f4f4; padding: 8px; overflow-x: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>ThunderBrowser — Options</h1>
+    <p class="small">Phase 0 + 1 dev build. Pairing flow lands in Phase 2; this page just configures the WSS endpoint and surfaces local audit state.</p>
+
+    <label for="endpoint">WSS endpoint</label>
+    <input id="endpoint" type="text" placeholder="ws://localhost:7861/browser">
+    <p class="small">Dev default: <code>ws://localhost:7861/browser</code> (mock TG). Real TG endpoint is configured at pairing time in Phase 2.</p>
+    <button id="save">Save</button>
+
+    <h2>Allowlist (read-only)</h2>
+    <pre id="allowlist"></pre>
+    <p class="small">Allowlist is enforced in code in Phase 1. Editable via this page in Phase 2; never editable via WSS push (design §7.4).</p>
+
+    <h2>Recent audit (last 10)</h2>
+    <pre id="audit">loading...</pre>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

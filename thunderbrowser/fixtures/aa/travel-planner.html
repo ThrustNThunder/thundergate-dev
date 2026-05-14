@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Travel planner — AA fixture</title>
+<style>body{font:14px sans-serif;max-width:720px;margin:32px auto;padding:0 16px}label{display:block;margin:12px 0 4px}input,select{padding:6px}button{margin-top:16px;padding:8px 16px}</style></head>
+<body data-aa-travel-planner>
+  <h1>Plan your trip</h1>
+  <p>Where to today?</p>
+  <form>
+    <label>Origin</label>
+    <input name="origin" placeholder="MIA">
+    <label>Destination</label>
+    <input name="destination" placeholder="DFW">
+    <label>Date</label>
+    <input name="date" type="date">
+    <button type="button" onclick="location.href='/aa/travel-planner/results'">Search</button>
+  </form>
+</body>
+</html>

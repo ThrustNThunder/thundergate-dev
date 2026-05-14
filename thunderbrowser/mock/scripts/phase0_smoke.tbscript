@@ -1,0 +1,4 @@
+# Phase 0 smoke — verifies WSS handshake and heartbeat liveness.
+EXPECT_READY
+SLEEP 1000
+ASSERT no_errors

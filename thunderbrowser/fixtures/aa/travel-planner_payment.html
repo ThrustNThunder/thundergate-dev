@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Payment — AA fixture</title></head>
+<body>
+  <h1>Payment</h1>
+  <p>Card on file — last 4: 4242</p>
+  <form>
+    <label>Card number</label><input autocomplete="cc-number" name="cardnumber">
+    <label>CVV</label><input autocomplete="cc-csc" name="cvv">
+  </form>
+  <p><em>The extension should never fill this surface — payment is owner-only.</em></p>
+  <button onclick="location.href='/aa/travel-planner/confirm'">Continue (dev shortcut)</button>
+</body>
+</html>

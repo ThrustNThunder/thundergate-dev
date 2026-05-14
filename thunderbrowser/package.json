@@ -1,0 +1,21 @@
+{
+  "name": "thunderbrowser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ThunderBrowser — ThunderGate's browser surface. Chrome MV3 extension + WSS bridge + mock TG + AA/PBS fixtures.",
+  "scripts": {
+    "bridge": "node bridge/server.mjs",
+    "mock": "node mock/tg-mock.mjs",
+    "mock:smoke": "node mock/tg-mock.mjs mock/scripts/phase0_smoke.tbscript",
+    "fixtures": "node fixtures/server.mjs",
+    "dev-chrome": "scripts/dev-chrome.sh",
+    "test:smoke": "node tests/smoke.mjs",
+    "test:state-pack": "node tests/state-pack.test.mjs",
+    "test:bridge": "node tests/bridge.e2e.mjs",
+    "test": "node tests/smoke.mjs && node tests/state-pack.test.mjs && node tests/bridge.e2e.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.20.1"
+  }
+}

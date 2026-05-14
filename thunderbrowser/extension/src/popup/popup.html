@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>ThunderBrowser</title>
+    <style>
+      body { font: 13px -apple-system, BlinkMacSystemFont, sans-serif; width: 280px; margin: 0; padding: 12px; background: #fff8d6; color: #222; }
+      h1 { font-size: 14px; margin: 0 0 10px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+      .pill.ok { background: #d4f7c5; color: #1a5a1a; }
+      .pill.bad { background: #f7c5c5; color: #5a1a1a; }
+      .pill.paused { background: #ffe6a8; color: #6a4500; }
+      .row { margin: 8px 0; }
+      .small { color: #666; font-size: 11px; }
+      button { padding: 6px 10px; margin-right: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>ThunderBrowser (dev)</h1>
+    <div class="row">Status: <span id="status" class="pill bad">disconnected</span></div>
+    <div class="row small" id="endpoint"></div>
+    <div class="row small" id="queue"></div>
+    <div class="row">
+      <button id="reconnect">Reconnect</button>
+      <button id="pause">Pause</button>
+      <button id="options">Options</button>
+    </div>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
