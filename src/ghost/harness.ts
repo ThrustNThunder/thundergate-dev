@@ -114,8 +114,13 @@ export type GhostResponder = (
 export interface StateSnapshotSource {
   /** Latest weighted score + sample count for *today*. */
   ghostScore?: () => { weightedScore: number; samples: number; matchRate: number } | null;
-  /** WAL counters: hot rows, last rotation epoch ms. */
-  walStats?: () => { hotRows: number; lastRotationAt: number | null } | null;
+  /** WAL counters: hot rows, unplayed rows, oldest unplayed age, last rotation epoch ms. */
+  walStats?: () => {
+    hotRows: number;
+    unplayedRows: number;
+    oldestUnplayedAgeMs: number | null;
+    lastRotationAt: number | null;
+  } | null;
   /** Count of currently open promises. */
   openPromiseCount?: () => number | null;
   /** Current frame topic + status (e.g. "ghost-tier1 / ACTIVE"). */
@@ -333,7 +338,14 @@ export function buildStateSnapshot(
     const rot = w.lastRotationAt
       ? `${Math.round((now - w.lastRotationAt) / 60_000)}m ago`
       : 'never';
-    return `- wal: hot_rows=${w.hotRows} last_rotation=${rot}`;
+    const oldest =
+      w.oldestUnplayedAgeMs != null
+        ? `${Math.round(w.oldestUnplayedAgeMs / 60_000)}m`
+        : 'n/a';
+    return (
+      `- wal: hot_rows=${w.hotRows} unplayed=${w.unplayedRows} ` +
+      `oldest_unplayed=${oldest} last_rotation=${rot}`
+    );
   };
 
   const promiseLine = (): string | null => {

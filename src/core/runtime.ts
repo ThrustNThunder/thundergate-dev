@@ -645,7 +645,12 @@ export class ThunderGateRuntime {
         try {
           if (!this.wal) return null;
           const s = this.wal.stats();
-          return { hotRows: s.hotRows, lastRotationAt: s.lastRotationAt };
+          return {
+            hotRows: s.hotRows,
+            unplayedRows: s.unplayedRows,
+            oldestUnplayedAgeMs: s.oldestUnplayedAgeMs,
+            lastRotationAt: s.lastRotationAt
+          };
         } catch {
           return null;
         }
