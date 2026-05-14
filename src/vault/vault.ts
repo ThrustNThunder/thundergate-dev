@@ -1,13 +1,19 @@
 /**
  * VaultService — encrypted PII store, separate from context.db.
  *
- * The vault holds high-sensitivity values (SSNs, cards, medical IDs,
- * passwords) that the agent should be able to read only after the user
- * has actively unlocked the store. Database lives at
- *   ~/.thundergate/vault.db
- * with a sibling salt file
- *   ~/.thundergate/vault.salt
- * holding the per-vault PBKDF2 salt.
+ * Architecture (Burt's separation):
+ *   - ThunderGate executes.
+ *   - Vault constrains: every read is gated by a Grant (scoped, expiring,
+ *     purpose-bound, channel-bound, agent-bound) and produces a hash-chained
+ *     Receipt. Sensitive values never enter the provenance ledger.
+ *   - BYOAA authorizes: the GrantAuthorizer seam decides whether a grant
+ *     may be issued (today, the local authorizer is permissive but enforces
+ *     "raw requires policy reason"). Future BYOAA flows plug in here.
+ *   - Receipts prove: every disclosure writes a hash-chained receipt
+ *     (SHA-256 of the prior receipt) to vault_receipts.
+ *
+ * Database lives at ~/.thundergate/vault.db with a sibling salt file
+ * ~/.thundergate/vault.salt holding the per-vault PBKDF2 salt.
  *
  * Lock model:
  *   - Locked on every process start. The derived key only exists in memory
@@ -15,12 +21,14 @@
  *   - Unlock requires the vault password OR a biometric approval signal
  *     relayed from a paired device (vault_unlock_approval — see
  *     PROTOCOL_VAULT.md).
- *   - Default session TTL: 30 minutes. Each access() re-checks expiry.
+ *   - Default session TTL: 30 minutes. Each access re-checks expiry.
  *
  * Audit:
- *   - Every add/access/unlock/lock/touch writes a ProvenanceLedger row
- *     keyed by the supplied task description so the post-hoc question
- *     "why did the agent read this field?" has a real answer.
+ *   - issueGrant / accessWithGrant / unlock / lock / add write a
+ *     ProvenanceLedger row carrying grant_id, receipt_id, purpose,
+ *     channel, agent_id — never the sensitive value itself.
+ *   - Hash-chained receipts in vault_receipts give the durable, tamper-
+ *     evident trail; provenance is the convenience index.
  */
 
 import Database, { type Database as Db } from 'better-sqlite3';
@@ -33,14 +41,18 @@ import {
 } from 'fs';
 import { dirname, join } from 'path';
 import * as os from 'os';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import type { ProvenanceLedger } from '../provenance/ledger.js';
 import {
+  canonicalStringify,
   decrypt,
   deriveKey,
   encrypt,
   generateSalt,
-  keysEqual
+  hexEqual,
+  hmacHex,
+  keysEqual,
+  sha256Hex
 } from './crypto.js';
 
 export type VaultCategory = 'identity' | 'financial' | 'medical' | 'auth';
@@ -87,6 +99,114 @@ export interface UnlockOptions {
   ttlMs?: number;
 }
 
+/**
+ * Disclosure mode bound to every Grant.
+ *   - 'claim'         : returns proof of presence (no value, no fingerprint).
+ *                       Default. Use this for "the agent needs to know the
+ *                       user has an SSN on file" without releasing it.
+ *   - 'blinded_match' : caller commits to a candidate via
+ *                       HMAC(candidate, grant.nonce); vault returns whether
+ *                       the stored value matches. No plaintext leaves.
+ *   - 'raw'           : returns plaintext. Exceptional path — the issuing
+ *                       authorizer must accept an explicit policy reason,
+ *                       and the receipt records the mode.
+ */
+export type DisclosureMode = 'claim' | 'blinded_match' | 'raw';
+
+const VALID_DISCLOSURE_MODES: ReadonlySet<DisclosureMode> = new Set([
+  'claim',
+  'blinded_match',
+  'raw'
+]);
+
+export interface Grant {
+  grant_id: string;
+  user: string;
+  agent_id: string;
+  channel: string;
+  purpose: string;
+  field_label: string;
+  disclosure_mode: DisclosureMode;
+  ttl_ms: number;
+  granted_at: number;     // epoch ms
+  expires_at: number;     // epoch ms (granted_at + ttl_ms)
+  nonce: string;          // hex; binds blinded_match HMACs to this grant
+  policy_hash: string;    // identifier of the policy that authorized issuance
+}
+
+export interface IssueGrantOptions {
+  user: string;
+  agent_id: string;
+  channel: string;
+  purpose: string;
+  field_label: string;
+  ttl_ms: number;
+  disclosure_mode?: DisclosureMode;     // default 'claim'
+  raw_policy_reason?: string;            // required when disclosure_mode === 'raw'
+  policy_hash?: string;                  // optional override (BYOAA pin)
+}
+
+export interface Receipt {
+  receipt_id: string;
+  grant_id: string;
+  field_label: string;
+  purpose: string;
+  disclosure_mode: DisclosureMode;
+  accessed_at: number;
+  agent_id: string;
+  channel: string;
+  previous_receipt_hash: string | null;
+  receipt_hash: string;   // SHA-256 over canonical(receipt - this field)
+}
+
+export type AccessResponse =
+  | { mode: 'raw'; receipt_id: string; grant_id: string; value: string }
+  | { mode: 'claim'; receipt_id: string; grant_id: string; has_value: true }
+  | {
+      mode: 'blinded_match';
+      receipt_id: string;
+      grant_id: string;
+      matches: boolean;
+    };
+
+export interface AccessRequest {
+  grant: Grant;
+  /** Required when grant.disclosure_mode === 'blinded_match'. Hex HMAC of the
+   *  candidate value keyed by the grant's nonce. */
+  candidate_hmac?: string;
+}
+
+/**
+ * BYOAA seam. Authorizers decide whether a Grant may be issued at all and
+ * stamp it with a policy_hash that the receipt later cites. The local
+ * implementation is permissive but enforces the one non-negotiable: 'raw'
+ * disclosure requires an explicit policy reason from the caller.
+ */
+export interface GrantAuthorizer {
+  authorize(req: IssueGrantOptions): { allowed: true; policy_hash: string } | { allowed: false; reason: string };
+}
+
+export class LocalGrantAuthorizer implements GrantAuthorizer {
+  authorize(req: IssueGrantOptions): { allowed: true; policy_hash: string } | { allowed: false; reason: string } {
+    const mode: DisclosureMode = req.disclosure_mode ?? 'claim';
+    if (mode === 'raw' && (!req.raw_policy_reason || req.raw_policy_reason.trim().length === 0)) {
+      return {
+        allowed: false,
+        reason: 'raw disclosure requires an explicit raw_policy_reason'
+      };
+    }
+    if (req.ttl_ms <= 0) {
+      return { allowed: false, reason: 'ttl_ms must be positive' };
+    }
+    if (req.ttl_ms > 24 * 60 * 60 * 1000) {
+      return { allowed: false, reason: 'ttl_ms must not exceed 24h on the local authorizer' };
+    }
+    const policyTag = mode === 'raw' ? `local:raw(${req.raw_policy_reason})` : `local:${mode}`;
+    return { allowed: true, policy_hash: sha256Hex(policyTag) };
+  }
+}
+
+/** @deprecated retained only for the unlock protocol envelope. */
 export interface AccessOptions {
   label: string;
   task: string;                  // free-text, recorded in provenance
@@ -116,6 +236,41 @@ CREATE TABLE IF NOT EXISTS vault (
 
 CREATE INDEX IF NOT EXISTS idx_vault_label ON vault(label);
 CREATE INDEX IF NOT EXISTS idx_vault_category ON vault(category);
+
+CREATE TABLE IF NOT EXISTS vault_grants (
+  grant_id TEXT PRIMARY KEY,
+  user TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  field_label TEXT NOT NULL,
+  disclosure_mode TEXT NOT NULL,
+  ttl_ms INTEGER NOT NULL,
+  granted_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  nonce TEXT NOT NULL,
+  policy_hash TEXT NOT NULL,
+  revoked_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_grants_field ON vault_grants(field_label);
+CREATE INDEX IF NOT EXISTS idx_vault_grants_expires ON vault_grants(expires_at);
+
+CREATE TABLE IF NOT EXISTS vault_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  grant_id TEXT NOT NULL,
+  field_label TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  disclosure_mode TEXT NOT NULL,
+  accessed_at INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  previous_receipt_hash TEXT,
+  receipt_hash TEXT NOT NULL UNIQUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_receipts_grant ON vault_receipts(grant_id);
+CREATE INDEX IF NOT EXISTS idx_vault_receipts_accessed ON vault_receipts(accessed_at);
 `;
 
 interface UnlockedSession {
@@ -140,20 +295,29 @@ export class VaultBadPasswordError extends Error {
   }
 }
 
+export class VaultGrantError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VaultGrantError';
+  }
+}
+
 export class VaultService {
   private db!: Db;
   private salt!: Buffer;
   private session: UnlockedSession | null = null;
   private readonly dbPath: string;
   private readonly saltPath: string;
+  private readonly authorizer: GrantAuthorizer;
 
   constructor(
     private readonly ledger: ProvenanceLedger,
-    options: { dbPath?: string; saltPath?: string } = {}
+    options: { dbPath?: string; saltPath?: string; authorizer?: GrantAuthorizer } = {}
   ) {
     const home = os.homedir();
     this.dbPath = options.dbPath ?? join(home, '.thundergate', 'vault.db');
     this.saltPath = options.saltPath ?? join(home, '.thundergate', 'vault.salt');
+    this.authorizer = options.authorizer ?? new LocalGrantAuthorizer();
   }
 
   /**
@@ -352,47 +516,349 @@ export class VaultService {
   }
 
   /**
-   * Read the plaintext for a labeled entry. Vault must be unlocked. Every
-   * call writes a provenance row carrying the supplied task description
-   * so callers can later answer "why was this field accessed?".
+   * Issue a scoped, expiring, purpose-bound, channel-bound, agent-bound
+   * Grant. The authorizer (BYOAA seam) decides whether issuance is
+   * allowed and stamps the policy_hash. The grant is written to
+   * vault_grants and the returned object is the only thing the caller
+   * needs to later access the field through accessWithGrant().
+   *
+   * Sensitive value is NOT loaded here — issuance does not require an
+   * unlocked vault, only a label that exists.
    */
-  access(opts: AccessOptions): string {
-    const live = this.requireUnlocked();
-    if (!opts.task || opts.task.trim().length === 0) {
-      throw new Error('access task description required');
+  issueGrant(opts: IssueGrantOptions): Grant {
+    if (!opts.user || opts.user.trim().length === 0) throw new VaultGrantError('user required');
+    if (!opts.agent_id || opts.agent_id.trim().length === 0) throw new VaultGrantError('agent_id required');
+    if (!opts.channel || opts.channel.trim().length === 0) throw new VaultGrantError('channel required');
+    if (!opts.purpose || opts.purpose.trim().length === 0) throw new VaultGrantError('purpose required');
+    if (!opts.field_label || opts.field_label.trim().length === 0) throw new VaultGrantError('field_label required');
+    const mode: DisclosureMode = opts.disclosure_mode ?? 'claim';
+    if (!VALID_DISCLOSURE_MODES.has(mode)) {
+      throw new VaultGrantError(`invalid disclosure_mode '${mode}'`);
     }
+    const exists = this.db
+      .prepare(`SELECT 1 AS hit FROM vault WHERE label = ? LIMIT 1`)
+      .get(opts.field_label) as { hit: number } | undefined;
+    if (!exists) throw new VaultGrantError(`no vault entry with label: ${opts.field_label}`);
+
+    const decision = this.authorizer.authorize({ ...opts, disclosure_mode: mode });
+    if (!decision.allowed) {
+      this.ledger.append({
+        actor: 'vault',
+        action: 'grant_denied',
+        target: opts.field_label,
+        reason: decision.reason,
+        data: {
+          user: opts.user,
+          agent_id: opts.agent_id,
+          channel: opts.channel,
+          purpose: opts.purpose,
+          disclosure_mode: mode
+        }
+      });
+      throw new VaultGrantError(`grant denied: ${decision.reason}`);
+    }
+
+    const now = Date.now();
+    const grant: Grant = {
+      grant_id: randomUUID(),
+      user: opts.user,
+      agent_id: opts.agent_id,
+      channel: opts.channel,
+      purpose: opts.purpose,
+      field_label: opts.field_label,
+      disclosure_mode: mode,
+      ttl_ms: opts.ttl_ms,
+      granted_at: now,
+      expires_at: now + opts.ttl_ms,
+      nonce: randomBytesHex(16),
+      policy_hash: opts.policy_hash ?? decision.policy_hash
+    };
+
+    this.db
+      .prepare(
+        `INSERT INTO vault_grants (
+           grant_id, user, agent_id, channel, purpose, field_label,
+           disclosure_mode, ttl_ms, granted_at, expires_at, nonce, policy_hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        grant.grant_id,
+        grant.user,
+        grant.agent_id,
+        grant.channel,
+        grant.purpose,
+        grant.field_label,
+        grant.disclosure_mode,
+        grant.ttl_ms,
+        grant.granted_at,
+        grant.expires_at,
+        grant.nonce,
+        grant.policy_hash
+      );
+
+    this.ledger.append({
+      actor: 'vault',
+      action: 'grant_issued',
+      target: grant.field_label,
+      reason: grant.purpose,
+      data: {
+        grant_id: grant.grant_id,
+        user: grant.user,
+        agent_id: grant.agent_id,
+        channel: grant.channel,
+        disclosure_mode: grant.disclosure_mode,
+        ttl_ms: grant.ttl_ms,
+        expires_at: grant.expires_at,
+        policy_hash: grant.policy_hash
+      }
+    });
+    return grant;
+  }
+
+  /** Look up a grant by id. Returns null if unknown. Does NOT validate expiry. */
+  getGrant(grant_id: string): Grant | null {
     const row = this.db
       .prepare(
-        `SELECT id, encrypted_value FROM vault WHERE label = ? LIMIT 1`
+        `SELECT grant_id, user, agent_id, channel, purpose, field_label,
+                disclosure_mode, ttl_ms, granted_at, expires_at, nonce,
+                policy_hash, revoked_at
+         FROM vault_grants WHERE grant_id = ? LIMIT 1`
       )
-      .get(opts.label) as { id: string; encrypted_value: string } | undefined;
-    if (!row) throw new Error(`no vault entry with label: ${opts.label}`);
+      .get(grant_id) as
+      | (Omit<Grant, 'disclosure_mode'> & {
+          disclosure_mode: string;
+          revoked_at: number | null;
+        })
+      | undefined;
+    if (!row) return null;
+    if (row.revoked_at !== null) return null;
+    return {
+      grant_id: row.grant_id,
+      user: row.user,
+      agent_id: row.agent_id,
+      channel: row.channel,
+      purpose: row.purpose,
+      field_label: row.field_label,
+      disclosure_mode: row.disclosure_mode as DisclosureMode,
+      ttl_ms: row.ttl_ms,
+      granted_at: row.granted_at,
+      expires_at: row.expires_at,
+      nonce: row.nonce,
+      policy_hash: row.policy_hash
+    };
+  }
+
+  /**
+   * Access a vault entry under a previously issued grant. Validates scope
+   * (grant.field_label === field_label), expiry, and disclosure mode, then
+   * decrypts and shapes the response. Writes a hash-chained Receipt and a
+   * value-free provenance row. Vault must be unlocked.
+   */
+  accessWithGrant(
+    grant_id: string,
+    field_label: string,
+    candidate_hmac?: string
+  ): AccessResponse {
+    const grant = this.getGrant(grant_id);
+    if (!grant) throw new VaultGrantError(`unknown or revoked grant: ${grant_id}`);
+    return this.access({ grant, candidate_hmac });
+  }
+
+  /**
+   * Access using an inlined Grant object (e.g., the value just returned
+   * by issueGrant). Equivalent to accessWithGrant after a getGrant(),
+   * but skips the round-trip when the caller already holds the row.
+   */
+  access(req: AccessRequest): AccessResponse {
+    const live = this.requireUnlocked();
+    const { grant, candidate_hmac } = req;
+    if (!grant || !grant.grant_id) throw new VaultGrantError('grant required');
+    // Re-load the grant from disk to defeat caller-side mutation; the
+    // on-disk row is the source of truth for scope + expiry.
+    const stored = this.getGrant(grant.grant_id);
+    if (!stored) throw new VaultGrantError(`unknown or revoked grant: ${grant.grant_id}`);
+    if (stored.field_label !== grant.field_label) {
+      throw new VaultGrantError('grant scope mismatch (field_label)');
+    }
+
+    const now = Date.now();
+    if (now >= stored.expires_at) {
+      this.ledger.append({
+        actor: 'vault',
+        action: 'access_denied',
+        target: stored.field_label,
+        reason: 'grant_expired',
+        data: { grant_id: stored.grant_id, expires_at: stored.expires_at }
+      });
+      throw new VaultGrantError(`grant expired at ${new Date(stored.expires_at).toISOString()}`);
+    }
+
+    if (stored.disclosure_mode === 'blinded_match') {
+      if (!candidate_hmac || candidate_hmac.length === 0) {
+        throw new VaultGrantError('blinded_match grants require candidate_hmac');
+      }
+    }
+
+    const row = this.db
+      .prepare(`SELECT id, encrypted_value FROM vault WHERE label = ? LIMIT 1`)
+      .get(stored.field_label) as { id: string; encrypted_value: string } | undefined;
+    if (!row) throw new VaultGrantError(`no vault entry with label: ${stored.field_label}`);
+
     let plaintext: string;
     try {
       plaintext = decrypt(row.encrypted_value, live.key);
-    } catch (err) {
+    } catch {
       this.ledger.append({
         actor: 'vault',
         action: 'access_failed',
-        target: opts.label,
-        reason: opts.task,
-        data: { id: row.id, taskId: opts.taskId, error: (err as Error).message }
+        target: stored.field_label,
+        reason: 'decrypt_failed',
+        data: { grant_id: stored.grant_id, id: row.id }
       });
       throw new VaultBadPasswordError(
-        `decrypt failed for ${opts.label} — likely wrong password since unlock`
+        `decrypt failed for ${stored.field_label} — likely wrong password since unlock`
       );
     }
+
     this.db
       .prepare(`UPDATE vault SET last_accessed_at = ? WHERE id = ?`)
       .run(Date.now() / 1000, row.id);
+
+    const receipt = this.appendReceipt(stored);
+
+    let response: AccessResponse;
+    switch (stored.disclosure_mode) {
+      case 'raw':
+        response = {
+          mode: 'raw',
+          receipt_id: receipt.receipt_id,
+          grant_id: stored.grant_id,
+          value: plaintext
+        };
+        break;
+      case 'claim':
+        response = {
+          mode: 'claim',
+          receipt_id: receipt.receipt_id,
+          grant_id: stored.grant_id,
+          has_value: true
+        };
+        break;
+      case 'blinded_match': {
+        const expected = hmacHex(stored.nonce, plaintext);
+        const matches =
+          candidate_hmac!.length === expected.length &&
+          /^[0-9a-f]+$/i.test(candidate_hmac!) &&
+          hexEqual(candidate_hmac!, expected);
+        response = {
+          mode: 'blinded_match',
+          receipt_id: receipt.receipt_id,
+          grant_id: stored.grant_id,
+          matches
+        };
+        break;
+      }
+    }
+
+    // Wipe plaintext from this scope before returning. raw mode hands it
+    // to the caller, but in claim/blinded_match it must not linger.
+    if (stored.disclosure_mode !== 'raw') {
+      plaintext = '';
+    }
+
     this.ledger.append({
       actor: 'vault',
       action: 'access',
-      target: opts.label,
-      reason: opts.task,
-      data: { id: row.id, taskId: opts.taskId }
+      target: stored.field_label,
+      reason: stored.purpose,
+      data: {
+        grant_id: stored.grant_id,
+        receipt_id: receipt.receipt_id,
+        disclosure_mode: stored.disclosure_mode,
+        agent_id: stored.agent_id,
+        channel: stored.channel
+      }
     });
-    return plaintext;
+
+    return response;
+  }
+
+  /**
+   * Tail the receipt chain. Returns rows newest-first. Receipts only
+   * contain metadata (grant_id, field_label, purpose, mode, hashes); no
+   * sensitive value is stored or returned.
+   */
+  listReceipts(limit: number = 10): Receipt[] {
+    const rows = this.db
+      .prepare(
+        `SELECT receipt_id, grant_id, field_label, purpose, disclosure_mode,
+                accessed_at, agent_id, channel,
+                previous_receipt_hash, receipt_hash
+         FROM vault_receipts
+         ORDER BY accessed_at DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, Math.min(limit, 1000))) as Array<{
+        receipt_id: string;
+        grant_id: string;
+        field_label: string;
+        purpose: string;
+        disclosure_mode: string;
+        accessed_at: number;
+        agent_id: string;
+        channel: string;
+        previous_receipt_hash: string | null;
+        receipt_hash: string;
+      }>;
+    return rows.map((r) => ({
+      receipt_id: r.receipt_id,
+      grant_id: r.grant_id,
+      field_label: r.field_label,
+      purpose: r.purpose,
+      disclosure_mode: r.disclosure_mode as DisclosureMode,
+      accessed_at: r.accessed_at,
+      agent_id: r.agent_id,
+      channel: r.channel,
+      previous_receipt_hash: r.previous_receipt_hash,
+      receipt_hash: r.receipt_hash
+    }));
+  }
+
+  /**
+   * Verify the receipt chain end-to-end. Recomputes each receipt_hash and
+   * checks that previous_receipt_hash matches the prior row's hash.
+   * Returns the index of the first broken link, or null if intact.
+   */
+  verifyReceiptChain(): { ok: true } | { ok: false; broken_at_receipt_id: string; reason: string } {
+    const rows = this.db
+      .prepare(
+        `SELECT receipt_id, grant_id, field_label, purpose, disclosure_mode,
+                accessed_at, agent_id, channel,
+                previous_receipt_hash, receipt_hash
+         FROM vault_receipts
+         ORDER BY accessed_at ASC, rowid ASC`
+      )
+      .all() as Array<Receipt>;
+    let prev: string | null = null;
+    for (const r of rows) {
+      if ((r.previous_receipt_hash ?? null) !== prev) {
+        return {
+          ok: false,
+          broken_at_receipt_id: r.receipt_id,
+          reason: 'previous_receipt_hash mismatch'
+        };
+      }
+      const expected = computeReceiptHash(r);
+      if (!hexEqual(expected, r.receipt_hash)) {
+        return {
+          ok: false,
+          broken_at_receipt_id: r.receipt_id,
+          reason: 'receipt_hash recomputation mismatch'
+        };
+      }
+      prev = r.receipt_hash;
+    }
+    return { ok: true };
   }
 
   /**
@@ -426,6 +892,59 @@ export class VaultService {
   }
 
   // ── internals ──────────────────────────────────────────────────────────
+
+  /**
+   * Persist a hash-chained receipt for a successful access. The chain head
+   * is whichever receipt has the highest accessed_at — we read its
+   * receipt_hash and use it as previous_receipt_hash. UNIQUE on
+   * receipt_hash defends against duplicate insertion racing the read.
+   */
+  private appendReceipt(grant: Grant): Receipt {
+    const head = this.db
+      .prepare(
+        `SELECT receipt_hash FROM vault_receipts
+         ORDER BY accessed_at DESC, rowid DESC LIMIT 1`
+      )
+      .get() as { receipt_hash: string } | undefined;
+    const previous_receipt_hash = head ? head.receipt_hash : null;
+
+    const partial: Omit<Receipt, 'receipt_hash'> = {
+      receipt_id: randomUUID(),
+      grant_id: grant.grant_id,
+      field_label: grant.field_label,
+      purpose: grant.purpose,
+      disclosure_mode: grant.disclosure_mode,
+      accessed_at: Date.now(),
+      agent_id: grant.agent_id,
+      channel: grant.channel,
+      previous_receipt_hash
+    };
+    const receipt: Receipt = {
+      ...partial,
+      receipt_hash: computeReceiptHash(partial)
+    };
+
+    this.db
+      .prepare(
+        `INSERT INTO vault_receipts (
+           receipt_id, grant_id, field_label, purpose, disclosure_mode,
+           accessed_at, agent_id, channel, previous_receipt_hash, receipt_hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        receipt.receipt_id,
+        receipt.grant_id,
+        receipt.field_label,
+        receipt.purpose,
+        receipt.disclosure_mode,
+        receipt.accessed_at,
+        receipt.agent_id,
+        receipt.channel,
+        receipt.previous_receipt_hash,
+        receipt.receipt_hash
+      );
+    return receipt;
+  }
 
   private openSession(
     key: Buffer,
@@ -493,4 +1012,30 @@ function fingerprint(token: string): string {
     h = ((h << 5) - h + token.charCodeAt(i)) | 0;
   }
   return h.toString(16);
+}
+
+function randomBytesHex(n: number): string {
+  return randomBytes(n).toString('hex');
+}
+
+/**
+ * Receipt hash = SHA-256 over canonical JSON of the receipt minus the
+ * receipt_hash field itself. Verification recomputes and compares so any
+ * mutation of the row (or of the prior link) is detectable.
+ */
+export function computeReceiptHash(r: Omit<Receipt, 'receipt_hash'> | Receipt): string {
+  const { receipt_id, grant_id, field_label, purpose, disclosure_mode,
+          accessed_at, agent_id, channel, previous_receipt_hash } = r;
+  const canonical = canonicalStringify({
+    receipt_id,
+    grant_id,
+    field_label,
+    purpose,
+    disclosure_mode,
+    accessed_at,
+    agent_id,
+    channel,
+    previous_receipt_hash
+  });
+  return sha256Hex(canonical);
 }

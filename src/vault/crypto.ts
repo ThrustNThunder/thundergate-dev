@@ -17,6 +17,8 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHash,
+  createHmac,
   pbkdf2Sync,
   randomBytes,
   timingSafeEqual
@@ -93,6 +95,47 @@ export function decrypt(blob: string, key: Buffer): string {
 export function keysEqual(a: Buffer, b: Buffer): boolean {
   if (a.length !== b.length) return false;
   return timingSafeEqual(a, b);
+}
+
+/**
+ * Stable JSON serializer — sorts object keys recursively so two equivalent
+ * objects always produce identical bytes. Receipts are hash-chained, so a
+ * non-canonical encoder would break verification on re-serialize.
+ */
+export function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return '[' + value.map((v) => canonicalStringify(v)).join(',') + ']';
+  }
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  const parts: string[] = [];
+  for (const k of keys) {
+    const v = (value as Record<string, unknown>)[k];
+    if (v === undefined) continue;
+    parts.push(JSON.stringify(k) + ':' + canonicalStringify(v));
+  }
+  return '{' + parts.join(',') + '}';
+}
+
+/** SHA-256 hex of arbitrary bytes/string. Used for receipt-chain links. */
+export function sha256Hex(input: string | Buffer): string {
+  return createHash('sha256').update(input).digest('hex');
+}
+
+/**
+ * HMAC-SHA-256 hex. Used for blinded_match disclosure: caller commits to a
+ * candidate value via HMAC(candidate, grant_nonce); vault recomputes
+ * HMAC(plaintext, grant_nonce) and timing-safe-compares. Plaintext never
+ * leaves the vault on this path.
+ */
+export function hmacHex(key: string | Buffer, message: string | Buffer): string {
+  return createHmac('sha256', key).update(message).digest('hex');
+}
+
+/** Constant-time hex string equality. */
+export function hexEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 }
 
 export const _internals = {

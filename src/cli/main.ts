@@ -33,7 +33,9 @@ import {
   VaultService,
   VaultLockedError,
   VaultBadPasswordError,
-  type VaultCategory
+  VaultGrantError,
+  type VaultCategory,
+  type DisclosureMode
 } from '../vault/vault.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -921,18 +923,39 @@ vaultCmd
 
 vaultCmd
   .command('access <label>')
-  .description('Read a value (vault must be unlocked). Records the task in provenance.')
-  .requiredOption('--task <description>', 'What is this access for? Captured in the audit trail.')
-  .option('--task-id <id>', 'Optional task id for cross-referencing')
+  .description(
+    'Read under a one-shot grant (vault must be unlocked). Default mode is claim ' +
+      '(presence proof, no value). Use --raw with --policy-reason to emit plaintext.'
+  )
+  .requiredOption('--purpose <text>', 'Why is this access happening? Bound into the grant + receipt.')
+  .option('--channel <name>', 'ThunderGate channel that requested the access', 'cli')
+  .option('--agent-id <id>', 'Agent runtime id (defaults to "cli:<user>")')
+  .option('--user <name>', 'Principal user (defaults to $USER)')
+  .option('--ttl <seconds>', 'Grant TTL in seconds for this single access', '60')
+  .option('--mode <mode>', 'Disclosure mode: claim | raw | blinded_match', 'claim')
+  .option('--raw', 'Shortcut for --mode raw (requires --policy-reason)')
+  .option('--policy-reason <text>', 'Required when mode is raw — the reason raw plaintext is justified.')
+  .option('--candidate-hmac <hex>', 'For blinded_match: HMAC of the candidate keyed by grant.nonce.')
   .option('--password <text>', 'Vault password if currently locked')
-  .action(async (label: string, opts: { task: string; taskId?: string; password?: string }) => {
+  .action(async (
+    label: string,
+    opts: {
+      purpose: string;
+      channel?: string;
+      agentId?: string;
+      user?: string;
+      ttl?: string;
+      mode?: string;
+      raw?: boolean;
+      policyReason?: string;
+      candidateHmac?: string;
+      password?: string;
+    }
+  ) => {
     await withVault(async (vault) => {
       if (!vault.isUnlocked()) {
         if (!opts.password) {
-          // Emit an unlock-request envelope so a paired device could
-          // respond. We still need an interactive password to proceed in
-          // CLI mode until the iOS biometric path lands.
-          const env = vault.buildUnlockRequest(opts.task, `cli access of ${label}`);
+          const env = vault.buildUnlockRequest(opts.purpose, `cli access of ${label}`);
           console.error(
             `  ⚠ Vault is locked. Emitted vault_unlock_request ${env.request_id} ` +
               '(paired device handler pending). Re-run with --password to unlock from the CLI.'
@@ -949,17 +972,183 @@ vaultCmd
           throw err;
         }
       }
+      const ttlSec = Math.max(1, parseInt(opts.ttl ?? '60', 10) || 60);
+      const ttl_ms = ttlSec * 1000;
+      const user = opts.user ?? process.env.USER ?? 'unknown';
+      const agent_id = opts.agentId ?? `cli:${user}`;
+      const channel = opts.channel ?? 'cli';
+      const mode: DisclosureMode = opts.raw
+        ? 'raw'
+        : ((opts.mode as DisclosureMode) ?? 'claim');
       try {
-        const value = vault.access({ label, task: opts.task, taskId: opts.taskId });
-        process.stdout.write(value);
-        if (process.stdout.isTTY) process.stdout.write('\n');
+        const grant = vault.issueGrant({
+          user,
+          agent_id,
+          channel,
+          purpose: opts.purpose,
+          field_label: label,
+          disclosure_mode: mode,
+          ttl_ms,
+          ...(mode === 'raw' && opts.policyReason ? { raw_policy_reason: opts.policyReason } : {})
+        });
+        const resp = vault.access({
+          grant,
+          ...(opts.candidateHmac ? { candidate_hmac: opts.candidateHmac } : {})
+        });
+        switch (resp.mode) {
+          case 'raw':
+            process.stdout.write(resp.value);
+            if (process.stdout.isTTY) process.stdout.write('\n');
+            console.error(
+              `  • grant ${grant.grant_id.slice(0, 8)} → receipt ${resp.receipt_id.slice(0, 8)} (raw)`
+            );
+            break;
+          case 'claim':
+            console.log(
+              JSON.stringify({
+                mode: 'claim',
+                has_value: true,
+                grant_id: resp.grant_id,
+                receipt_id: resp.receipt_id
+              })
+            );
+            break;
+          case 'blinded_match':
+            console.log(
+              JSON.stringify({
+                mode: 'blinded_match',
+                matches: resp.matches,
+                grant_id: resp.grant_id,
+                receipt_id: resp.receipt_id
+              })
+            );
+            break;
+        }
       } catch (err) {
         if (err instanceof VaultLockedError) {
           console.error('  ✗ Vault locked between unlock and access (TTL expired).');
           process.exit(1);
         }
+        if (err instanceof VaultGrantError) {
+          console.error(`  ✗ Grant rejected: ${err.message}`);
+          process.exit(1);
+        }
         console.error(`  ✗ Access failed: ${(err as Error).message}`);
         process.exit(1);
+      }
+    });
+  });
+
+vaultCmd
+  .command('grant')
+  .description(
+    'Issue a scoped, expiring grant. Print grant_id so the caller can later run `vault access` ' +
+      'against it. Default disclosure_mode is claim.'
+  )
+  .requiredOption('--field <label>', 'Field label this grant covers (e.g. ssn, bcbs_member_id)')
+  .requiredOption('--purpose <text>', 'Why this grant exists. Recorded on every receipt.')
+  .requiredOption('--ttl <minutes>', 'Grant lifetime in minutes')
+  .option('--channel <name>', 'ThunderGate channel that requested the grant', 'cli')
+  .option('--agent-id <id>', 'Agent runtime id (defaults to "cli:<user>")')
+  .option('--user <name>', 'Principal user (defaults to $USER)')
+  .option('--mode <mode>', 'Disclosure mode: claim | raw | blinded_match', 'claim')
+  .option('--policy-reason <text>', 'Required if mode is raw — explicit justification.')
+  .action(async (opts: {
+    field: string;
+    purpose: string;
+    ttl: string;
+    channel?: string;
+    agentId?: string;
+    user?: string;
+    mode?: string;
+    policyReason?: string;
+  }) => {
+    await withVault(async (vault) => {
+      const ttlMin = Math.max(1, parseInt(opts.ttl, 10) || 0);
+      if (ttlMin <= 0) {
+        console.error('  ✗ --ttl must be a positive integer (minutes)');
+        process.exit(1);
+      }
+      const user = opts.user ?? process.env.USER ?? 'unknown';
+      const agent_id = opts.agentId ?? `cli:${user}`;
+      const channel = opts.channel ?? 'cli';
+      const mode: DisclosureMode = (opts.mode as DisclosureMode) ?? 'claim';
+      try {
+        const grant = vault.issueGrant({
+          user,
+          agent_id,
+          channel,
+          purpose: opts.purpose,
+          field_label: opts.field,
+          disclosure_mode: mode,
+          ttl_ms: ttlMin * 60 * 1000,
+          ...(mode === 'raw' && opts.policyReason ? { raw_policy_reason: opts.policyReason } : {})
+        });
+        console.log('⚡ Vault Grant Issued');
+        console.log('═══════════════════════════════════════');
+        console.log(`  grant_id        : ${grant.grant_id}`);
+        console.log(`  field_label     : ${grant.field_label}`);
+        console.log(`  purpose         : ${grant.purpose}`);
+        console.log(`  channel         : ${grant.channel}`);
+        console.log(`  agent_id        : ${grant.agent_id}`);
+        console.log(`  user            : ${grant.user}`);
+        console.log(`  disclosure_mode : ${grant.disclosure_mode}`);
+        console.log(`  ttl             : ${ttlMin}m`);
+        console.log(`  expires_at      : ${new Date(grant.expires_at).toISOString()}`);
+        console.log(`  policy_hash     : ${grant.policy_hash.slice(0, 16)}…`);
+        if (grant.disclosure_mode === 'blinded_match') {
+          console.log(`  nonce (HMAC key): ${grant.nonce}`);
+        }
+      } catch (err) {
+        if (err instanceof VaultGrantError) {
+          console.error(`  ✗ Grant denied: ${err.message}`);
+          process.exit(1);
+        }
+        throw err;
+      }
+    });
+  });
+
+vaultCmd
+  .command('receipts')
+  .description('Show the hash-chained access-receipt log. Never prints values.')
+  .option('--limit <n>', 'How many receipts to show (newest first)', '10')
+  .option('--verify', 'Also verify the chain end-to-end and report the result')
+  .action(async (opts: { limit?: string; verify?: boolean }) => {
+    await withVault(async (vault) => {
+      const limit = Math.max(1, parseInt(opts.limit ?? '10', 10) || 10);
+      const rows = vault.listReceipts(limit);
+      if (rows.length === 0) {
+        console.log('No vault receipts recorded.');
+      } else {
+        console.log(`Vault receipts (${rows.length}, newest first):`);
+        for (const r of rows) {
+          const ts = new Date(r.accessed_at).toISOString();
+          const prev = r.previous_receipt_hash
+            ? r.previous_receipt_hash.slice(0, 12) + '…'
+            : '(genesis)';
+          console.log(
+            `  [${ts}] ${r.field_label.padEnd(20)} ${r.disclosure_mode.padEnd(14)} ` +
+              `grant ${r.grant_id.slice(0, 8)} receipt ${r.receipt_id.slice(0, 8)}`
+          );
+          console.log(
+            `     channel=${r.channel} agent=${r.agent_id} purpose="${r.purpose}"`
+          );
+          console.log(
+            `     prev=${prev}  hash=${r.receipt_hash.slice(0, 16)}…`
+          );
+        }
+      }
+      if (opts.verify) {
+        const result = vault.verifyReceiptChain();
+        if (result.ok) {
+          console.log('\n  ✓ Receipt chain verified end-to-end.');
+        } else {
+          console.error(
+            `\n  ✗ Chain broken at receipt ${result.broken_at_receipt_id} (${result.reason})`
+          );
+          process.exit(1);
+        }
       }
     });
   });
