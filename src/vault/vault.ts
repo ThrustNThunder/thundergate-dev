@@ -41,7 +41,7 @@ import {
 } from 'fs';
 import { dirname, join } from 'path';
 import * as os from 'os';
-import { randomBytes, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import type { ProvenanceLedger } from '../provenance/ledger.js';
 import {
   canonicalStringify,
@@ -54,6 +54,7 @@ import {
   keysEqual,
   sha256Hex
 } from './crypto.js';
+import { VaultProviderRegistry } from './registry.js';
 
 export type VaultCategory = 'identity' | 'financial' | 'medical' | 'auth';
 
@@ -308,22 +309,32 @@ export class VaultService {
   private session: UnlockedSession | null = null;
   private readonly dbPath: string;
   private readonly saltPath: string;
-  private readonly authorizer: GrantAuthorizer;
+  private registry: VaultProviderRegistry | null = null;
 
   constructor(
     private readonly ledger: ProvenanceLedger,
-    options: { dbPath?: string; saltPath?: string; authorizer?: GrantAuthorizer } = {}
+    options: {
+      dbPath?: string;
+      saltPath?: string;
+      registry?: VaultProviderRegistry;
+    } = {}
   ) {
     const home = os.homedir();
     this.dbPath = options.dbPath ?? join(home, '.thundergate', 'vault.db');
     this.saltPath = options.saltPath ?? join(home, '.thundergate', 'vault.salt');
-    this.authorizer = options.authorizer ?? new LocalGrantAuthorizer();
+    this.registry = options.registry ?? null;
   }
 
   /**
    * Open the SQLite handle and ensure schema + salt are in place. Vault
    * always starts locked; a separate unlock() call is required before any
    * value can be read.
+   *
+   * If no provider registry was passed to the constructor, a default
+   * one is constructed here using the freshly opened DB handle. That
+   * keeps the V1 local providers active by default — callers that
+   * never touch the registry see byte-identical behavior to the
+   * pre-registry codebase.
    */
   initialize(): void {
     mkdirSync(dirname(this.dbPath), { recursive: true });
@@ -332,6 +343,30 @@ export class VaultService {
     this.db.pragma('synchronous = NORMAL');
     this.db.exec(SCHEMA_SQL);
     this.salt = this.loadOrCreateSalt();
+    if (!this.registry) {
+      // Default V1: local providers all the way. Safe to construct
+      // here — providers.ts only references vault.ts inside method
+      // bodies, so the module-cycle bindings are resolved by the time
+      // any of these providers' methods run.
+      this.registry = new VaultProviderRegistry({
+        db: this.db,
+        unlockHandle: { unlock: (opts) => this.unlock(opts) }
+      });
+    }
+  }
+
+  /** Replace the active provider registry. Used by the runtime to
+   *  inject a shared registry after construction, so doctor + CLI
+   *  inventory see the same providers the runtime is using. */
+  setRegistry(registry: VaultProviderRegistry): void {
+    this.registry = registry;
+  }
+
+  /** Read-only access to the provider registry. Returns null only if
+   *  `initialize()` hasn't been called yet (and no registry was passed
+   *  via the constructor). */
+  getRegistry(): VaultProviderRegistry | null {
+    return this.registry;
   }
 
   private loadOrCreateSalt(): Buffer {
@@ -517,15 +552,15 @@ export class VaultService {
 
   /**
    * Issue a scoped, expiring, purpose-bound, channel-bound, agent-bound
-   * Grant. The authorizer (BYOAA seam) decides whether issuance is
-   * allowed and stamps the policy_hash. The grant is written to
-   * vault_grants and the returned object is the only thing the caller
-   * needs to later access the field through accessWithGrant().
+   * Grant. The CapabilityAuthority plugin socket (BYOAA seam) decides
+   * whether a Grant may be issued and stamps the policy_hash; today's
+   * V1 LocalCapabilityAuthority wraps the same LocalGrantAuthorizer
+   * policy code path that used to live inline here.
    *
    * Sensitive value is NOT loaded here — issuance does not require an
    * unlocked vault, only a label that exists.
    */
-  issueGrant(opts: IssueGrantOptions): Grant {
+  async issueGrant(opts: IssueGrantOptions): Promise<Grant> {
     if (!opts.user || opts.user.trim().length === 0) throw new VaultGrantError('user required');
     if (!opts.agent_id || opts.agent_id.trim().length === 0) throw new VaultGrantError('agent_id required');
     if (!opts.channel || opts.channel.trim().length === 0) throw new VaultGrantError('channel required');
@@ -540,39 +575,38 @@ export class VaultService {
       .get(opts.field_label) as { hit: number } | undefined;
     if (!exists) throw new VaultGrantError(`no vault entry with label: ${opts.field_label}`);
 
-    const decision = this.authorizer.authorize({ ...opts, disclosure_mode: mode });
-    if (!decision.allowed) {
+    const authority = this.requireRegistry().capabilityAuthority;
+    let grant: Grant;
+    try {
+      grant = await authority.issueCapabilityGrant({
+        user: opts.user,
+        agent_id: opts.agent_id,
+        channel: opts.channel,
+        purpose: opts.purpose,
+        field_label: opts.field_label,
+        ttl_ms: opts.ttl_ms,
+        disclosure_mode: mode,
+        ...(opts.raw_policy_reason !== undefined ? { raw_policy_reason: opts.raw_policy_reason } : {}),
+        ...(opts.policy_hash !== undefined ? { policy_hash: opts.policy_hash } : {})
+      });
+    } catch (err) {
+      const reason = (err as Error).message ?? 'capability denied';
       this.ledger.append({
         actor: 'vault',
         action: 'grant_denied',
         target: opts.field_label,
-        reason: decision.reason,
+        reason,
         data: {
           user: opts.user,
           agent_id: opts.agent_id,
           channel: opts.channel,
           purpose: opts.purpose,
-          disclosure_mode: mode
+          disclosure_mode: mode,
+          authority: authority.kind
         }
       });
-      throw new VaultGrantError(`grant denied: ${decision.reason}`);
+      throw new VaultGrantError(`grant denied: ${reason}`);
     }
-
-    const now = Date.now();
-    const grant: Grant = {
-      grant_id: randomUUID(),
-      user: opts.user,
-      agent_id: opts.agent_id,
-      channel: opts.channel,
-      purpose: opts.purpose,
-      field_label: opts.field_label,
-      disclosure_mode: mode,
-      ttl_ms: opts.ttl_ms,
-      granted_at: now,
-      expires_at: now + opts.ttl_ms,
-      nonce: randomBytesHex(16),
-      policy_hash: opts.policy_hash ?? decision.policy_hash
-    };
 
     this.db
       .prepare(
@@ -609,10 +643,33 @@ export class VaultService {
         disclosure_mode: grant.disclosure_mode,
         ttl_ms: grant.ttl_ms,
         expires_at: grant.expires_at,
-        policy_hash: grant.policy_hash
+        policy_hash: grant.policy_hash,
+        authority: authority.kind
       }
     });
     return grant;
+  }
+
+  /**
+   * Revoke a previously issued grant. Authority-side revocation is a
+   * no-op for V1 local (the local service is the issuer); the DB
+   * stamps `revoked_at` so subsequent `getGrant()` calls return null.
+   */
+  async revokeGrant(grantId: string): Promise<void> {
+    if (!grantId) throw new VaultGrantError('grantId required');
+    const authority = this.requireRegistry().capabilityAuthority;
+    await authority.revokeGrant(grantId);
+    const result = this.db
+      .prepare(`UPDATE vault_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL`)
+      .run(Date.now(), grantId);
+    if (result.changes === 0) return;
+    this.ledger.append({
+      actor: 'vault',
+      action: 'grant_revoked',
+      target: grantId,
+      reason: 'revokeGrant',
+      data: { authority: authority.kind }
+    });
   }
 
   /** Look up a grant by id. Returns null if unknown. Does NOT validate expiry. */
@@ -654,11 +711,11 @@ export class VaultService {
    * decrypts and shapes the response. Writes a hash-chained Receipt and a
    * value-free provenance row. Vault must be unlocked.
    */
-  accessWithGrant(
+  async accessWithGrant(
     grant_id: string,
     field_label: string,
     candidate_hmac?: string
-  ): AccessResponse {
+  ): Promise<AccessResponse> {
     const grant = this.getGrant(grant_id);
     if (!grant) throw new VaultGrantError(`unknown or revoked grant: ${grant_id}`);
     return this.access({ grant, candidate_hmac });
@@ -669,7 +726,7 @@ export class VaultService {
    * by issueGrant). Equivalent to accessWithGrant after a getGrant(),
    * but skips the round-trip when the caller already holds the row.
    */
-  access(req: AccessRequest): AccessResponse {
+  async access(req: AccessRequest): Promise<AccessResponse> {
     const live = this.requireUnlocked();
     const { grant, candidate_hmac } = req;
     if (!grant || !grant.grant_id) throw new VaultGrantError('grant required');
@@ -724,7 +781,7 @@ export class VaultService {
       .prepare(`UPDATE vault SET last_accessed_at = ? WHERE id = ?`)
       .run(Date.now() / 1000, row.id);
 
-    const receipt = this.appendReceipt(stored);
+    const receipt = await this.appendReceipt(stored);
 
     let response: AccessResponse;
     switch (stored.disclosure_mode) {
@@ -894,12 +951,13 @@ export class VaultService {
   // ── internals ──────────────────────────────────────────────────────────
 
   /**
-   * Persist a hash-chained receipt for a successful access. The chain head
-   * is whichever receipt has the highest accessed_at — we read its
-   * receipt_hash and use it as previous_receipt_hash. UNIQUE on
-   * receipt_hash defends against duplicate insertion racing the read.
+   * Build a hash-chained receipt for a successful access and hand it to
+   * the active ReceiptAnchorProvider for persistence. V1 local routes
+   * the INSERT through `LocalReceiptAnchorProvider` so the on-disk
+   * shape is identical to the pre-registry implementation; V2 (Loop)
+   * batches and anchors a Merkle root on-chain.
    */
-  private appendReceipt(grant: Grant): Receipt {
+  private async appendReceipt(grant: Grant): Promise<Receipt> {
     const head = this.db
       .prepare(
         `SELECT receipt_hash FROM vault_receipts
@@ -924,26 +982,17 @@ export class VaultService {
       receipt_hash: computeReceiptHash(partial)
     };
 
-    this.db
-      .prepare(
-        `INSERT INTO vault_receipts (
-           receipt_id, grant_id, field_label, purpose, disclosure_mode,
-           accessed_at, agent_id, channel, previous_receipt_hash, receipt_hash
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        receipt.receipt_id,
-        receipt.grant_id,
-        receipt.field_label,
-        receipt.purpose,
-        receipt.disclosure_mode,
-        receipt.accessed_at,
-        receipt.agent_id,
-        receipt.channel,
-        receipt.previous_receipt_hash,
-        receipt.receipt_hash
-      );
+    await this.requireRegistry().anchorProvider.anchorReceipts([receipt]);
     return receipt;
+  }
+
+  private requireRegistry(): VaultProviderRegistry {
+    if (!this.registry) {
+      throw new Error(
+        'vault provider registry not initialized — call VaultService.initialize() first'
+      );
+    }
+    return this.registry;
   }
 
   private openSession(
@@ -1012,10 +1061,6 @@ function fingerprint(token: string): string {
     h = ((h << 5) - h + token.charCodeAt(i)) | 0;
   }
   return h.toString(16);
-}
-
-function randomBytesHex(n: number): string {
-  return randomBytes(n).toString('hex');
 }
 
 /**

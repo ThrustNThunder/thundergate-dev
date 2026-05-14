@@ -38,7 +38,6 @@ import { randomUUID } from 'crypto';
 import type { ProvenanceLedger } from '../provenance/ledger.js';
 import { WorldState, type PendingVaultRequest } from '../world/state.js';
 import {
-  VaultBadPasswordError,
   VaultGrantError,
   VaultLockedError,
   VaultService,
@@ -165,7 +164,7 @@ export class VaultProtocol {
    * should hand to the user. The next inbound on that channel — fed to
    * `handleInbound()` — completes the flow.
    */
-  requestAccess(opts: RequestAccessOptions): RequestAccessResult {
+  async requestAccess(opts: RequestAccessOptions): Promise<RequestAccessResult> {
     const channel = opts.channel.trim();
     if (!channel) throw new Error('channel required for vault.requestAccess');
     const agent_id = opts.agent_id ?? `jon:${channel}`;
@@ -174,7 +173,7 @@ export class VaultProtocol {
     const grant_ttl_ms = opts.grant_ttl_ms ?? 60_000;
 
     if (this.vault.isUnlocked()) {
-      const response = this.issueAndAccess({
+      const response = await this.issueAndAccess({
         field_label: opts.field_label,
         purpose: opts.purpose,
         channel,
@@ -336,7 +335,7 @@ export class VaultProtocol {
    * state regardless of outcome — no replay attempts on the same
    * prompt.
    */
-  handleInbound(channel: string, text: string): UnlockResponseResult {
+  async handleInbound(channel: string, text: string): Promise<UnlockResponseResult> {
     // Read the raw map (not getPending) so we can tell expired apart
     // from never-existed. getPending sweeps expired rows out as a side
     // effect, which is convenient for the runtime's pre-check but
@@ -456,35 +455,52 @@ export class VaultProtocol {
 
   // ── internals ──────────────────────────────────────────────────────────
 
-  private tryUnlockAndAccess(
+  private async tryUnlockAndAccess(
     pending: PendingVaultRequest,
     password: string,
     opts: { biometricToken?: string; unlockSource: 'password' | 'biometric' }
-  ): UnlockResponseResult {
+  ): Promise<UnlockResponseResult> {
     const unlockTtlMs = DEFAULT_UNLOCK_TTL_MS;
-    try {
-      if (opts.unlockSource === 'biometric') {
-        this.vault.unlock({
-          source: 'biometric',
-          password,
-          biometricToken: opts.biometricToken ?? `stub:${pending.request_id}`,
-          ttlMs: unlockTtlMs
-        });
-      } else {
-        this.vault.unlock({
-          source: 'password',
-          password,
-          ttlMs: unlockTtlMs
-        });
+    // Route the actual unlock through the AuthorizationProvider socket.
+    // V1 local: LocalAuthorizationProvider calls vault.unlock with the
+    // supplied credential and returns success. BYOAA path: provider
+    // verifies a signed grant from the paired device instead.
+    const registry = this.vault.getRegistry();
+    if (!registry) {
+      return {
+        status: 'denied',
+        request_id: pending.request_id,
+        reason: 'vault registry not initialized'
+      };
+    }
+    const authResult = await registry.authProvider.requestAuthorization({
+      type: 'vault_unlock_request',
+      request_id: pending.request_id,
+      task: pending.purpose,
+      reason: `vault unlock via ${pending.mode}`,
+      requested_at: pending.requested_at,
+      ttl_ms: pending.ttl_ms,
+      mode: pending.mode,
+      channel: pending.channel,
+      credential: {
+        source: opts.unlockSource,
+        password,
+        ...(opts.biometricToken !== undefined ? { biometricToken: opts.biometricToken } : (opts.unlockSource === 'biometric' ? { biometricToken: `stub:${pending.request_id}` } : {})),
+        unlockTtlMs
       }
-    } catch (err) {
-      if (err instanceof VaultBadPasswordError) {
+    });
+    if (authResult.status !== 'authorized') {
+      if (authResult.status === 'bad_credential') {
         this.ledger.append({
           actor: 'vault_protocol',
           action: 'unlock_bad_password',
           target: pending.field_label,
-          reason: 'wrong password supplied at prompt',
-          data: { request_id: pending.request_id, channel: pending.channel }
+          reason: 'auth provider rejected credential',
+          data: {
+            request_id: pending.request_id,
+            channel: pending.channel,
+            provider: registry.authProvider.kind
+          }
         });
         return {
           status: 'bad_password',
@@ -496,19 +512,23 @@ export class VaultProtocol {
         actor: 'vault_protocol',
         action: 'unlock_failed',
         target: pending.field_label,
-        reason: (err as Error).message,
-        data: { request_id: pending.request_id, channel: pending.channel }
+        reason: authResult.reason ?? 'auth denied',
+        data: {
+          request_id: pending.request_id,
+          channel: pending.channel,
+          provider: registry.authProvider.kind
+        }
       });
       return {
         status: 'denied',
         request_id: pending.request_id,
-        reason: `unlock failed: ${(err as Error).message}`
+        reason: `unlock failed: ${authResult.reason ?? 'auth denied'}`
       };
     }
 
     let response: AccessResponse;
     try {
-      response = this.issueAndAccess({
+      response = await this.issueAndAccess({
         field_label: pending.field_label,
         purpose: pending.purpose,
         channel: pending.channel,
@@ -556,7 +576,7 @@ export class VaultProtocol {
     };
   }
 
-  private issueAndAccess(opts: {
+  private async issueAndAccess(opts: {
     field_label: string;
     purpose: string;
     channel: string;
@@ -565,8 +585,8 @@ export class VaultProtocol {
     disclosure_mode: DisclosureMode;
     raw_policy_reason?: string;
     grant_ttl_ms: number;
-  }): AccessResponse {
-    const grant = this.vault.issueGrant({
+  }): Promise<AccessResponse> {
+    const grant = await this.vault.issueGrant({
       user: opts.user,
       agent_id: opts.agent_id,
       channel: opts.channel,

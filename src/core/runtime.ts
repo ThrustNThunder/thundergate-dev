@@ -44,6 +44,7 @@ import { ProvisionalMemoryService } from '../memory/provisional.js';
 import { MemoryWAL } from '../memory/wal.js';
 import { VaultService } from '../vault/vault.js';
 import { VaultProtocol } from '../vault/protocol.js';
+import type { VaultProviderRegistry } from '../vault/registry.js';
 
 // Runtime state
 interface RuntimeState {
@@ -170,6 +171,13 @@ export class ThunderGateRuntime {
 
   getVaultProtocol(): VaultProtocol | undefined {
     return this.vaultProtocol ?? undefined;
+  }
+
+  /** Access the vault's plugin-provider registry. Construction lives
+   *  inside VaultService.initialize(); this is the runtime-side
+   *  accessor BYOAA/Loop integrations call to swap a provider. */
+  getVaultRegistry(): VaultProviderRegistry | undefined {
+    return this.vault?.getRegistry() ?? undefined;
   }
 
   /** DB accessor — CLI needs it for read-only memory list. */
@@ -430,7 +438,7 @@ export class ThunderGateRuntime {
     // promise tracker, or the WAL outbound (we still log the outcome).
     if (this.vaultProtocol && this.vaultProtocol.looksLikeUnlockResponse(channelId, entry.text)) {
       try {
-        const result = this.vaultProtocol.handleInbound(channelId, entry.text);
+        const result = await this.vaultProtocol.handleInbound(channelId, entry.text);
         const replyText = this.vaultProtocol.formatOutcome(result);
         const delivery: OutboundDelivery = {
           id: newMessageId(),

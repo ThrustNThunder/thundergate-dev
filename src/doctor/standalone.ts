@@ -17,6 +17,7 @@ import { loadCheckpoint } from '../checkpoint/save.js';
 import { ensureConfig } from '../config/index.js';
 import { GhostEvaluator } from '../ghost/evaluator.js';
 import { ProvenanceLedger, type ProvenanceEvent } from '../provenance/ledger.js';
+import { VaultService } from '../vault/vault.js';
 
 const THUNDERGATE_DIR = join(os.homedir(), '.thundergate');
 const PID_FILE = join(THUNDERGATE_DIR, 'thundergate.pid');
@@ -79,6 +80,11 @@ export function runHealthCheck(): HealthReport {
   // 11. Local inference (ThunderMind / Ollama). Configured? Reachable?
   // When did the long-running provider last successfully probe it?
   checks.push(checkLocalInference());
+
+  // 12. Vault provider sockets — surfaces the BYOAA + Loop seam state.
+  // V1 reports all-local + ZKP-null as healthy; any non-local provider
+  // is surfaced so the operator knows a plugin is wired in.
+  checks.push(checkVaultProviders());
 
   // Calculate overall status
   const hasFailures = checks.some(c => c.status === 'fail');
@@ -408,6 +414,74 @@ function checkLocalInference(): HealthCheck {
     status: 'warn',
     detail: `${endpoint} — unknown (daemon hasn't probed yet)${tail}`
   };
+}
+
+/**
+ * Vault provider socket inventory. Opens a short-lived VaultService
+ * handle, reads the registry inventory, and surfaces which providers
+ * are live. Fully self-contained — runs from the standalone doctor
+ * without a running runtime.
+ *
+ * Status policy:
+ *   - All four sockets at their V1 defaults (local + local + local +
+ *     null ZKP) → pass.
+ *   - Any non-default kind active → still pass, but the detail line
+ *     names which sockets diverged (operators want to see this — a
+ *     BYOAA plug-in IS the healthy state once we cross V1.5).
+ *   - Registry uninitialized or vault open fails → warn.
+ */
+function checkVaultProviders(): HealthCheck {
+  let cfg;
+  try {
+    cfg = ensureConfig();
+  } catch (err) {
+    return {
+      name: 'VaultProvs',
+      status: 'warn',
+      detail: `config error: ${(err as Error).message}`
+    };
+  }
+  const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+  const vault = new VaultService(ledger);
+  try {
+    vault.initialize();
+    const registry = vault.getRegistry();
+    if (!registry) {
+      return {
+        name: 'VaultProvs',
+        status: 'warn',
+        detail: 'registry not initialized'
+      };
+    }
+    const inv = registry.inventory();
+    const auth = inv.authProvider.kind;
+    const anchor = inv.anchorProvider.kind;
+    const cap = inv.capabilityAuthority.kind;
+    const zkp = inv.zkpProvider?.kind ?? 'unset';
+    const allDefault =
+      auth === 'local' && anchor === 'local' && cap === 'local' && zkp === 'null';
+    const summary = `auth=${auth} anchor=${anchor} cap=${cap} zkp=${zkp}`;
+    if (allDefault) {
+      return {
+        name: 'VaultProvs',
+        status: 'pass',
+        detail: `V1 local on all sockets (${summary})`
+      };
+    }
+    return {
+      name: 'VaultProvs',
+      status: 'pass',
+      detail: `mixed providers — ${summary}`
+    };
+  } catch (err) {
+    return {
+      name: 'VaultProvs',
+      status: 'warn',
+      detail: `vault open failed: ${(err as Error).message}`
+    };
+  } finally {
+    try { vault.close(); } catch { /* ignore */ }
+  }
 }
 
 function truncateLine(s: string, n: number): string {

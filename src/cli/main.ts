@@ -984,7 +984,7 @@ vaultCmd
         ? 'raw'
         : ((opts.mode as DisclosureMode) ?? 'claim');
       try {
-        const grant = vault.issueGrant({
+        const grant = await vault.issueGrant({
           user,
           agent_id,
           channel,
@@ -994,7 +994,7 @@ vaultCmd
           ttl_ms,
           ...(mode === 'raw' && opts.policyReason ? { raw_policy_reason: opts.policyReason } : {})
         });
-        const resp = vault.access({
+        const resp = await vault.access({
           grant,
           ...(opts.candidateHmac ? { candidate_hmac: opts.candidateHmac } : {})
         });
@@ -1077,7 +1077,7 @@ vaultCmd
       const channel = opts.channel ?? 'cli';
       const mode: DisclosureMode = (opts.mode as DisclosureMode) ?? 'claim';
       try {
-        const grant = vault.issueGrant({
+        const grant = await vault.issueGrant({
           user,
           agent_id,
           channel,
@@ -1156,6 +1156,72 @@ vaultCmd
     });
   });
 
+// ── vault providers ──────────────────────────────────────────────────────
+//
+// Inventory of the four plugin sockets defined in
+// THUNDERGATE_BYOAA_LOOP_SPEC.md. Read-only — flips from local→byoaa→loop
+// happen via runtime registration, not via this command.
+vaultCmd
+  .command('providers')
+  .description('Show the currently-registered vault provider sockets (local | byoaa | loop | null).')
+  .action(async () => {
+    await withVault(async (vault) => {
+      const registry = vault.getRegistry();
+      console.log('⚡ Vault Provider Sockets');
+      console.log('═══════════════════════════════════════');
+      if (!registry) {
+        console.log('  ⚠ Registry not initialized (initialize() not yet called).');
+        return;
+      }
+      const inv = registry.inventory();
+      const row = (
+        label: string,
+        kind: string,
+        ctor: string,
+        version: string
+      ): string =>
+        `  ${label.padEnd(22)} ${kind.padEnd(8)} ${version.padEnd(8)} ${ctor}`;
+      console.log(`  ${'socket'.padEnd(22)} ${'kind'.padEnd(8)} ${'phase'.padEnd(8)} class`);
+      console.log(`  ${''.padEnd(22, '-')} ${''.padEnd(8, '-')} ${''.padEnd(8, '-')} ${''.padEnd(24, '-')}`);
+      console.log(row('AuthorizationProvider', inv.authProvider.kind, inv.authProvider.ctor, providerPhase(inv.authProvider.kind)));
+      console.log(row('ReceiptAnchorProvider', inv.anchorProvider.kind, inv.anchorProvider.ctor, providerPhase(inv.anchorProvider.kind)));
+      console.log(row('CapabilityAuthority',  inv.capabilityAuthority.kind, inv.capabilityAuthority.ctor, providerPhase(inv.capabilityAuthority.kind)));
+      if (inv.zkpProvider) {
+        console.log(row('ZKProofProvider',     inv.zkpProvider.kind, inv.zkpProvider.ctor, providerPhase(inv.zkpProvider.kind)));
+      } else {
+        console.log(row('ZKProofProvider',     'unset',  '(none)',                'V1'));
+      }
+      console.log();
+      const allLocal =
+        inv.authProvider.kind === 'local' &&
+        inv.anchorProvider.kind === 'local' &&
+        inv.capabilityAuthority.kind === 'local' &&
+        (inv.zkpProvider?.kind ?? 'null') === 'null';
+      console.log(
+        allLocal
+          ? '  ✓ All sockets running V1 local providers — no BYOAA/Loop integration active.'
+          : '  ↪ One or more sockets running non-local providers — see kind column above.'
+      );
+    });
+  });
+
+function providerPhase(kind: string): string {
+  switch (kind) {
+    case 'local':
+      return 'V1';
+    case 'byoaa':
+      return 'V1.5';
+    case 'loop':
+      return 'V2';
+    case 'zkp':
+      return 'V3';
+    case 'null':
+      return 'V1';
+    default:
+      return '?';
+  }
+}
+
 // ── vault test-request ────────────────────────────────────────────────────
 //
 // End-to-end exerciser for the live VaultProtocol. Walks the full
@@ -1208,7 +1274,7 @@ vaultCmd
       // Step 1 — issue the access request. Vault is locked on every CLI
       // invocation (withVault opens a fresh handle and never unlocks),
       // so this will always come back as pending_unlock.
-      const result = protocol.requestAccess({
+      const result = await protocol.requestAccess({
         field_label: opts.field,
         purpose: opts.purpose,
         channel,
@@ -1245,7 +1311,7 @@ vaultCmd
       }
 
       // Step 3 — feed it through the protocol exactly as the runtime would.
-      const outcome = protocol.handleInbound(channel, unlockReply);
+      const outcome = await protocol.handleInbound(channel, unlockReply);
       console.log();
       console.log(`  ← Outcome: ${outcome.status}`);
       if (outcome.status === 'unlocked') {
