@@ -136,6 +136,21 @@ export interface StateSnapshotSource {
   principlesCount?: () => number | null;
   /** Doctor's last health verdict + consecutive-healthy count (technical snapshot). */
   doctorSummary?: () => { status: string; consecutiveHealthy: number } | null;
+  /**
+   * BrowserBridge liveness — current URL, portal state, last action age.
+   * Returned only when an extension is connected; null/undefined means no
+   * line is rendered. Included in *every* snapshot type (status, cli,
+   * technical) so Ghost is aware whenever a browser is open and watching
+   * a page — improves prediction on questions like "are we on the
+   * dashboard?" without forcing Jon to repeat context that's already live
+   * in WorldState.
+   */
+  browserState?: () => {
+    connected: boolean;
+    url: string;
+    portalState: string | null;
+    lastActionAt: number | null;
+  } | null;
   /** Wall-clock at the moment the snapshot is built. */
   now?: () => number;
 }
@@ -399,6 +414,26 @@ export function buildStateSnapshot(
     return `- doctor: status=${d.status} consecutive_healthy=${d.consecutiveHealthy}`;
   };
 
+  // Browser awareness rendered into *every* snapshot type when a
+  // ThunderBrowser extension is dialed in. The line is skipped entirely
+  // when no extension is connected — adding `browser: none` to every
+  // Ghost prompt would just be noise on the non-browser turns that make
+  // up most of the day. The age math uses the snapshot's `now` so the
+  // string is stable across the call (no test-flake from a clock tick
+  // mid-render).
+  const browserLine = (): string | null => {
+    const b = safe(source.browserState);
+    if (!b || !b.connected) return null;
+    const parts = ['connected'];
+    if (b.url) parts.push(`url=${b.url}`);
+    if (b.portalState) parts.push(`portal=${b.portalState}`);
+    if (b.lastActionAt) {
+      const ageMin = Math.round((now - b.lastActionAt) / 60_000);
+      parts.push(`last_action=${ageMin}m ago`);
+    }
+    return `- browser: ${parts.join(' ')}`;
+  };
+
   const push = (line: string | null): void => {
     if (line) lines.push(line);
   };
@@ -410,6 +445,7 @@ export function buildStateSnapshot(
     push(frameLine());
     push(inferenceLine());
     push(serviceUptimeLine());
+    push(browserLine());
   } else if (type === 'cli') {
     push(gitCommitLine());
     push(serviceStatusLine());
@@ -418,12 +454,14 @@ export function buildStateSnapshot(
     push(promiseLine());
     push(frameLine());
     push(lastInboundLine());
+    push(browserLine());
   } else if (type === 'technical') {
     push(versionLine());
     push(principlesLine());
     push(inferenceLine());
     push(doctorLine());
     push(walLine());
+    push(browserLine());
   }
 
   if (lines.length === 0) return null;

@@ -651,6 +651,24 @@ export class ThunderGateRuntime {
           return null;
         }
       },
+      // WorldState carries the same fields the bridge mutates on every
+      // extension envelope. Reading them here (instead of touching the
+      // bridge directly) keeps the harness ignorant of the bridge — if
+      // the bridge ever fails to bind, the world reads cleanly as
+      // disconnected and `browserLine()` simply skips.
+      browserState: () => {
+        try {
+          if (!this.world.browserConnected) return null;
+          return {
+            connected: true,
+            url: this.world.browserCurrentUrl,
+            portalState: this.world.browserPortalState,
+            lastActionAt: this.world.browserLastActionAt
+          };
+        } catch {
+          return null;
+        }
+      },
       now: () => Date.now()
     };
   }

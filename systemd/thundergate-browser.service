@@ -1,0 +1,31 @@
+[Unit]
+Description=ThunderBrowser — headless Chromium for ThunderBase
+# Browser comes up after the gateway so the extension finds the bridge
+# listener on port 8770 on first dial. `Wants=` (not `Requires=`) keeps
+# the dependency soft — the browser is non-critical to the Ghost Jon
+# 7-day clock; if thundergate is down the browser just retries.
+After=network-online.target thundergate.service
+Wants=network-online.target thundergate.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/thundergate-dev
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/bin:/bin:/usr/local/bin
+ExecStart=/home/ubuntu/thundergate-dev/scripts/launch-browser.sh
+# Chromium occasionally exits on missing /dev/shm space, font cache
+# rebuilds, or transient driver failures. Restart on failure but cap so
+# we don't hammer apt locks during install windows.
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# Journal capture — the launcher prints the chosen binary, port, and
+# initial URL on each start. Operators read this with `journalctl -u
+# thundergate-browser`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

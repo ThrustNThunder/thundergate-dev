@@ -1647,4 +1647,259 @@ browserCmd
     }
   });
 
+// ── browser start / stop / navigate / state ───────────────────────────────
+//
+// Local control surface for the headless Chromium that hosts the
+// ThunderBrowser extension. The launch is via the script
+// `scripts/launch-browser.sh` which keeps all flag wrangling in one
+// place — the CLI just spawns it (or kills it).
+//
+// `navigate` talks to Chrome's DevTools Protocol on port 9222 rather
+// than going through BrowserBridge. The bridge is single-client by
+// design (the extension), and a CLI WS would displace the extension's
+// connection. Driving the page via CDP keeps the extension's socket
+// to the bridge intact, and the page's `state_update` envelope still
+// flows back so `world.browserCurrentUrl` updates on its own.
+
+const BROWSER_LAUNCHER = join(__dirname, '..', '..', 'scripts', 'launch-browser.sh');
+const BROWSER_DEVTOOLS_PORT = 9222;
+const BROWSER_PID_FILE = join(THUNDERGATE_DIR, 'browser.pid');
+
+browserCmd
+  .command('start')
+  .description('Launch headless Chromium with the ThunderBrowser extension loaded')
+  .action(() => {
+    if (existsSync(BROWSER_PID_FILE)) {
+      const pid = parseInt(readFileSync(BROWSER_PID_FILE, 'utf-8').trim(), 10);
+      if (pid && processAlive(pid)) {
+        console.log(`⚡ Browser already running (PID ${pid})`);
+        process.exit(0);
+      }
+      // Stale pid file — clean up and continue.
+      try { unlinkSync(BROWSER_PID_FILE); } catch { /* ignore */ }
+    }
+    if (!existsSync(BROWSER_LAUNCHER)) {
+      console.error(`  ✗ launcher missing: ${BROWSER_LAUNCHER}`);
+      process.exit(1);
+    }
+    console.log('⚡ Starting ThunderBrowser (headless Chromium)...');
+    const child = spawn('/bin/bash', [BROWSER_LAUNCHER], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    child.unref();
+    if (child.pid) {
+      writeFileSync(BROWSER_PID_FILE, String(child.pid));
+      console.log(`  ✓ Launched (PID ${child.pid})`);
+      console.log(`  ✓ DevTools: http://127.0.0.1:${BROWSER_DEVTOOLS_PORT}`);
+      console.log("  ↻ Run 'thundergate browser status' in ~5s to confirm the extension dialed in");
+    } else {
+      console.error('  ✗ spawn failed');
+      process.exit(1);
+    }
+  });
+
+browserCmd
+  .command('stop')
+  .description('Stop the headless Chromium process (graceful, then SIGKILL)')
+  .action(() => {
+    let pid: number | null = null;
+    if (existsSync(BROWSER_PID_FILE)) {
+      const raw = readFileSync(BROWSER_PID_FILE, 'utf-8').trim();
+      const parsed = parseInt(raw, 10);
+      if (parsed && processAlive(parsed)) pid = parsed;
+    }
+    if (pid === null) {
+      console.log('⚡ Browser is not running (no PID file)');
+      try { if (existsSync(BROWSER_PID_FILE)) unlinkSync(BROWSER_PID_FILE); } catch { /* ignore */ }
+      process.exit(0);
+    }
+    console.log(`⚡ Stopping browser (PID ${pid})...`);
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch (err) {
+      console.warn(`  ⚠ SIGTERM failed: ${(err as Error).message}`);
+    }
+    // Chromium leaves child processes; the parent is the only one we
+    // tracked. systemd would clean up the cgroup on `systemctl stop`,
+    // but the CLI path is best-effort: pkill any orphan chromium that
+    // owns our profile dir so the next `browser start` isn't blocked
+    // by a leftover singleton lock.
+    try {
+      // Profile dir lives under $HOME (non-hidden) so snap chromium can
+      // access it — match the launcher's TB_PROFILE_DIR default.
+      const profile = join(os.homedir(), 'thundergate-chrome-profile');
+      execSync(`pkill -f ${shellQuoteCli(profile)} 2>/dev/null || true`, {
+        stdio: 'ignore'
+      });
+    } catch { /* ignore */ }
+    try { unlinkSync(BROWSER_PID_FILE); } catch { /* ignore */ }
+    console.log('  ✓ Stopped');
+  });
+
+browserCmd
+  .command('state')
+  .description('Show current page state (URL, portal state, last action) from the runtime')
+  .action(() => {
+    const cfg = ensureConfig();
+    const portUp = portOpen(DEFAULT_BROWSER_BRIDGE_PORT);
+    console.log('⚡ ThunderBrowser State');
+    console.log('═══════════════════════════════════════');
+    console.log(`  Bridge listening: ${portUp ? `✅ ws://0.0.0.0:${DEFAULT_BROWSER_BRIDGE_PORT}` : '❌ not bound'}`);
+    if (!portUp) {
+      console.log('  (start thundergate first — bridge is in-process)');
+      return;
+    }
+
+    // The runtime mutates WorldState on every extension envelope, but
+    // that state lives in the runtime process. Out-of-process the
+    // provenance ledger is the truth seam — it carries every state
+    // transition the bridge has observed.
+    let events: ProvenanceEvent[] = [];
+    try {
+      const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+      events = ledger.tail(500);
+    } catch {
+      /* ignore — empty events render below */
+    }
+    const reversed = [...events].reverse();
+    const lastReady = reversed.find(
+      (e) => e.actor === 'browser-bridge' && e.action === 'extension_ready'
+    );
+    const lastDisc = reversed.find(
+      (e) => e.actor === 'browser-bridge' && e.action === 'extension_disconnected'
+    );
+    const connected =
+      lastReady != null &&
+      (lastDisc == null || lastDisc.timestamp < lastReady.timestamp);
+    console.log(`  Extension:        ${connected ? '✅ connected' : '❌ not connected'}`);
+    if (lastReady) {
+      const url = (lastReady.data as any)?.url ?? '';
+      const portalState = (lastReady.data as any)?.portalState ?? null;
+      console.log(`  Current URL:      ${url || '(unknown)'}`);
+      console.log(`  Portal state:     ${portalState ?? '(none)'}`);
+      console.log(`  Last ready:       ${formatLedgerAge(lastReady.timestamp)}`);
+    } else {
+      console.log('  Current URL:      (no ready envelope yet)');
+    }
+    const lastAction = reversed.find(
+      (e) => e.actor === 'browser-bridge' && typeof e.action === 'string' && e.action.startsWith('browser_')
+    );
+    if (lastAction) {
+      const verb = lastAction.action.replace(/^browser_/, '');
+      const data = (lastAction.data as any) || {};
+      const success = data.success === true ? '✅' : '❌';
+      const lat = typeof data.latencyMs === 'number' ? `${data.latencyMs}ms` : '?';
+      console.log(`  Last action:      ${success} ${verb}  (${lat}, ${formatLedgerAge(lastAction.timestamp)})`);
+    } else {
+      console.log('  Last action:      (none recorded)');
+    }
+  });
+
+browserCmd
+  .command('navigate <url>')
+  .description('Drive the running browser to a URL via Chrome DevTools Protocol (port 9222)')
+  .action(async (url: string) => {
+    if (!/^https?:\/\//i.test(url)) {
+      console.error('  ✗ url must start with http:// or https://');
+      process.exit(1);
+    }
+    try {
+      const res = await navigateViaCDP(url);
+      console.log(`⚡ Navigated to ${url}`);
+      console.log(`  Tab:      ${res.tabId}`);
+      console.log(`  Loader:   ${res.loaderId ?? '(none returned)'}`);
+      console.log("  ↻ Run 'thundergate browser state' to confirm the new URL landed");
+    } catch (err) {
+      console.error(`  ✗ navigate failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Drive Chrome's first available tab via DevTools Protocol. The launcher
+ * pins `--remote-debugging-port=9222` on 127.0.0.1, so the surface is
+ * loopback-only — no external attacker reach. We list tabs, pick the
+ * first `type === "page"`, then open its WS endpoint and send
+ * `Page.navigate`. The WS connect+send+close cycle takes ~50ms on
+ * localhost; we cap at 5s so a wedged browser doesn't hang the CLI.
+ */
+async function navigateViaCDP(url: string): Promise<{ tabId: string; loaderId: string | null }> {
+  const listRes = await fetch(`http://127.0.0.1:${BROWSER_DEVTOOLS_PORT}/json`);
+  if (!listRes.ok) {
+    throw new Error(`CDP list returned ${listRes.status} — is the browser running?`);
+  }
+  const tabs = (await listRes.json()) as Array<{
+    id: string;
+    type: string;
+    webSocketDebuggerUrl?: string;
+  }>;
+  const page = tabs.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+  if (!page || !page.webSocketDebuggerUrl) {
+    throw new Error('no page tab with a debugger URL');
+  }
+
+  // ws is already a runtime dep (BrowserBridge uses it). Importing here
+  // dynamically keeps the cold-start surface of unrelated CLI subcommands
+  // (`status`, `doctor`, etc.) free of WS load cost.
+  const { WebSocket } = await import('ws');
+  return await new Promise((resolve, reject) => {
+    const sock = new WebSocket(page.webSocketDebuggerUrl!);
+    const cmdId = 1;
+    const timer = setTimeout(() => {
+      try { sock.close(); } catch { /* ignore */ }
+      reject(new Error('CDP navigate timed out after 5s'));
+    }, 5000);
+    sock.on('open', () => {
+      sock.send(JSON.stringify({
+        id: cmdId,
+        method: 'Page.navigate',
+        params: { url }
+      }));
+    });
+    sock.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as {
+          id?: number;
+          result?: { loaderId?: string; errorText?: string };
+          error?: { message?: string };
+        };
+        if (msg.id !== cmdId) return;
+        clearTimeout(timer);
+        try { sock.close(); } catch { /* ignore */ }
+        if (msg.error) {
+          reject(new Error(msg.error.message ?? 'CDP error'));
+          return;
+        }
+        if (msg.result?.errorText) {
+          reject(new Error(msg.result.errorText));
+          return;
+        }
+        resolve({ tabId: page.id, loaderId: msg.result?.loaderId ?? null });
+      } catch (err) {
+        clearTimeout(timer);
+        try { sock.close(); } catch { /* ignore */ }
+        reject(err as Error);
+      }
+    });
+    sock.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shellQuoteCli(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 program.parse();
