@@ -11,7 +11,7 @@
  */
 
 import { Command } from 'commander';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, createReadStream, readdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, createReadStream, readdirSync, readlinkSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
@@ -1514,6 +1514,82 @@ function portOpen(port: number): boolean {
   }
 }
 
+/**
+ * BrowserBridge ownership check — replaces the old TCP-probe path for
+ * the bridge port. A bare port probe says "something is listening" but
+ * not *who*; that produced a false-positive "Listening: ✅" whenever any
+ * unrelated process bound 8771. Here we find the listening socket's
+ * inode (IPv4 + IPv6) and ask the kernel whether ThunderGate's PID owns
+ * it via /proc/<pid>/fd/*. Three outcomes the operator actually cares
+ * about: owned, unbound, or conflict.
+ */
+type BridgeStatus =
+  | { state: 'owned'; port: number }
+  | { state: 'unbound'; port: number }
+  | { state: 'conflict'; port: number; ownerPid: number | null };
+
+function findListeningInode(port: number): string | null {
+  const hex = port.toString(16).toUpperCase().padStart(4, '0');
+  for (const path of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let data: string;
+    try {
+      data = readFileSync(path, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const line of data.split('\n')) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length > 9 && cols[1]?.endsWith(`:${hex}`) && cols[3] === '0A') {
+        const inode = cols[9];
+        if (inode && inode !== '0') return inode;
+      }
+    }
+  }
+  return null;
+}
+
+function pidHoldsInode(pid: number, inode: string): boolean {
+  const expected = `socket:[${inode}]`;
+  let entries: string[];
+  try {
+    entries = readdirSync(`/proc/${pid}/fd`);
+  } catch {
+    return false;
+  }
+  for (const fd of entries) {
+    try {
+      if (readlinkSync(`/proc/${pid}/fd/${fd}`) === expected) return true;
+    } catch {
+      // fd vanished mid-scan or perm denied — keep going
+    }
+  }
+  return false;
+}
+
+function findInodeOwnerPid(inode: string): number | null {
+  let pids: string[];
+  try {
+    pids = readdirSync('/proc');
+  } catch {
+    return null;
+  }
+  for (const entry of pids) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = parseInt(entry, 10);
+    if (pidHoldsInode(pid, inode)) return pid;
+  }
+  return null;
+}
+
+function checkBridgeOwnership(port: number): BridgeStatus {
+  const inode = findListeningInode(port);
+  if (!inode) return { state: 'unbound', port };
+  if (isRunning() && pidHoldsInode(getPid(), inode)) {
+    return { state: 'owned', port };
+  }
+  return { state: 'conflict', port, ownerPid: findInodeOwnerPid(inode) };
+}
+
 async function runDiagnostic(autoFix: boolean = false): Promise<void> {
   const timestamp = new Date().toLocaleString();
   console.log(`⚡ ThunderGate Doctor — ${timestamp}`);
@@ -1704,7 +1780,7 @@ async function runDiagnostic(autoFix: boolean = false): Promise<void> {
   if (running) {
     try {
       const browserPort = DEFAULT_BROWSER_BRIDGE_PORT;
-      const portUp = portOpen(browserPort);
+      const bridge = checkBridgeOwnership(browserPort);
       const ledger = new ProvenanceLedger(ensureConfig().localInference.provenanceFile);
       const events: ProvenanceEvent[] = ledger.tail(200);
       const reversed = [...events].reverse();
@@ -1723,12 +1799,22 @@ async function runDiagnostic(autoFix: boolean = false): Promise<void> {
       const tail = connected
         ? ` | ext connected at ${lastReadyAt}${url ? ` | url=${truncate(url, 60)}` : ''}${portalState ? ` | state=${portalState}` : ''}`
         : ` | no extension currently connected`;
+      let detail: string;
+      switch (bridge.state) {
+        case 'owned':
+          detail = `Listening on ws://0.0.0.0:${browserPort}${tail}`;
+          break;
+        case 'unbound':
+          detail = `Not listening on ${browserPort} — port bind failed or runtime old build${tail}`;
+          break;
+        case 'conflict':
+          detail = `Port ${browserPort} held by another process${bridge.ownerPid != null ? ` (PID ${bridge.ownerPid})` : ''} — ThunderGate is NOT the listener${tail}`;
+          break;
+      }
       checks.push({
         name: 'Browser',
-        pass: portUp,
-        detail: portUp
-          ? `Listening on ws://0.0.0.0:${browserPort}${tail}`
-          : `Not listening on ${browserPort} — port bind failed or runtime old build${tail}`
+        pass: bridge.state === 'owned',
+        detail
       });
     } catch (err) {
       checks.push({
@@ -1784,17 +1870,34 @@ browserCmd
   .action(() => {
     const cfg = ensureConfig();
     const browserPort = DEFAULT_BROWSER_BRIDGE_PORT;
-    const portUp = portOpen(browserPort);
+    const bridge = checkBridgeOwnership(browserPort);
 
     console.log('⚡ ThunderBrowser Bridge Status');
     console.log('═══════════════════════════════════════');
-    console.log(`  Listening:        ${portUp ? `✅ ws://0.0.0.0:${browserPort}` : `❌ port ${browserPort} not bound`}`);
-    if (!portUp) {
+    let listeningLine: string;
+    switch (bridge.state) {
+      case 'owned':
+        listeningLine = `✅ ws://0.0.0.0:${browserPort}`;
+        break;
+      case 'unbound':
+        listeningLine = `❌ port ${browserPort} not bound`;
+        break;
+      case 'conflict':
+        listeningLine = `❌ port conflict${bridge.ownerPid != null ? ` (PID ${bridge.ownerPid} holds :${browserPort})` : ` on :${browserPort}`}`;
+        break;
+    }
+    console.log(`  Listening:        ${listeningLine}`);
+    if (bridge.state !== 'owned') {
       console.log('');
-      console.log('  Bridge listener not bound. Most likely causes:');
-      console.log('   • ThunderGate runtime is not running (run: thundergate start)');
-      console.log('   • Runtime is on an older build that predates the BrowserBridge wiring');
-      console.log('   • Port already in use by another process');
+      if (bridge.state === 'unbound') {
+        console.log('  Bridge listener not bound. Most likely causes:');
+        console.log('   • ThunderGate runtime is not running (run: thundergate start)');
+        console.log('   • Runtime is on an older build that predates the BrowserBridge wiring');
+      } else {
+        console.log('  Another process owns the bridge port. ThunderGate is NOT the listener.');
+        console.log('   • Stop the conflicting process, or move the bridge to another port');
+        console.log('   • Check: ss -ltnp | grep :' + browserPort);
+      }
       return;
     }
 
@@ -1942,11 +2045,24 @@ browserCmd
   .description('Show current page state (URL, portal state, last action) from the runtime')
   .action(() => {
     const cfg = ensureConfig();
-    const portUp = portOpen(DEFAULT_BROWSER_BRIDGE_PORT);
+    const bridge = checkBridgeOwnership(DEFAULT_BROWSER_BRIDGE_PORT);
+    const owned = bridge.state === 'owned';
     console.log('⚡ ThunderBrowser State');
     console.log('═══════════════════════════════════════');
-    console.log(`  Bridge listening: ${portUp ? `✅ ws://0.0.0.0:${DEFAULT_BROWSER_BRIDGE_PORT}` : '❌ not bound'}`);
-    if (!portUp) {
+    let bridgeLine: string;
+    switch (bridge.state) {
+      case 'owned':
+        bridgeLine = `✅ ws://0.0.0.0:${DEFAULT_BROWSER_BRIDGE_PORT}`;
+        break;
+      case 'unbound':
+        bridgeLine = `❌ port ${DEFAULT_BROWSER_BRIDGE_PORT} not bound`;
+        break;
+      case 'conflict':
+        bridgeLine = `❌ port conflict${bridge.ownerPid != null ? ` (PID ${bridge.ownerPid})` : ''}`;
+        break;
+    }
+    console.log(`  Bridge listening: ${bridgeLine}`);
+    if (!owned) {
       console.log('  (start thundergate first — bridge is in-process)');
       return;
     }
