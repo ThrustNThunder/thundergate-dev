@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "ThunderBrowser",
+  "version": "0.1.0",
+  "description": "ThunderGate's arm in the browser. Dials the BrowserBridge on ws://localhost:8771 and executes navigate/click/fill/get_state on behalf of the runtime.",
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "activeTab",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "minimum_chrome_version": "120"
+}

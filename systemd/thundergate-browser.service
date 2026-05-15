@@ -1,7 +1,7 @@
 [Unit]
 Description=ThunderBrowser — headless Chromium for ThunderBase
 # Browser comes up after the gateway so the extension finds the bridge
-# listener on port 8770 on first dial. `Wants=` (not `Requires=`) keeps
+# listener on port 8771 on first dial. `Wants=` (not `Requires=`) keeps
 # the dependency soft — the browser is non-critical to the Ghost Jon
 # 7-day clock; if thundergate is down the browser just retries.
 After=network-online.target thundergate.service
