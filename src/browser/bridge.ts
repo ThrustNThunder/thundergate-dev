@@ -8,7 +8,7 @@
  * the way a process treats stdin/stdout — wire-level plumbing the
  * caller never has to think about.
  *
- * Topology: ThunderGate listens on a dedicated port (default 8770).
+ * Topology: ThunderGate listens on a dedicated port (default 8771).
  * The ThunderBrowser extension dials in on load, sends `browser_ready`
  * with its current URL + portal state, and from then on this bridge
  * pushes commands and the extension answers them with `command_result`
@@ -36,7 +36,7 @@ import { randomUUID } from 'crypto';
 import { WorldState } from '../world/state.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
 
-export const DEFAULT_BROWSER_BRIDGE_PORT = 8770;
+export const DEFAULT_BROWSER_BRIDGE_PORT = 8771;
 export const DEFAULT_COMMAND_TIMEOUT_MS = 5000;
 
 /** Optional per-call override. */

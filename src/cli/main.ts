@@ -1696,7 +1696,7 @@ async function runDiagnostic(autoFix: boolean = false): Promise<void> {
   }
 
   // Check 11: BrowserBridge native infrastructure. Listening port
-  // (default 8770) holds open for the ThunderBrowser extension to dial
+  // (default 8771) holds open for the ThunderBrowser extension to dial
   // in. "No extension connected" is a healthy steady state — most
   // operators don't have the extension running. We pass when the
   // listener is up; the detail string carries connection + portal state

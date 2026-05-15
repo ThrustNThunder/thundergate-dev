@@ -75,7 +75,7 @@ export class ThunderGateRuntime {
   private provenance!: ProvenanceLedger;
   private localInference!: LocalInferenceProvider;
   // Native runtime bridge to the ThunderBrowser extension. Listens on a
-  // dedicated port (default 8770) and exposes browser.click()/fill()/
+  // dedicated port (default 8771) and exposes browser.click()/fill()/
   // getState() as direct async calls — the brain commanding the arm.
   // Unlike `BrowserBridgeChannel`, this is not a channel: there's no
   // queueing, no per-peer audit chain, just request/response over a
