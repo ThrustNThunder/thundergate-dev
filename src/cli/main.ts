@@ -2166,6 +2166,229 @@ browserCmd
     }
   });
 
+browserCmd
+  .command('read')
+  .description('Print the visible text of the current page (document.body.innerText)')
+  .action(async () => {
+    try {
+      const text = await evalOnPage<string>('document.body ? document.body.innerText : ""');
+      process.stdout.write((text ?? '') + (text && !text.endsWith('\n') ? '\n' : ''));
+    } catch (err) {
+      console.error(`  ✗ read failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+browserCmd
+  .command('extract [selector]')
+  .description('Extract text from one element by CSS selector — body text if omitted')
+  .option('--html', 'Return outerHTML instead of innerText')
+  .action(async (selector: string | undefined, opts: { html?: boolean }) => {
+    // Encode the selector as a JSON string so embedded quotes, backslashes,
+    // or newlines don't break the eval. The "no selector" branch is just a
+    // synonym for `read` so users don't have to remember which command
+    // takes optional args.
+    const sel = selector ? JSON.stringify(selector) : null;
+    const prop = opts.html ? 'outerHTML' : 'innerText';
+    const expr = sel
+      ? `(() => { const el = document.querySelector(${sel}); if (!el) throw new Error('element_not_found:${selector?.replace(/'/g, "\\'")}'); return el.${prop}; })()`
+      : `document.body ? document.body.${prop} : ''`;
+    try {
+      const text = await evalOnPage<string>(expr);
+      process.stdout.write((text ?? '') + (text && !text.endsWith('\n') ? '\n' : ''));
+    } catch (err) {
+      console.error(`  ✗ extract failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+browserCmd
+  .command('click <selector>')
+  .description('Click the first matching element. CSS selector, or "text=Foo" for a textContent match')
+  .action(async (selector: string) => {
+    // Mirror the content-script behavior: find element → .click(). text=
+    // prefix walks anchors/buttons/inputs for a textContent match so
+    // operators don't need to hand-write XPath for common cases.
+    const expr = buildClickExpression(selector);
+    try {
+      await evalOnPage(expr);
+      console.log(`⚡ Clicked ${selector}`);
+    } catch (err) {
+      console.error(`  ✗ click failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+browserCmd
+  .command('fill <selector> <value...>')
+  .description('Fill an input/textarea/contentEditable element with a value (dispatches input + change)')
+  .action(async (selector: string, valueParts: string[]) => {
+    const value = valueParts.join(' ');
+    // Replicates content.js exactly — focus, assign value or textContent
+    // for contentEditable, then dispatch input + change so framework
+    // listeners (React, Vue, Lit) actually see the change.
+    const expr = `(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) throw new Error('element_not_found:${selector.replace(/'/g, "\\'")}');
+      if ('value' in el) {
+        el.focus();
+        el.value = ${JSON.stringify(value)};
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      } else if (el.isContentEditable) {
+        el.textContent = ${JSON.stringify(value)};
+      } else {
+        throw new Error('element_not_fillable');
+      }
+      return true;
+    })()`;
+    try {
+      await evalOnPage(expr);
+      console.log(`⚡ Filled ${selector} (${value.length} chars)`);
+    } catch (err) {
+      console.error(`  ✗ fill failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+browserCmd
+  .command('eval <js...>')
+  .description('Evaluate arbitrary JavaScript in the page and print the result (JSON for objects)')
+  .action(async (jsParts: string[]) => {
+    const expr = jsParts.join(' ');
+    try {
+      const value = await evalOnPage(expr);
+      if (value === undefined) {
+        console.log('(undefined)');
+      } else if (typeof value === 'string') {
+        process.stdout.write(value + (value.endsWith('\n') ? '' : '\n'));
+      } else {
+        console.log(JSON.stringify(value, null, 2));
+      }
+    } catch (err) {
+      console.error(`  ✗ eval failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Build the click expression for `browser click <selector>`. CSS goes
+ * straight to querySelector. `text=Foo` does a case-insensitive walk of
+ * actionable elements (anchors, buttons, inputs, role=button) looking for
+ * an exact-or-substring textContent match — keeps the surface usable when
+ * the operator doesn't know the page's class structure.
+ */
+function buildClickExpression(selector: string): string {
+  if (selector.startsWith('text=')) {
+    const phrase = selector.slice(5);
+    return `(() => {
+      const needle = ${JSON.stringify(phrase.toLowerCase())};
+      const candidates = document.querySelectorAll('a,button,input[type="submit"],input[type="button"],[role="button"]');
+      for (const el of candidates) {
+        const text = (el.innerText || el.value || '').trim().toLowerCase();
+        if (text === needle || text.includes(needle)) {
+          el.click();
+          return true;
+        }
+      }
+      throw new Error('no_clickable_match:' + ${JSON.stringify(phrase)});
+    })()`;
+  }
+  return `(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) throw new Error('element_not_found:${selector.replace(/'/g, "\\'")}');
+    el.click();
+    return true;
+  })()`;
+}
+
+/**
+ * Drive the first available page tab via CDP Runtime.evaluate. Used by
+ * read / extract / click / fill / eval — all of which boil down to
+ * "run some JavaScript in the page and return the value". We pick the
+ * first tab whose URL isn't about:blank so the command targets the
+ * working page rather than a leftover blank tab.
+ *
+ * `awaitPromise` + `returnByValue` let callers write async expressions
+ * (e.g. `eval "await fetch('/api/x').then(r => r.json())"`) and still
+ * receive a plain value.
+ */
+async function evalOnPage<T = unknown>(expression: string, timeoutMs = 10000): Promise<T> {
+  const listRes = await fetch(`http://127.0.0.1:${BROWSER_DEVTOOLS_PORT}/json`);
+  if (!listRes.ok) {
+    throw new Error(`CDP list returned ${listRes.status} — is the browser running?`);
+  }
+  const tabs = (await listRes.json()) as Array<{
+    id: string;
+    type: string;
+    url?: string;
+    webSocketDebuggerUrl?: string;
+  }>;
+  const pages = tabs.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+  if (pages.length === 0) throw new Error('no page tab with a debugger URL');
+  const page = pages.find((t) => t.url && t.url !== 'about:blank') ?? pages[0];
+  const { WebSocket } = await import('ws');
+  return await new Promise<T>((resolve, reject) => {
+    const sock = new WebSocket(page.webSocketDebuggerUrl!);
+    const cmdId = 1;
+    const timer = setTimeout(() => {
+      try { sock.close(); } catch { /* ignore */ }
+      reject(new Error(`CDP eval timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    sock.on('open', () => {
+      sock.send(JSON.stringify({
+        id: cmdId,
+        method: 'Runtime.evaluate',
+        params: {
+          expression,
+          returnByValue: true,
+          awaitPromise: true,
+          userGesture: true
+        }
+      }));
+    });
+    sock.on('message', (raw) => {
+      let msg: {
+        id?: number;
+        result?: {
+          result?: { value?: unknown; type?: string; description?: string };
+          exceptionDetails?: { exception?: { description?: string }; text?: string };
+        };
+        error?: { message?: string };
+      };
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch (err) {
+        clearTimeout(timer);
+        try { sock.close(); } catch { /* ignore */ }
+        reject(err as Error);
+        return;
+      }
+      if (msg.id !== cmdId) return;
+      clearTimeout(timer);
+      try { sock.close(); } catch { /* ignore */ }
+      if (msg.error) {
+        reject(new Error(msg.error.message ?? 'CDP error'));
+        return;
+      }
+      const ex = msg.result?.exceptionDetails;
+      if (ex) {
+        const detail = ex.exception?.description ?? ex.text ?? 'page exception';
+        // Strip the "Error: " prefix and any stack trace lines so the CLI
+        // surfaces the meaningful one-liner the page threw.
+        const oneLine = detail.split('\n')[0].replace(/^Error:\s*/, '');
+        reject(new Error(oneLine));
+        return;
+      }
+      resolve(msg.result?.result?.value as T);
+    });
+    sock.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
 /**
  * Drive Chrome's first available tab via DevTools Protocol. The launcher
  * pins `--remote-debugging-port=9222` on 127.0.0.1, so the surface is
