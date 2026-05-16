@@ -57,6 +57,8 @@ import { MemoryWAL } from '../memory/wal.js';
 import { VaultService } from '../vault/vault.js';
 import { VaultProtocol } from '../vault/protocol.js';
 import type { VaultProviderRegistry } from '../vault/registry.js';
+import { AgentVault, setSharedAgentVault, tryGetAgentSecret } from '../vault/agent-vault.js';
+import { EmergencyProtocol } from '../vault/emergency.js';
 
 // Runtime state
 interface RuntimeState {
@@ -116,6 +118,15 @@ export class ThunderGateRuntime {
   // but it is never auto-unlocked: every protocol cycle re-prompts.
   private vault: VaultService | null = null;
   private vaultProtocol: VaultProtocol | null = null;
+  // Vault A — agent credential vault. Holds API keys/tokens for outbound
+  // HTTP. Process-shared so the redactor and HTTP call sites see the
+  // same lock state.
+  private agentVault: AgentVault | null = null;
+  // Emergency Protocol state machine — see src/vault/emergency.ts.
+  // Constructed during start(); inbound messages route through here
+  // before the normal LLM path so the trigger/challenge/standdown
+  // phrases bypass everything else.
+  private emergency!: EmergencyProtocol;
   /**
    * Wall-clock at runtime start, used by the Ghost state snapshot to
    * report service uptime. Captured in the constructor (not start()) so
@@ -198,6 +209,63 @@ export class ThunderGateRuntime {
     return this.vault?.getRegistry() ?? undefined;
   }
 
+  /** Vault A accessor — agent credential vault. May be null if the
+   *  agent vault failed to initialize. */
+  getAgentVault(): AgentVault | undefined {
+    return this.agentVault ?? undefined;
+  }
+
+  /** Emergency Protocol state machine — exposed so doctor + TUI can
+   *  surface the current state without poking at internals. */
+  getEmergencyProtocol(): EmergencyProtocol | undefined {
+    return this.emergency;
+  }
+
+  /**
+   * Read a single vault H field for Emergency Protocol bootstrap. The
+   * protocol asks for `emergency_challenge` / `emergency_response`;
+   * we issue a one-shot `raw` grant so the actual word reaches the
+   * caller. If the vault is locked or the field is missing, returns
+   * null and the protocol falls back to development defaults.
+   *
+   * This is the ONE place outside the protocol that can pull these
+   * fields raw; the grant carries a clear policy reason for the audit
+   * trail.
+   */
+  private async readVaultFieldForEmergency(label: string): Promise<string | null> {
+    if (!this.vault || !this.vault.isUnlocked()) return null;
+    try {
+      const grant = await this.vault.issueGrant({
+        user: 'system',
+        agent_id: 'jon',
+        channel: 'emergency-protocol',
+        purpose: `emergency_protocol_read(${label})`,
+        field_label: label,
+        ttl_ms: 30_000,
+        disclosure_mode: 'raw',
+        raw_policy_reason: 'emergency-protocol bootstrap'
+      });
+      const resp = await this.vault.access({ grant });
+      if (resp.mode === 'raw') return resp.value;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Resolve an outbound service API key. Tries Vault A first (so the
+   * operator-owned, encrypted store wins when unlocked); falls back to
+   * the config-supplied key otherwise. Returns the empty string if
+   * neither source has one — the caller decides whether to skip the
+   * call or fail loud.
+   */
+  async resolveServiceKey(name: 'elevenlabs' | 'voyage', fallback: string | undefined): Promise<string> {
+    const fromVault = await tryGetAgentSecret(name);
+    if (fromVault) return fromVault;
+    return fallback ?? '';
+  }
+
   /** DB accessor — CLI needs it for read-only memory list. */
   getDB(): SessionDB | undefined {
     return this.db;
@@ -262,6 +330,28 @@ export class ThunderGateRuntime {
       this.vault = null;
       this.vaultProtocol = null;
     }
+
+    // Vault A — agent credential vault. Starts locked. Process-shared
+    // via setSharedAgentVault so the HTTP call sites (resolveServiceKey
+    // below) can reach the unlocked handle without threading the
+    // runtime through every adapter.
+    try {
+      this.agentVault = new AgentVault();
+      this.agentVault.initialize();
+      setSharedAgentVault(this.agentVault);
+      console.log('  ✓ Vault A (agent credentials) initialized (locked)');
+    } catch (err) {
+      console.warn('  ⚠ Vault A init failed (non-fatal):', (err as Error).message);
+      this.agentVault = null;
+      setSharedAgentVault(null);
+    }
+
+    // Emergency Protocol state machine. Independent of vault unlock
+    // state — falls back to development defaults if vault H is locked
+    // or the challenge/response fields are missing.
+    this.emergency = new EmergencyProtocol({
+      readVaultField: (label) => this.readVaultFieldForEmergency(label)
+    });
     if (this.config.localInference.enabled) {
       console.log(`  ✓ Local inference probe started (${this.config.localInference.endpoint})`);
     } else {
@@ -514,6 +604,58 @@ export class ThunderGateRuntime {
       entry.text
     );
 
+    // ── Emergency Protocol short-circuit ────────────────────────────────
+    // Trigger phrase, challenge response, and stand-down all bypass the
+    // normal LLM path. The state machine returns a `reply` field when
+    // it wants us to emit something synthetic back to the same channel.
+    try {
+      const ev = await this.emergency.onInbound(channelId, entry.text);
+      if (ev.kind !== 'none' && ev.reply) {
+        const replyText = redactSecrets(ev.reply);
+        const delivery: OutboundDelivery = {
+          id: newMessageId(),
+          agentId: 'jon',
+          sender: 'Jon',
+          channel: channelId,
+          text: replyText,
+          timestamp: Date.now(),
+          model: this.config.runtime.model
+        };
+        this.wal.append({
+          type: 'outbound_message',
+          sessionId: this.state.sessionId || null,
+          payload: {
+            messageId: delivery.id,
+            inboundMessageId: entry.id,
+            channel: channelId,
+            agentId: delivery.agentId,
+            sender: delivery.sender,
+            text: replyText,
+            timestamp: delivery.timestamp,
+            model: delivery.model,
+            emergency_event: ev.kind
+          }
+        });
+        persistChannelMessage(
+          this.db,
+          this.state.sessionId,
+          channelId,
+          'assistant',
+          replyText
+        );
+        this.channels.broadcast(delivery);
+        // For activate/challenge/deactivate we short-circuit. Failed
+        // responses also short-circuit — we don't want to feed the
+        // wrong word into the LLM either.
+        if (ev.kind === 'challenge_issued' || ev.kind === 'activated' ||
+            ev.kind === 'deactivated' || ev.kind === 'failed_response') {
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn('  ⚠ emergency protocol handler failed:', (err as Error).message);
+    }
+
     // ── Vault protocol short-circuit ────────────────────────────────────
     // If a vault unlock request is pending on this channel and the
     // inbound looks like the user's answer, divert *before* any other
@@ -632,6 +774,12 @@ export class ThunderGateRuntime {
     let composedText = response.content;
     if (untrainLine) composedText = `${untrainLine}\n\n${composedText}`;
     if (surfaceLine) composedText = `${surfaceLine}\n\n${composedText}`;
+
+    // ── Vault A outbound redaction ──
+    // Pattern-scan the assembled reply before it touches any surface.
+    // HTTP headers/bodies the runtime makes itself are exempt (they ARE
+    // the key in use); only text destined for a surface gets scanned.
+    composedText = redactSecrets(composedText);
 
     // ── Promise extraction from the assistant's outbound text ──
     try {
@@ -1439,7 +1587,10 @@ export class ThunderGateRuntime {
     for (const t of compactResult.turns) {
       messages.push({ role: t.role, content: t.content });
     }
-    const replyText = await this.callLLM(messages, { cacheHint });
+    const rawReplyText = await this.callLLM(messages, { cacheHint });
+    // Vault A outbound redaction — apply before persistence so the
+    // session DB never holds the leaked key either.
+    const replyText = redactSecrets(rawReplyText);
 
     if (replyText) {
       try {
@@ -1612,6 +1763,12 @@ export class ThunderGateRuntime {
       this.vaultProtocol = null;
     } catch { /* ignore */ }
 
+    try {
+      this.agentVault?.close();
+      this.agentVault = null;
+      setSharedAgentVault(null);
+    } catch { /* ignore */ }
+
     // Close database
     await this.db.close();
     console.log('  ✓ Database closed');
@@ -1639,6 +1796,42 @@ export class ThunderGateRuntime {
  * sessions table hasn't been touched yet (Doctor and ghost paths exhibit
  * the same shape).
  */
+/**
+ * Vault A outbound redaction.
+ *
+ * Pattern-scans text destined for a surface (Slack, WhatsApp,
+ * ThunderCommo, TUI, etc.) for common API-key shapes and replaces any
+ * match with `[REDACTED:vault-a]`. HTTP request headers/bodies the
+ * runtime makes itself are exempt — those calls ARE the use of the key,
+ * not its disclosure.
+ *
+ * Patterns intentionally err on the side of catching too much:
+ *   - sk-...          : OpenAI / Stripe / generic 'sk-' tokens
+ *   - pa--...         : ElevenLabs convention
+ *   - ghp_...         : GitHub personal access tokens (40-char body)
+ *   - xai-...         : xAI tokens
+ *
+ * Each redaction logs a console.warn so operators can spot the model
+ * leaking a key without exposing the key itself in the log line.
+ */
+export function redactSecrets(text: string): string {
+  if (!text) return text;
+  const patterns: Array<{ name: string; rx: RegExp }> = [
+    { name: 'sk-', rx: /sk-[a-zA-Z0-9]{20,}/g },
+    { name: 'pa--', rx: /pa--[a-zA-Z0-9_-]{20,}/g },
+    { name: 'ghp_', rx: /ghp_[a-zA-Z0-9]{36}/g },
+    { name: 'xai-', rx: /xai-[a-zA-Z0-9]{40,}/g }
+  ];
+  let out = text;
+  for (const p of patterns) {
+    out = out.replace(p.rx, () => {
+      console.warn(`vault-a: redacted key pattern in outbound response (${p.name})`);
+      return '[REDACTED:vault-a]';
+    });
+  }
+  return out;
+}
+
 function persistChannelMessage(
   db: SessionDB,
   sessionId: string | null,

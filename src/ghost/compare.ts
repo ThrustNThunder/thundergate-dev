@@ -463,12 +463,15 @@ let lastWarnedAt = 0;
  * swap the URL/header and leave the rest of the comparator unchanged.
  */
 export function voyageEmbedder(
-  apiKey: string,
+  apiKey: string | (() => Promise<string>),
   opts: { model?: string; timeoutMs?: number } = {}
 ): EmbeddingFn {
   const model = opts.model ?? 'voyage-3-lite';
   const timeoutMs = opts.timeoutMs ?? 5000;
+  const resolveKey = typeof apiKey === 'function' ? apiKey : async () => apiKey;
   return async (texts: string[]): Promise<number[][]> => {
+    const key = await resolveKey();
+    if (!key) throw new Error('voyage: no API key available');
     const callOnce = async () => {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -477,7 +480,7 @@ export function voyageEmbedder(
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`
+            Authorization: `Bearer ${key}`
           },
           body: JSON.stringify({ input: texts, model }),
           signal: ctrl.signal

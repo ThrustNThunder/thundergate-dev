@@ -39,6 +39,7 @@ import {
   type EmbeddingFn,
   type MatchResult
 } from './compare.js';
+import { getSharedAgentVault, tryGetAgentSecret } from '../vault/agent-vault.js';
 
 export interface GhostEntry {
   timestamp: number;
@@ -543,8 +544,17 @@ export class GhostHarness {
     // Tier-3 of the comparator hits Voyage's embeddings endpoint. If no
     // key is configured the comparator silently degrades to tier-2 and
     // tags the entry so doctor can see we skipped.
-    if (config.voyageApiKey && config.voyageApiKey.length > 0) {
-      this.embed = voyageEmbedder(config.voyageApiKey);
+    //
+    // Key resolution order: Vault A first (operator-controlled,
+    // encrypted at rest), then config.voyageApiKey. We wire a resolver
+    // rather than a static string so a vault unlock mid-process picks
+    // up immediately on the next embed call.
+    const fallback = config.voyageApiKey ?? '';
+    if (fallback.length > 0 || getSharedAgentVault() !== null) {
+      this.embed = voyageEmbedder(async () => {
+        const fromVault = await tryGetAgentSecret('voyage');
+        return fromVault ?? fallback;
+      });
     }
   }
 

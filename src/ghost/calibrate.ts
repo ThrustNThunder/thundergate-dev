@@ -22,6 +22,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { dirname, resolve as pathResolve, dirname as pathDirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { Config } from '../config/loader.js';
+import { getSharedAgentVault, tryGetAgentSecret } from '../vault/agent-vault.js';
 import {
   compareResponses,
   voyageEmbedder,
@@ -150,8 +151,12 @@ export class GhostCalibrator {
 
   constructor(config: Config) {
     this.config = config;
-    if (config.voyageApiKey && config.voyageApiKey.length > 0) {
-      this.embed = voyageEmbedder(config.voyageApiKey);
+    const fallback = config.voyageApiKey ?? '';
+    if (fallback.length > 0 || getSharedAgentVault() !== null) {
+      this.embed = voyageEmbedder(async () => {
+        const fromVault = await tryGetAgentSecret('voyage');
+        return fromVault ?? fallback;
+      });
     }
     this.snapshotSource = this.buildSnapshotSource();
   }

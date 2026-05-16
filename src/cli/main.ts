@@ -22,6 +22,7 @@ import {
   validateConfig,
   getConfigPath,
   saveConfigField,
+  readRawConfig,
   CONTEXT_TTL_VALUES,
   CONTEXT_CACHE_VALUES,
   CONTEXT_COMPACTION_VALUES
@@ -49,6 +50,11 @@ import {
   type DisclosureMode
 } from '../vault/vault.js';
 import { VaultProtocol } from '../vault/protocol.js';
+import {
+  AgentVault,
+  AgentVaultBadPasswordError,
+  AgentVaultLockedError
+} from '../vault/agent-vault.js';
 import { WorldState } from '../world/state.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1230,6 +1236,270 @@ function providerPhase(kind: string): string {
     default:
       return '?';
   }
+}
+
+// ── vault-a (agent credential vault) ─────────────────────────────────────
+//
+// Separate SQLite store at ~/.thundergate/agent-vault.db holding API
+// keys/tokens Jon uses for outbound HTTP. Same crypto as Vault H but a
+// flat schema (no grants/receipts) — these are runtime-native; "use" is
+// the default operation, "disclose" is what we redact for.
+
+async function withAgentVault<T>(fn: (vault: AgentVault) => Promise<T> | T): Promise<T> {
+  const vault = new AgentVault();
+  vault.initialize();
+  try {
+    return await fn(vault);
+  } finally {
+    vault.close();
+  }
+}
+
+const vaultACmd = program.command('vault-a').description('Agent credential vault — API keys, tokens, service creds');
+
+vaultACmd
+  .command('status')
+  .description('Show lock state and entry count')
+  .action(async () => {
+    await withAgentVault((vault) => {
+      const s = vault.status();
+      console.log('⚡ Vault A Status');
+      console.log('═══════════════════════════════════════');
+      console.log(`  DB path: ${s.dbPath}`);
+      console.log(`  Entries: ${s.entryCount}`);
+      console.log(`  State:   ${s.locked ? '🔒 LOCKED' : '🔓 UNLOCKED'}`);
+    });
+  });
+
+vaultACmd
+  .command('unlock')
+  .description('Unlock the agent vault (prompts for password)')
+  .option('--password <text>', 'Password (otherwise prompted)')
+  .action(async (opts: { password?: string }) => {
+    await withAgentVault(async (vault) => {
+      const password = opts.password ?? (await promptHidden('Vault A password: '));
+      try {
+        await vault.unlockAgentVault(password);
+        const s = vault.status();
+        console.log(`  ✓ Vault A unlocked (${s.entryCount} entries)`);
+      } catch (err) {
+        if (err instanceof AgentVaultBadPasswordError) {
+          console.error('  ✗ Bad password — vault stays locked.');
+          process.exit(1);
+        }
+        throw err;
+      }
+    });
+  });
+
+vaultACmd
+  .command('add <name> <value>')
+  .description('Add or replace an agent secret. <name> is the lookup key (e.g. "elevenlabs"); <value> is the secret.')
+  .option('--service <name>', 'Service tag for grouping (defaults to <name>)')
+  .option('--password <text>', 'Vault password (otherwise prompted)')
+  .action(async (name: string, value: string, opts: { service?: string; password?: string }) => {
+    await withAgentVault(async (vault) => {
+      if (!vault.isUnlocked()) {
+        const password = opts.password ?? (await promptHidden('Vault A password: '));
+        try {
+          await vault.unlockAgentVault(password);
+        } catch (err) {
+          if (err instanceof AgentVaultBadPasswordError) {
+            console.error('  ✗ Bad password — vault stays locked.');
+            process.exit(1);
+          }
+          throw err;
+        }
+      }
+      const service = opts.service ?? name;
+      try {
+        await vault.addAgentSecret(name, value, service);
+        console.log(`  ✓ Stored agent secret '${name}' (service: ${service})`);
+      } catch (err) {
+        console.error(`  ✗ Add failed: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    });
+  });
+
+vaultACmd
+  .command('list')
+  .description('List agent secret names + services (never values)')
+  .action(async () => {
+    await withAgentVault((vault) => {
+      const rows = vault.listAgentSecrets();
+      if (rows.length === 0) {
+        console.log('Vault A is empty.');
+        return;
+      }
+      console.log(`Agent secrets (${rows.length}):`);
+      let lastService = '';
+      for (const r of rows) {
+        if (r.service !== lastService) {
+          console.log(`\n  [${r.service}]`);
+          lastService = r.service;
+        }
+        console.log(`    • ${r.name.padEnd(28)} (added: ${r.added_at})`);
+      }
+    });
+  });
+
+vaultACmd
+  .command('use <name>')
+  .description('Verify the named agent secret is loadable. Prints "Key loaded for: <name>" — never the value.')
+  .option('--password <text>', 'Vault password (otherwise prompted)')
+  .action(async (name: string, opts: { password?: string }) => {
+    await withAgentVault(async (vault) => {
+      if (!vault.isUnlocked()) {
+        const password = opts.password ?? (await promptHidden('Vault A password: '));
+        try {
+          await vault.unlockAgentVault(password);
+        } catch (err) {
+          if (err instanceof AgentVaultBadPasswordError) {
+            console.error('  ✗ Bad password — vault stays locked.');
+            process.exit(1);
+          }
+          throw err;
+        }
+      }
+      try {
+        const v = await vault.getAgentSecret(name);
+        if (v === null) {
+          console.error(`  ✗ No agent secret named '${name}'.`);
+          process.exit(1);
+        }
+        // Deliberately print ONLY the confirmation line. The value is
+        // wiped from this scope immediately — never echoed.
+        console.log(`Key loaded for: ${name}`);
+      } catch (err) {
+        if (err instanceof AgentVaultLockedError) {
+          console.error('  ✗ Vault A locked between unlock and use (TTL expired).');
+          process.exit(1);
+        }
+        throw err;
+      }
+    });
+  });
+
+// ── setup (onboarding) ───────────────────────────────────────────────────
+//
+// Walks the operator through first-time configuration: vault H password,
+// emergency challenge/response, and emergency contacts. Idempotent — re-
+// running it updates the encrypted entries and the contacts list.
+
+program
+  .command('setup')
+  .description('Onboarding wizard: vault password, emergency challenge/response, emergency contacts')
+  .option('--non-interactive', 'Fail fast if any required prompt would be needed')
+  .action(async (opts: { nonInteractive?: boolean }) => {
+    if (opts.nonInteractive && !process.stdin.isTTY) {
+      console.error('  ✗ --non-interactive mode requires all values via env (not yet supported)');
+      process.exit(1);
+    }
+    console.log('⚡ ThunderGate Setup');
+    console.log('═══════════════════════════════════════');
+
+    // Vault H password — set if first run, otherwise just unlock to
+    // verify and proceed.
+    const cfg = ensureConfig();
+    const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
+    const vault = new VaultService(ledger);
+    vault.initialize();
+    try {
+      const vstat = vault.status();
+      const isFirstRun = vstat.entryCount === 0;
+      const prompt = isFirstRun
+        ? 'Set your vault H master password: '
+        : 'Enter your vault H password (to add emergency fields): ';
+      const password = await promptHidden(prompt);
+      if (isFirstRun) {
+        const confirm = await promptHidden('Confirm password: ');
+        if (password !== confirm) {
+          console.error('  ✗ Passwords did not match. Aborting setup.');
+          process.exit(1);
+        }
+      }
+      try {
+        vault.unlock({ source: 'password', password });
+      } catch (err) {
+        if (err instanceof VaultBadPasswordError) {
+          console.error('  ✗ Bad password — cannot proceed.');
+          process.exit(1);
+        }
+        throw err;
+      }
+      console.log('  ✓ Vault H unlocked');
+
+      // Emergency challenge + response. Stored encrypted in vault H so
+      // they ride the same key as the rest of the user's PII; the
+      // Emergency Protocol reads them at trigger time.
+      const challenge = (await promptVisible('Set your emergency challenge word (what Jon will ask you): ')).trim();
+      if (challenge.length === 0) {
+        console.error('  ✗ Challenge word required.');
+        process.exit(1);
+      }
+      const response = (await promptVisible('Set your emergency response word (what you reply with): ')).trim();
+      if (response.length === 0) {
+        console.error('  ✗ Response word required.');
+        process.exit(1);
+      }
+      try {
+        vault.add('auth', 'emergency_challenge', challenge);
+      } catch (err) {
+        // If the label already exists, vault.add throws on UNIQUE; we
+        // can fall through and skip — the operator can edit via the
+        // normal vault add path if they want to rotate.
+        const msg = (err as Error).message ?? '';
+        if (!/UNIQUE/i.test(msg)) {
+          console.warn(`  ⚠ Could not store emergency_challenge: ${msg}`);
+        } else {
+          console.log('  ℹ emergency_challenge already set — leaving prior value in place');
+        }
+      }
+      try {
+        vault.add('auth', 'emergency_response', response);
+      } catch (err) {
+        const msg = (err as Error).message ?? '';
+        if (!/UNIQUE/i.test(msg)) {
+          console.warn(`  ⚠ Could not store emergency_response: ${msg}`);
+        } else {
+          console.log('  ℹ emergency_response already set — leaving prior value in place');
+        }
+      }
+      console.log('  ✓ Emergency challenge + response stored (encrypted in vault H)');
+
+      // Emergency contacts. Written to config.json so they're loadable
+      // without the vault — the runtime uses them to fan out
+      // notifications during an active incident.
+      const contactName = (await promptVisible('Emergency contact name: ')).trim();
+      const contactChannel = (await promptVisible('Emergency contact channel (e.g. whatsapp:+17193388327): ')).trim();
+      if (contactName.length > 0 && contactChannel.length > 0) {
+        const raw = readRawConfig() ?? {};
+        const existing = Array.isArray((raw as { emergencyContacts?: unknown }).emergencyContacts)
+          ? ((raw as { emergencyContacts: Array<{ name: string; channel: string }> }).emergencyContacts)
+          : [];
+        // Replace any prior entry with the same channel; otherwise append.
+        const without = existing.filter((c) => c.channel !== contactChannel);
+        without.push({ name: contactName, channel: contactChannel });
+        saveConfigField('emergencyContacts', without);
+        console.log(`  ✓ Emergency contact saved: ${contactName} <${contactChannel}>`);
+      } else {
+        console.log('  ℹ Skipped emergency contact (left blank)');
+      }
+      console.log('\nSetup complete. You can re-run `thundergate setup` any time to update these values.');
+    } finally {
+      vault.close();
+    }
+  });
+
+// Plain-text prompt used by setup for fields that aren't secret. Kept
+// separate from promptHidden so secrets are obviously hidden by
+// construction at the call site.
+async function promptVisible(label: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer: string = await new Promise((resolve) => rl.question(label, resolve));
+  rl.close();
+  return answer;
 }
 
 // ── vault test-request ────────────────────────────────────────────────────
