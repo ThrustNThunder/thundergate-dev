@@ -1475,6 +1475,35 @@ function getMemoryUsage(): string {
   return used.toFixed(0);
 }
 
+interface LatestBrowserState {
+  url: string;
+  title: string;
+  portalState: string | null;
+  timestamp: number;
+}
+
+/**
+ * Find the freshest URL/title/portalState the bridge has observed.
+ * `state_update` carries post-navigation snapshots; `extension_ready`
+ * carries the initial connect. Whichever timestamp is newer wins so
+ * `browser state` reflects what's on screen *now*, not what was there
+ * at SW startup.
+ */
+function pickLatestBrowserState(reversedEvents: ProvenanceEvent[]): LatestBrowserState | null {
+  const candidate = reversedEvents.find(
+    (e) =>
+      e.actor === 'browser-bridge' &&
+      (e.action === 'state_update' || e.action === 'extension_ready')
+  );
+  if (!candidate) return null;
+  const data = (candidate.data as Record<string, unknown> | undefined) ?? {};
+  const url = typeof data.url === 'string' ? data.url : '';
+  const title = typeof data.title === 'string' ? data.title : '';
+  const portalStateRaw = data.portalState;
+  const portalState = typeof portalStateRaw === 'string' ? portalStateRaw : null;
+  return { url, title, portalState, timestamp: candidate.timestamp };
+}
+
 function formatLedgerAge(timestamp: number): string {
   const ms = Date.now() - timestamp;
   if (ms < 0) return 'in the future';
@@ -1918,6 +1947,7 @@ browserCmd
     const lastAction = reversed.find(
       (e) => e.actor === 'browser-bridge' && typeof e.action === 'string' && e.action.startsWith('browser_')
     );
+    const latestState = pickLatestBrowserState(reversed);
 
     const connected =
       lastReady != null &&
@@ -1925,13 +1955,14 @@ browserCmd
     console.log(`  Extension:        ${connected ? '✅ connected' : '❌ not connected'}`);
 
     if (lastReady) {
-      const url = (lastReady.data as any)?.url ?? '';
-      const portalState = (lastReady.data as any)?.portalState ?? null;
       console.log(`  Last ready:       ${formatLedgerAge(lastReady.timestamp)}`);
-      if (url) console.log(`  Current URL:      ${url}`);
-      if (portalState) console.log(`  Portal state:     ${portalState}`);
     } else {
       console.log('  Last ready:       (no extension has ever connected)');
+    }
+    if (latestState) {
+      if (latestState.url) console.log(`  Current URL:      ${latestState.url}`);
+      if (latestState.title) console.log(`  Page title:       ${latestState.title}`);
+      if (latestState.portalState) console.log(`  Portal state:     ${latestState.portalState}`);
     }
 
     if (lastDisc) {
@@ -2085,18 +2116,21 @@ browserCmd
     const lastDisc = reversed.find(
       (e) => e.actor === 'browser-bridge' && e.action === 'extension_disconnected'
     );
+    const latestState = pickLatestBrowserState(reversed);
     const connected =
       lastReady != null &&
       (lastDisc == null || lastDisc.timestamp < lastReady.timestamp);
     console.log(`  Extension:        ${connected ? '✅ connected' : '❌ not connected'}`);
-    if (lastReady) {
-      const url = (lastReady.data as any)?.url ?? '';
-      const portalState = (lastReady.data as any)?.portalState ?? null;
-      console.log(`  Current URL:      ${url || '(unknown)'}`);
-      console.log(`  Portal state:     ${portalState ?? '(none)'}`);
-      console.log(`  Last ready:       ${formatLedgerAge(lastReady.timestamp)}`);
+    if (latestState) {
+      console.log(`  Current URL:      ${latestState.url || '(unknown)'}`);
+      console.log(`  Page title:       ${latestState.title || '(unknown)'}`);
+      console.log(`  Portal state:     ${latestState.portalState ?? '(none)'}`);
+      console.log(`  State observed:   ${formatLedgerAge(latestState.timestamp)}`);
     } else {
       console.log('  Current URL:      (no ready envelope yet)');
+    }
+    if (lastReady && !latestState) {
+      console.log(`  Last ready:       ${formatLedgerAge(lastReady.timestamp)}`);
     }
     const lastAction = reversed.find(
       (e) => e.actor === 'browser-bridge' && typeof e.action === 'string' && e.action.startsWith('browser_')

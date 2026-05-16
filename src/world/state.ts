@@ -89,6 +89,7 @@ export class WorldState {
    */
   browserConnected: boolean = false;
   browserCurrentUrl: string = '';
+  browserPageTitle: string = '';
   browserPortalState: string | null = null;
   browserLastActionAt: number | null = null;
 

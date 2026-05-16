@@ -58,6 +58,7 @@ async function currentUrlAndState() {
   if (tab) activeTabId = tab.id ?? activeTabId;
   return {
     url: tab?.url ?? '',
+    title: tab?.title ?? '',
     state: null
   };
 }
@@ -79,8 +80,8 @@ function connect() {
 
   ws.addEventListener('open', async () => {
     log('connected');
-    const { url, state } = await currentUrlAndState();
-    safeSend({ type: 'browser_ready', url, state });
+    const { url, title, state } = await currentUrlAndState();
+    safeSend({ type: 'browser_ready', url, title, state });
   });
 
   ws.addEventListener('message', async (event) => {
@@ -154,12 +155,17 @@ async function runCommand(action, args) {
 async function cmdGetState() {
   const tab = await getActiveTab();
   if (!tab || tab.id == null) {
-    return { url: '', portalState: null, capturedAt: Date.now() };
+    return { url: '', title: '', portalState: null, capturedAt: Date.now() };
   }
   activeTabId = tab.id;
   const inPage = await tabRpc(tab.id, { op: 'getState' });
+  const title = inPage?.snapshot?.title ?? tab.title ?? '';
+  // Echo so the bridge's resolvePending path is enough for callers that
+  // only await get_state — no separate state_update needed.
+  safeSend({ type: 'state_update', url: tab.url ?? '', title });
   return {
     url: tab.url ?? '',
+    title,
     portalState: inPage?.portalState ?? null,
     domSnapshot: inPage?.snapshot,
     capturedAt: Date.now()
@@ -174,11 +180,30 @@ async function cmdNavigate(args) {
   if (tabId == null) {
     const created = await chrome.tabs.create({ url, active: true });
     activeTabId = created.id ?? null;
-    return { url, tabId: created.id ?? null };
+    if (created.id != null) await waitForTabComplete(created.id, COMMAND_TIMEOUT_MS - 500);
+    return await reportFinalNavState(created.id ?? null, url);
   }
   await chrome.tabs.update(tabId, { url, active: true });
   await waitForTabComplete(tabId, COMMAND_TIMEOUT_MS - 500);
-  return { url, tabId };
+  return await reportFinalNavState(tabId, url);
+}
+
+// Re-read the tab post-load so we capture the resolved URL (server may
+// have redirected) and the title (only populated once the page paints).
+// Push it as a state_update so out-of-process consumers can see the new
+// state immediately, even if they happen to look before the next
+// tabs.onUpdated fires.
+async function reportFinalNavState(tabId, fallbackUrl) {
+  if (tabId == null) return { url: fallbackUrl, title: '', tabId: null };
+  try {
+    const finalTab = await chrome.tabs.get(tabId);
+    const url = finalTab?.url ?? fallbackUrl;
+    const title = finalTab?.title ?? '';
+    safeSend({ type: 'state_update', url, title });
+    return { url, title, tabId };
+  } catch {
+    return { url: fallbackUrl, title: '', tabId };
+  }
 }
 
 async function cmdClick(args) {
@@ -310,16 +335,22 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   activeTabId = tabId;
   try {
     const tab = await chrome.tabs.get(tabId);
-    safeSend({ type: 'state_update', url: tab.url ?? '' });
+    safeSend({ type: 'state_update', url: tab.url ?? '', title: tab.title ?? '' });
   } catch { /* ignore */ }
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  // First tab to update wins until we see an explicit activation —
+  // covers the case where the browser boots straight into a single tab
+  // and no onActivated has fired yet.
+  if (activeTabId == null) activeTabId = tabId;
   if (tabId !== activeTabId) return;
-  if (typeof info.url === 'string') {
-    safeSend({ type: 'state_update', url: info.url });
-  } else if (info.status === 'complete' && tab?.url) {
-    safeSend({ type: 'state_update', url: tab.url });
+  if (info.status === 'complete') {
+    safeSend({ type: 'state_update', url: tab?.url ?? '', title: tab?.title ?? '' });
+  } else if (typeof info.url === 'string') {
+    safeSend({ type: 'state_update', url: info.url, title: tab?.title ?? '' });
+  } else if (typeof info.title === 'string') {
+    safeSend({ type: 'state_update', url: tab?.url ?? '', title: info.title });
   }
 });
 

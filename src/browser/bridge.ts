@@ -46,6 +46,7 @@ export interface BrowserCallOptions {
 
 export interface BrowserState {
   url: string;
+  title?: string;
   portalState: string | null;
   domSnapshot?: unknown;
   capturedAt: number;
@@ -76,6 +77,7 @@ interface InboundEnvelope {
   type: string;
   correlation_id?: string;
   url?: string;
+  title?: string;
   state?: string;
   domSnapshot?: unknown;
   success?: boolean;
@@ -375,6 +377,7 @@ export class BrowserBridge {
   private markConnected(msg: InboundEnvelope): void {
     this.world.browserConnected = true;
     this.world.browserCurrentUrl = typeof msg.url === 'string' ? msg.url : '';
+    this.world.browserPageTitle = typeof msg.title === 'string' ? msg.title : '';
     this.world.browserPortalState = typeof msg.state === 'string' ? msg.state : null;
     this.provenance.append({
       actor: 'browser-bridge',
@@ -382,6 +385,7 @@ export class BrowserBridge {
       target: 'browser',
       data: {
         url: this.world.browserCurrentUrl,
+        title: this.world.browserPageTitle,
         portalState: this.world.browserPortalState
       }
     });
@@ -406,8 +410,34 @@ export class BrowserBridge {
   }
 
   private applyStateUpdate(msg: InboundEnvelope): void {
-    if (typeof msg.url === 'string') this.world.browserCurrentUrl = msg.url;
-    if (typeof msg.state === 'string') this.world.browserPortalState = msg.state;
+    let changed = false;
+    if (typeof msg.url === 'string' && msg.url !== this.world.browserCurrentUrl) {
+      this.world.browserCurrentUrl = msg.url;
+      changed = true;
+    }
+    if (typeof msg.title === 'string' && msg.title !== this.world.browserPageTitle) {
+      this.world.browserPageTitle = msg.title;
+      changed = true;
+    }
+    if (typeof msg.state === 'string' && msg.state !== this.world.browserPortalState) {
+      this.world.browserPortalState = msg.state;
+      changed = true;
+    }
+    // Out-of-process readers (CLI `browser state`) consume the ledger,
+    // not in-memory WorldState. Emit a row so they see the new URL/title
+    // even though the runtime owns the live socket.
+    if (changed) {
+      this.provenance.append({
+        actor: 'browser-bridge',
+        action: 'state_update',
+        target: 'browser',
+        data: {
+          url: this.world.browserCurrentUrl,
+          title: this.world.browserPageTitle,
+          portalState: this.world.browserPortalState
+        }
+      });
+    }
   }
 
   private resolvePending(msg: InboundEnvelope): void {
