@@ -52,8 +52,42 @@ export interface SurfaceContext {
   getSessionId(): string | null;
   /** Model name to stamp on responses so the TUI status line is honest. */
   getModel(): string;
-  /** Run inference with the supplied conversation history. */
-  callLLM(messages: Array<{ role: string; content: string }>): Promise<string>;
+  /**
+   * Process one inbound through the runtime's full surface pipeline:
+   * TTL gating, persistence, compaction, cache hint, inference,
+   * outbound persistence. Hooks let the caller stream `session_reset`
+   * and `thinking` to its WS client at the right moments without the
+   * surface needing to know about TTL semantics.
+   */
+  processSurfaceMessage(
+    text: string,
+    hooks: {
+      onReset?: (newSessionId: string) => void;
+      onThinking?: () => void;
+    }
+  ): Promise<{ text: string; resetOccurred: boolean; newSessionId?: string }>;
+  /** Force a session reset now — used by `thundergate context reset`. */
+  resetSessionNow(): { newSessionId: string };
+  /**
+   * Snapshot for `thundergate context status`. Returns a JSON-safe summary
+   * of the live session age, turn count, token estimate, and effective
+   * context config so the CLI can render it without loading runtime state
+   * out of band.
+   */
+  getContextSnapshot(): {
+    sessionId: string | null;
+    msSinceLastActivity: number;
+    wouldResetOnNextInbound: boolean;
+    sessionTurnCount: number;
+    sessionTokensEstimate: number;
+    cfg: {
+      sessionTtl: '30m' | '1h' | '2h' | '4h' | 'unlimited';
+      cacheRetention: 'short' | 'long' | 'extended';
+      compaction: 'smart' | 'aggressive' | 'none';
+      maxTokens: number;
+      pruneOnReset: boolean;
+    };
+  };
 }
 
 export interface SurfaceAttachOptions {
@@ -83,11 +117,35 @@ interface MessageEnvelope {
 
 interface ErrorEnvelope { type: 'error'; code: string; message: string; correlationId?: string; }
 
-type ServerEnvelope = AttachedEnvelope | ThinkingEnvelope | MessageEnvelope | ErrorEnvelope;
+type ServerEnvelope =
+  | AttachedEnvelope
+  | ThinkingEnvelope
+  | MessageEnvelope
+  | ErrorEnvelope
+  | SessionResetEnvelope
+  | ResetDoneEnvelope;
 
 interface ClientSendEnvelope {
   type: 'send';
   text: string;
+  correlationId?: string;
+}
+
+interface ClientResetEnvelope {
+  type: 'reset';
+  correlationId?: string;
+}
+
+interface SessionResetEnvelope {
+  type: 'session_reset';
+  oldSessionId: string | null;
+  newSessionId: string;
+  reason: 'manual' | 'ttl_expired';
+}
+
+interface ResetDoneEnvelope {
+  type: 'reset_done';
+  newSessionId: string;
   correlationId?: string;
 }
 
@@ -212,56 +270,71 @@ export class SurfaceAttach {
   }
 
   private async onMessage(ws: WebSocket, raw: string): Promise<void> {
-    let msg: Partial<ClientSendEnvelope>;
+    let msg: Record<string, unknown>;
     try { msg = JSON.parse(raw); } catch {
       safeSend(ws, { type: 'error', code: 'INVALID_JSON', message: 'unparseable envelope' });
+      return;
+    }
+    if (msg?.type === 'reset') {
+      const correlationId = typeof msg.correlationId === 'string' ? msg.correlationId : undefined;
+      this.handleReset(ws, correlationId);
+      return;
+    }
+    if (msg?.type === 'status_request') {
+      safeSend(ws, {
+        // Cast — the wire shape is intentionally outside the strict
+        // ServerEnvelope union (operator-side diagnostic, not a chat
+        // surface event), but goes through the same socket.
+        ...({ type: 'status', snapshot: this.ctx.getContextSnapshot() } as unknown as ServerEnvelope)
+      });
       return;
     }
     if (msg?.type !== 'send' || typeof msg.text !== 'string') return;
     const text = msg.text.trim();
     if (!text) return;
-    const correlationId = msg.correlationId;
-    const sessionId = this.ctx.getSessionId();
-    if (!sessionId) {
+    const correlationId = typeof msg.correlationId === 'string' ? msg.correlationId : undefined;
+    if (!this.ctx.getSessionId()) {
       safeSend(ws, { type: 'error', code: 'NO_SESSION', message: 'runtime has no active session', correlationId });
       return;
     }
 
+    // The runtime's `processSurfaceMessage` owns the full pipeline now:
+    // TTL gating, prune-on-reset, persistence, compaction, cache hint,
+    // inference, outbound persistence. We only forward the `session_reset`
+    // and `thinking` signals to this WS client at the moment they happen.
     try {
-      this.ctx.db.ensureSession(sessionId);
-      this.ctx.db.storeMessage({
-        sessionId,
+      const result = await this.ctx.processSurfaceMessage(text, {
+        onReset: (newId) => {
+          const env: SessionResetEnvelope = {
+            type: 'session_reset',
+            oldSessionId: null,
+            newSessionId: newId,
+            reason: 'ttl_expired'
+          };
+          safeSend(ws, env);
+        },
+        onThinking: () => safeSend(ws, { type: 'thinking', agentId: 'jon' })
+      });
+      if (!result.text) {
+        safeSend(ws, {
+          type: 'error',
+          code: 'EMPTY_RESPONSE',
+          message: 'inference returned empty text',
+          correlationId
+        });
+        return;
+      }
+      const reply: MessageEnvelope = {
+        type: 'message',
+        id: randomUUID(),
+        sender: 'Jon',
+        agentId: 'jon',
         channel: SURFACE_CHANNEL_ID,
-        role: 'user',
-        content: text
-      });
-    } catch (err) {
-      safeSend(ws, {
-        type: 'error',
-        code: 'PERSIST_INBOUND_FAILED',
-        message: (err as Error).message,
-        correlationId
-      });
-      // Still attempt the LLM call — losing the recall row is worse than
-      // missing the audit row from the surface attach's perspective.
-    }
-
-    // Signal "Jon's reading" before the round-trip so the TUI can show the
-    // same indicator users see on Slack. We don't bother streaming partial
-    // tokens — `callLLM` is non-streaming and adding it would force this
-    // surface to know about provider-specific deltas.
-    safeSend(ws, { type: 'thinking', agentId: 'jon' });
-
-    // Build the history for this turn. We pull from SessionDB (the unified
-    // recall seam) so any other native surface that's also been chatting
-    // shows up here. Already-stored inbound is included via getRecent, so
-    // we don't append it twice.
-    const turns = this.loadHistory(HISTORY_TURNS_FOR_INFERENCE);
-    const llmMessages = turns.map((t) => ({ role: t.role, content: t.text }));
-
-    let replyText: string;
-    try {
-      replyText = await this.ctx.callLLM(llmMessages);
+        text: result.text,
+        timestamp: Date.now(),
+        model: this.ctx.getModel()
+      };
+      safeSend(ws, reply);
     } catch (err) {
       safeSend(ws, {
         type: 'error',
@@ -269,56 +342,48 @@ export class SurfaceAttach {
         message: (err as Error).message,
         correlationId
       });
-      return;
     }
-    if (!replyText) {
+  }
+
+  private handleReset(ws: WebSocket, correlationId?: string): void {
+    const oldSessionId = this.ctx.getSessionId();
+    let newSessionId: string;
+    try {
+      ({ newSessionId } = this.ctx.resetSessionNow());
+    } catch (err) {
       safeSend(ws, {
         type: 'error',
-        code: 'EMPTY_RESPONSE',
-        message: 'inference returned empty text',
+        code: 'RESET_FAILED',
+        message: (err as Error).message,
         correlationId
       });
       return;
     }
-
-    try {
-      this.ctx.db.storeMessage({
-        sessionId,
-        channel: SURFACE_CHANNEL_ID,
-        role: 'assistant',
-        content: replyText
-      });
-    } catch (err) {
-      // Audit row failed but the user is still owed the reply.
-      this.ctx.provenance.append({
-        actor: 'surface-attach',
-        action: 'persist_outbound_failed',
-        target: 'session-db',
-        reason: (err as Error).message
-      });
-    }
-
-    const reply: MessageEnvelope = {
-      type: 'message',
-      id: randomUUID(),
-      sender: 'Jon',
-      agentId: 'jon',
-      channel: SURFACE_CHANNEL_ID,
-      text: replyText,
-      timestamp: Date.now(),
-      model: this.ctx.getModel()
+    // Tell every connected surface — not just the requester — so a TUI
+    // and a separate `thundergate context reset` invocation see the same
+    // outcome at the same moment.
+    const resetEnv: SessionResetEnvelope = {
+      type: 'session_reset',
+      oldSessionId,
+      newSessionId,
+      reason: 'manual'
     };
-    safeSend(ws, reply);
+    for (const c of this.clients) safeSend(c, resetEnv);
+    safeSend(ws, { type: 'reset_done', newSessionId, correlationId });
   }
 
   /**
-   * Pull the last N turns of the unified conversation. SessionDB.getRecent
-   * returns DESC; the TUI wants ASC (oldest first) so it can scroll into
-   * the newest turn. We map row.role → 'user' | 'assistant' so the wire
-   * shape matches what the LLM call expects.
+   * Pull the last N turns of the current session's transcript. SessionDB
+   * stores rows across every session the runtime has ever owned; we
+   * filter by the live `sessionId` so a TTL reset cleanly drops history
+   * from the attach view (the row is still in the DB, just not in scope).
+   * Rows arrive DESC, we want ASC so the TUI can scroll into the newest
+   * turn. Role maps to 'user' | 'assistant' for both wire + LLM shapes.
    */
   private loadHistory(limit: number): AttachedEnvelope['history'] {
-    const rows = this.ctx.db.getRecentMessages(limit);
+    const sessionId = this.ctx.getSessionId();
+    if (!sessionId) return [];
+    const rows = this.ctx.db.getRecentMessagesForSession(sessionId, limit);
     return rows
       .slice()
       .reverse()

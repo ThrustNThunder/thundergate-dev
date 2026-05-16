@@ -172,5 +172,51 @@ export function validateConfig(cfg: Config): string[] {
     if (!cfg.ghost.log_file) problems.push('ghost.log_file missing');
   }
 
+  if (cfg.context) {
+    if (!CONTEXT_TTL_VALUES.includes(cfg.context.sessionTtl)) {
+      problems.push(`context.sessionTtl must be one of ${CONTEXT_TTL_VALUES.join(', ')}`);
+    }
+    if (!CONTEXT_CACHE_VALUES.includes(cfg.context.cacheRetention)) {
+      problems.push(`context.cacheRetention must be one of ${CONTEXT_CACHE_VALUES.join(', ')}`);
+    }
+    if (!CONTEXT_COMPACTION_VALUES.includes(cfg.context.compaction)) {
+      problems.push(`context.compaction must be one of ${CONTEXT_COMPACTION_VALUES.join(', ')}`);
+    }
+    if (typeof cfg.context.maxTokens !== 'number' || cfg.context.maxTokens <= 0) {
+      problems.push('context.maxTokens must be a positive number');
+    }
+    if (cfg.context.maxTokens > 200_000) {
+      problems.push('context.maxTokens must not exceed 200000 (Anthropic window)');
+    }
+  }
+
   return problems;
+}
+
+export const CONTEXT_TTL_VALUES = ['30m', '1h', '2h', '4h', 'unlimited'] as const;
+export const CONTEXT_CACHE_VALUES = ['short', 'long', 'extended'] as const;
+export const CONTEXT_COMPACTION_VALUES = ['smart', 'aggressive', 'none'] as const;
+
+/**
+ * Mutate the on-disk config.json under a single dotted-path key. We read
+ * raw (preserving the operator's edits and comments-as-keys), splice the
+ * new value in, and write back. The merged-with-defaults Config object
+ * is rebuilt on next loadConfig — we deliberately do NOT serialize the
+ * full merged Config because it would balloon every operator's config.json
+ * with defaults they never asked for.
+ */
+export function saveConfigField(dottedPath: string, value: unknown): void {
+  const raw = readRawConfig() ?? {};
+  const parts = dottedPath.split('.');
+  let cursor: Record<string, unknown> = raw;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const k = parts[i];
+    if (typeof cursor[k] !== 'object' || cursor[k] === null) {
+      cursor[k] = {};
+    }
+    cursor = cursor[k] as Record<string, unknown>;
+  }
+  cursor[parts[parts.length - 1]] = value;
+  mkdirSync(dirname(CONFIG_FILE), { recursive: true });
+  writeFileSync(CONFIG_FILE, JSON.stringify(raw, null, 2));
 }

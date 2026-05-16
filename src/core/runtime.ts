@@ -37,6 +37,16 @@ import { WorldState, ProcessingMode } from '../world/state.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
 import { BrowserBridge, DEFAULT_BROWSER_BRIDGE_PORT } from '../browser/bridge.js';
 import { SurfaceAttach, DEFAULT_SURFACE_ATTACH_PORT } from '../surface/attach.js';
+import {
+  effectiveContextConfig,
+  isExpired,
+  tagTurn,
+  compactForInference,
+  cacheHintForRetention,
+  pruneToMemory,
+  estimateTokens,
+  type Turn
+} from '../context/manager.js';
 import { LocalInferenceProvider } from '../inference/local_provider.js';
 import { PromiseTracker } from '../memory/promises.js';
 import { FrameManager } from '../memory/frame.js';
@@ -284,7 +294,9 @@ export class ThunderGateRuntime {
         provenance: this.provenance,
         getSessionId: () => this.state.sessionId ?? null,
         getModel: () => this.config.runtime.model,
-        callLLM: (messages) => this.callLLM(messages)
+        processSurfaceMessage: (text, hooks) => this.processSurfaceMessage(text, hooks),
+        resetSessionNow: () => this.resetSessionNow(),
+        getContextSnapshot: () => this.getContextStatus()
       },
       { port: DEFAULT_SURFACE_ATTACH_PORT }
     );
@@ -1163,7 +1175,8 @@ export class ThunderGateRuntime {
    * Ghost mode logs failures via the harness; deep routing isn't wired yet.
    */
   async callLLM(
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{ role: string; content: string }>,
+    opts?: { cacheHint?: import('../context/manager.js').CacheControlHint }
   ): Promise<string> {
     const model = this.config.ghost.model;
     const maxTokens = this.config.ghost.maxTokens;
@@ -1176,6 +1189,8 @@ export class ThunderGateRuntime {
           console.warn('  ⚠ callLLM: OPENAI_API_KEY not set');
           return '';
         }
+        // OpenAI doesn't have an equivalent of Anthropic's cache_control —
+        // the cacheHint is silently dropped on this branch.
         const response = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
           headers: {
@@ -1213,6 +1228,30 @@ export class ThunderGateRuntime {
           else chat.push(m);
         }
 
+        // Stamp cache_control on the last user message so the longest
+        // suffix of the conversation that's stable across turns reuses
+        // the cache. Anthropic's cache_control accepts an `ephemeral`
+        // type plus an optional `ttl` (1h / 4h) gated by the
+        // extended-cache-ttl beta header. We attach the structured
+        // payload by converting that message's `content` field into a
+        // single-block array — backwards compatible because Anthropic
+        // accepts either string or block-array content for messages.
+        const hint = opts?.cacheHint;
+        if (hint && chat.length > 0) {
+          for (let i = chat.length - 1; i >= 0; i--) {
+            if (chat[i].role === 'user') {
+              const original = chat[i] as { role: string; content: unknown };
+              const text = typeof original.content === 'string'
+                ? original.content
+                : '';
+              (chat[i] as unknown as { role: string; content: unknown[] }).content = [
+                { type: 'text', text, cache_control: hint.cacheControl }
+              ];
+              break;
+            }
+          }
+        }
+
         const body: Record<string, unknown> = {
           model: anthropicModel,
           max_tokens: maxTokens,
@@ -1221,13 +1260,18 @@ export class ThunderGateRuntime {
         };
         if (systemParts.length > 0) body.system = systemParts.join('\n\n');
 
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01'
+        };
+        if (hint?.betaHeader) {
+          headers['anthropic-beta'] = hint.betaHeader;
+        }
+
         const response = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01'
-          },
+          headers,
           body: JSON.stringify(body)
         });
         if (!response.ok) {
@@ -1254,6 +1298,217 @@ export class ThunderGateRuntime {
    */
   getState(): RuntimeState {
     return { ...this.state };
+  }
+
+  // ── Context manager glue ──────────────────────────────────────────────
+  //
+  // The methods below are the runtime's contract with native surfaces
+  // (SurfaceAttach today, future iOS-on-LAN). They centralize the cloud-mode
+  // context window controls — TTL gating, compaction, cache hints, prune-on-
+  // reset — so each surface doesn't reinvent them. LOCAL_INFERENCE has its
+  // own memory architecture; we deliberately do not consult these knobs in
+  // `processLocalInference`.
+
+  /**
+   * Process one surface inbound end-to-end. Returns the assistant reply
+   * plus reset-meta so the caller can notify its WS clients.
+   *
+   * Order of operations matters here:
+   *   1. TTL check — if the session has been idle past sessionTtl, we
+   *      prune-on-reset (best effort) and mint a new sessionId BEFORE
+   *      persisting the inbound, so the inbound lands in the new
+   *      session's transcript, not the closed one.
+   *   2. Persist inbound + update lastActivity.
+   *   3. Fire the thinking hook so the surface can show "Jon is thinking"
+   *      before the round-trip.
+   *   4. Load history scoped to the current session, run compaction,
+   *      attach cache_control, call callLLM.
+   *   5. Persist outbound.
+   */
+  async processSurfaceMessage(
+    text: string,
+    hooks: {
+      onReset?: (newSessionId: string) => void;
+      onThinking?: () => void;
+    } = {}
+  ): Promise<{ text: string; resetOccurred: boolean; newSessionId?: string; compaction?: { mode: string; removed: number; beforeTokens: number; afterTokens: number } }> {
+    const ctxCfg = effectiveContextConfig(this.config);
+
+    let resetOccurred = false;
+    let newSessionId: string | undefined;
+    if (this.state.sessionId && isExpired(this.state.lastActivity, ctxCfg.sessionTtl)) {
+      newSessionId = this.resetSessionInternal(`ttl_expired:${ctxCfg.sessionTtl}`, ctxCfg.pruneOnReset);
+      resetOccurred = true;
+      hooks.onReset?.(newSessionId);
+    }
+
+    const sessionId = this.state.sessionId;
+    if (!sessionId) {
+      throw new Error('runtime has no active session');
+    }
+
+    // Persist inbound first — even if inference fails, the user's text
+    // is in the recall seam and can be retried from any other surface.
+    try {
+      this.db.ensureSession(sessionId);
+      this.db.storeMessage({
+        sessionId,
+        channel: 'surface:tui',
+        role: 'user',
+        content: text
+      });
+    } catch (err) {
+      console.warn('  ⚠ surface inbound persist failed:', (err as Error).message);
+    }
+    this.state.lastActivity = new Date();
+
+    hooks.onThinking?.();
+
+    // Build the inference history from SessionDB, scoped to *this* session.
+    // After a reset that's just the one inbound we just wrote, which is
+    // exactly what we want — fresh slate.
+    const rows = this.db.getRecentMessagesForSession(sessionId, 80).slice().reverse();
+    const turns: Turn[] = rows.map((r) => tagTurn({
+      role: r.role === 'user' ? 'user' : 'assistant',
+      content: r.content
+    }));
+    const compactResult = compactForInference(turns, ctxCfg.compaction, ctxCfg.maxTokens);
+    if (compactResult.removed > 0) {
+      this.provenance.append({
+        actor: 'context-manager',
+        action: 'compacted',
+        target: 'inference-history',
+        data: {
+          mode: compactResult.mode,
+          removed: compactResult.removed,
+          beforeTokens: compactResult.beforeTokens,
+          afterTokens: compactResult.afterTokens
+        }
+      });
+    }
+
+    const cacheHint = cacheHintForRetention(ctxCfg.cacheRetention);
+    const messages = compactResult.turns.map((t) => ({ role: t.role, content: t.content }));
+    const replyText = await this.callLLM(messages, { cacheHint });
+
+    if (replyText) {
+      try {
+        this.db.storeMessage({
+          sessionId,
+          channel: 'surface:tui',
+          role: 'assistant',
+          content: replyText
+        });
+      } catch (err) {
+        console.warn('  ⚠ surface outbound persist failed:', (err as Error).message);
+      }
+      this.state.lastActivity = new Date();
+    }
+
+    return {
+      text: replyText,
+      resetOccurred,
+      newSessionId,
+      compaction: compactResult.removed > 0
+        ? {
+            mode: compactResult.mode,
+            removed: compactResult.removed,
+            beforeTokens: compactResult.beforeTokens,
+            afterTokens: compactResult.afterTokens
+          }
+        : undefined
+    };
+  }
+
+  /**
+   * Reset the session immediately, regardless of TTL. Used by
+   * `thundergate context reset` so an operator can force a fresh start.
+   * Same prune-on-reset semantics as the TTL-driven path.
+   */
+  resetSessionNow(): { newSessionId: string } {
+    const ctxCfg = effectiveContextConfig(this.config);
+    const newId = this.resetSessionInternal('manual', ctxCfg.pruneOnReset);
+    return { newSessionId: newId };
+  }
+
+  /**
+   * Snapshot for `thundergate context status`. We expose the live numbers
+   * the operator wants: how big the current session's transcript is, how
+   * long since the last activity, and what would happen on the next
+   * inbound under the current settings.
+   */
+  getContextStatus(): {
+    sessionId: string | null;
+    lastActivityAt: number;
+    msSinceLastActivity: number;
+    wouldResetOnNextInbound: boolean;
+    sessionTurnCount: number;
+    sessionTokensEstimate: number;
+    cfg: ReturnType<typeof effectiveContextConfig>;
+  } {
+    const ctxCfg = effectiveContextConfig(this.config);
+    const sessionId = this.state.sessionId || null;
+    let turns: Turn[] = [];
+    if (sessionId) {
+      try {
+        const rows = this.db.getRecentMessagesForSession(sessionId, 500);
+        turns = rows.map((r) => ({
+          role: r.role === 'user' ? 'user' : 'assistant',
+          content: r.content
+        }));
+      } catch { /* return zeros */ }
+    }
+    return {
+      sessionId,
+      lastActivityAt: this.state.lastActivity.getTime(),
+      msSinceLastActivity: Date.now() - this.state.lastActivity.getTime(),
+      wouldResetOnNextInbound: !!sessionId && isExpired(this.state.lastActivity, ctxCfg.sessionTtl),
+      sessionTurnCount: turns.length,
+      sessionTokensEstimate: estimateTokens(turns),
+      cfg: ctxCfg
+    };
+  }
+
+  private resetSessionInternal(reason: string, pruneOnReset: boolean): string {
+    const oldId = this.state.sessionId;
+    if (oldId && pruneOnReset) {
+      try {
+        const rows = this.db.getRecentMessagesForSession(oldId, 60).slice().reverse();
+        const turns: Turn[] = rows.map((r) => ({
+          role: r.role === 'user' ? 'user' : 'assistant',
+          content: r.content
+        }));
+        const result = pruneToMemory(turns, oldId);
+        this.provenance.append({
+          actor: 'context-manager',
+          action: 'prune_on_reset',
+          target: result.path,
+          reason: result.written ? undefined : result.reason,
+          data: {
+            written: result.written,
+            bullets: result.bullets.length,
+            oldSessionId: oldId
+          }
+        });
+      } catch (err) {
+        console.warn('  ⚠ prune-on-reset failed:', (err as Error).message);
+      }
+    }
+    const newId = `tg-${Date.now()}`;
+    this.state.sessionId = newId;
+    this.state.lastActivity = new Date();
+    try {
+      this.db.ensureSession(newId);
+    } catch { /* best-effort */ }
+    this.provenance.append({
+      actor: 'context-manager',
+      action: 'session_reset',
+      target: 'runtime',
+      reason,
+      data: { oldSessionId: oldId, newSessionId: newId }
+    });
+    console.log(`  ↺ Session reset (${reason}): ${oldId?.slice(0, 16)} → ${newId.slice(0, 16)}`);
+    return newId;
   }
 
   /**

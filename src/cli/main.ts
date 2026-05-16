@@ -17,7 +17,17 @@ import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
 import { createInterface } from 'readline';
 import * as os from 'os';
-import { ensureConfig, validateConfig, getConfigPath } from '../config/index.js';
+import {
+  ensureConfig,
+  validateConfig,
+  getConfigPath,
+  saveConfigField,
+  CONTEXT_TTL_VALUES,
+  CONTEXT_CACHE_VALUES,
+  CONTEXT_COMPACTION_VALUES
+} from '../config/index.js';
+import { DEFAULT_SURFACE_ATTACH_PORT } from '../surface/attach.js';
+import { effectiveContextConfig, parseTtl, cacheHintForRetention } from '../context/manager.js';
 import { GhostEvaluator } from '../ghost/evaluator.js';
 import { GhostCalibrator, type CalibrateCategory } from '../ghost/calibrate.js';
 import { runLearnTests, formatReport } from '../ghost/learn-test.js';
@@ -2498,5 +2508,207 @@ program
       process.exit(1);
     }
   });
+
+// ── context ──────────────────────────────────────────────────────────────
+//
+// Cloud-mode context window controls — operator-facing surface for the
+// knobs defined under config.context. LOCAL_INFERENCE has its own memory
+// architecture; these commands deliberately do not touch that path.
+//
+// `status` / `set <key> <value>` read & mutate config.json. `reset` opens
+// a brief connection to SurfaceAttach (ws://127.0.0.1:8772) and sends a
+// `reset` envelope so the change lands in the running runtime, not just
+// on disk.
+
+const contextCmd = program.command('context').description('ThunderGate context window controls (cloud mode)');
+
+contextCmd
+  .command('status')
+  .description('Show current context settings, session age, and token usage')
+  .action(async () => {
+    const cfg = ensureConfig();
+    const ctxCfg = effectiveContextConfig(cfg);
+    console.log('⚡ ThunderGate Context Status');
+    console.log('═══════════════════════════════════════');
+    console.log('  Settings:');
+    console.log(`    session_ttl:      ${ctxCfg.sessionTtl}`);
+    console.log(`    cache_retention:  ${ctxCfg.cacheRetention}  (${cacheHintForRetention(ctxCfg.cacheRetention).label})`);
+    console.log(`    compaction:       ${ctxCfg.compaction}`);
+    console.log(`    max_tokens:       ${ctxCfg.maxTokens.toLocaleString()}`);
+    console.log(`    prune_on_reset:   ${ctxCfg.pruneOnReset}`);
+
+    // Live runtime snapshot: ask SurfaceAttach for it. If the runtime
+    // isn't reachable we still show the settings — operators may want to
+    // tune config while the runtime is offline.
+    const live = await tryFetchLiveContextStatus();
+    console.log();
+    console.log('  Live runtime:');
+    if (!live) {
+      console.log('    (runtime not reachable on 127.0.0.1:' + DEFAULT_SURFACE_ATTACH_PORT + ' — start it with `thundergate start`)');
+      return;
+    }
+    const ageMin = Math.floor(live.msSinceLastActivity / 60_000);
+    const ageSec = Math.floor((live.msSinceLastActivity % 60_000) / 1000);
+    const ttlMs = parseTtl(live.cfg.sessionTtl);
+    const remainingMs = Number.isFinite(ttlMs) ? Math.max(0, ttlMs - live.msSinceLastActivity) : Infinity;
+    const remaining = !Number.isFinite(remainingMs)
+      ? 'never (unlimited)'
+      : Math.floor(remainingMs / 60_000) + 'm ' + Math.floor((remainingMs % 60_000) / 1000) + 's';
+    console.log(`    session_id:       ${live.sessionId ?? '(none)'}`);
+    console.log(`    last_activity:    ${ageMin}m ${ageSec}s ago`);
+    console.log(`    resets_in:        ${live.wouldResetOnNextInbound ? '(next inbound — TTL expired)' : remaining}`);
+    console.log(`    turns_in_session: ${live.sessionTurnCount}`);
+    console.log(`    tokens_estimate:  ${live.sessionTokensEstimate.toLocaleString()} / ${live.cfg.maxTokens.toLocaleString()}`);
+  });
+
+contextCmd
+  .command('set <key> <value>')
+  .description('Update one context setting (ttl | cache | compaction | max-tokens | prune-on-reset)')
+  .action((key: string, value: string) => {
+    const normalized = key.toLowerCase();
+    const cfgPath = getConfigPath();
+    try {
+      switch (normalized) {
+        case 'ttl': {
+          if (!CONTEXT_TTL_VALUES.includes(value as (typeof CONTEXT_TTL_VALUES)[number])) {
+            console.error(`  ✗ invalid TTL "${value}". Options: ${CONTEXT_TTL_VALUES.join(', ')}`);
+            process.exit(1);
+          }
+          saveConfigField('context.sessionTtl', value);
+          console.log(`  ✓ context.sessionTtl → ${value}  (in ${cfgPath})`);
+          break;
+        }
+        case 'cache': {
+          if (!CONTEXT_CACHE_VALUES.includes(value as (typeof CONTEXT_CACHE_VALUES)[number])) {
+            console.error(`  ✗ invalid cache retention "${value}". Options: ${CONTEXT_CACHE_VALUES.join(', ')}`);
+            process.exit(1);
+          }
+          saveConfigField('context.cacheRetention', value);
+          console.log(`  ✓ context.cacheRetention → ${value}  (in ${cfgPath})`);
+          break;
+        }
+        case 'compaction': {
+          if (!CONTEXT_COMPACTION_VALUES.includes(value as (typeof CONTEXT_COMPACTION_VALUES)[number])) {
+            console.error(`  ✗ invalid compaction "${value}". Options: ${CONTEXT_COMPACTION_VALUES.join(', ')}`);
+            process.exit(1);
+          }
+          saveConfigField('context.compaction', value);
+          console.log(`  ✓ context.compaction → ${value}  (in ${cfgPath})`);
+          break;
+        }
+        case 'max-tokens':
+        case 'maxtokens': {
+          const n = parseInt(value, 10);
+          if (!Number.isFinite(n) || n <= 0 || n > 200_000) {
+            console.error('  ✗ max-tokens must be a positive integer ≤ 200000');
+            process.exit(1);
+          }
+          saveConfigField('context.maxTokens', n);
+          console.log(`  ✓ context.maxTokens → ${n}  (in ${cfgPath})`);
+          break;
+        }
+        case 'prune-on-reset':
+        case 'pruneonreset': {
+          const truthy = ['true', '1', 'yes', 'on'].includes(value.toLowerCase());
+          const falsy = ['false', '0', 'no', 'off'].includes(value.toLowerCase());
+          if (!truthy && !falsy) {
+            console.error('  ✗ prune-on-reset must be true|false');
+            process.exit(1);
+          }
+          saveConfigField('context.pruneOnReset', truthy);
+          console.log(`  ✓ context.pruneOnReset → ${truthy}  (in ${cfgPath})`);
+          break;
+        }
+        default:
+          console.error(`  ✗ unknown key "${key}". Use ttl | cache | compaction | max-tokens | prune-on-reset`);
+          process.exit(1);
+      }
+      // The runtime reads config.context lazily through `effectiveContextConfig`
+      // every inbound, but `Config` is loaded once at startup. Most knobs that
+      // gate per-message behavior (TTL, cache hint, compaction) hot-reload
+      // because they're read from `this.config.context` each call — but
+      // `this.config` is the captured object from startup. We deliberately
+      // do not auto-restart the runtime here; the operator's expected workflow
+      // is `set` then `sudo systemctl restart thundergate.service` when they
+      // want the runtime to pick up changes. The CLI hint below documents that.
+      console.log('  ↻ Restart runtime to pick up the change: sudo systemctl restart thundergate.service');
+    } catch (err) {
+      console.error(`  ✗ set failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+contextCmd
+  .command('reset')
+  .description('Force a session reset now — runs prune-on-reset if enabled, then mints a new sessionId')
+  .action(async () => {
+    try {
+      const result = await sendSurfaceReset();
+      console.log(`  ✓ Session reset. New sessionId: ${result.newSessionId}`);
+    } catch (err) {
+      console.error(`  ✗ reset failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+async function tryFetchLiveContextStatus(): Promise<{
+  sessionId: string | null;
+  msSinceLastActivity: number;
+  wouldResetOnNextInbound: boolean;
+  sessionTurnCount: number;
+  sessionTokensEstimate: number;
+  cfg: { sessionTtl: 'unlimited' | '30m' | '1h' | '2h' | '4h'; cacheRetention: 'short' | 'long' | 'extended'; compaction: 'smart' | 'aggressive' | 'none'; maxTokens: number; pruneOnReset: boolean };
+} | null> {
+  // The runtime exposes context status via SurfaceAttach: connect, send
+  // `{type:'status_request'}`, receive `{type:'status', ...}`, close. Bare
+  // wire — no auth on localhost.
+  const { WebSocket } = await import('ws');
+  return await new Promise((resolve) => {
+    const sock = new WebSocket(`ws://127.0.0.1:${DEFAULT_SURFACE_ATTACH_PORT}`);
+    const timer = setTimeout(() => { try { sock.close(); } catch { /* ignore */ } resolve(null); }, 2000);
+    sock.on('open', () => sock.send(JSON.stringify({ type: 'status_request' })));
+    sock.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg?.type === 'status') {
+          clearTimeout(timer);
+          try { sock.close(); } catch { /* ignore */ }
+          resolve(msg.snapshot);
+        }
+      } catch { /* keep waiting */ }
+    });
+    sock.on('error', () => { clearTimeout(timer); resolve(null); });
+    sock.on('close', () => { clearTimeout(timer); resolve(null); });
+  });
+}
+
+async function sendSurfaceReset(): Promise<{ newSessionId: string }> {
+  const { WebSocket } = await import('ws');
+  return await new Promise((resolve, reject) => {
+    const sock = new WebSocket(`ws://127.0.0.1:${DEFAULT_SURFACE_ATTACH_PORT}`);
+    const timer = setTimeout(() => {
+      try { sock.close(); } catch { /* ignore */ }
+      reject(new Error('runtime did not respond on ' + DEFAULT_SURFACE_ATTACH_PORT));
+    }, 3000);
+    sock.on('open', () => {
+      sock.send(JSON.stringify({ type: 'reset', correlationId: `cli-${Date.now()}` }));
+    });
+    sock.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg?.type === 'reset_done' && typeof msg.newSessionId === 'string') {
+          clearTimeout(timer);
+          try { sock.close(); } catch { /* ignore */ }
+          resolve({ newSessionId: msg.newSessionId });
+        } else if (msg?.type === 'error') {
+          clearTimeout(timer);
+          try { sock.close(); } catch { /* ignore */ }
+          reject(new Error(msg.message ?? 'reset rejected'));
+        }
+      } catch { /* keep waiting */ }
+    });
+    sock.on('error', (err) => { clearTimeout(timer); reject(err); });
+  });
+}
 
 program.parse();

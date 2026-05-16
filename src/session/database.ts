@@ -361,6 +361,23 @@ export class SessionDB {
   }
 
   /**
+   * Get the recent N messages for one session. SessionDB stores rows from
+   * every session across the runtime's lifetime; the surface attach and
+   * context manager both want only the currently-active session's transcript
+   * (so a TTL reset cleanly starts a new history without dragging old
+   * conversation through the LLM call).
+   */
+  getRecentMessagesForSession(sessionId: string, limit: number = 50): Message[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE session_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `);
+    return stmt.all(sessionId, limit) as Message[];
+  }
+
+  /**
    * Get messages by channel
    */
   getMessagesByChannel(channel: string, limit: number = 50): Message[] {

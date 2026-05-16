@@ -128,6 +128,39 @@ export interface Config {
     deepModeThreshold: number;  // Tool calls before deep mode activates
   };
 
+  // Context window controls (CLOUD MODE ONLY).
+  //
+  // LOCAL_INFERENCE has its own memory architecture (`localInference.*`) —
+  // these knobs do not apply in that mode. In cloud mode, ContextManager
+  // reads this block to decide when to reset, how aggressively to prune
+  // for inference calls, and what cache-retention hint to send Anthropic.
+  context: {
+    // How long the session stays warm between inbound messages. After
+    // this elapses on the next inbound, the runtime resets the session
+    // (optionally pruning important content to MEMORY.md first).
+    // Accepted values: '30m', '1h', '2h', '4h', 'unlimited'.
+    sessionTtl: '30m' | '1h' | '2h' | '4h' | 'unlimited';
+    // Cache-retention hint passed to Anthropic. Maps to cache_control TTL:
+    //   short    → ephemeral, default ~5min
+    //   long     → ephemeral with ttl='1h' (beta header)
+    //   extended → ephemeral with ttl='4h' (newer beta)
+    cacheRetention: 'short' | 'long' | 'extended';
+    // Compaction style triggered when assembled history would exceed
+    // maxTokens.
+    //   smart      → keep last 20 turns + decisions/corrections/milestones
+    //   aggressive → keep last 5 turns only
+    //   none       → no compaction (callLLM gets the full transcript)
+    compaction: 'smart' | 'aggressive' | 'none';
+    // Soft cap (estimated tokens) before compaction kicks in. Hard cap at
+    // 200k regardless of value — Anthropic's window is the upper bound.
+    maxTokens: number;
+    // On session reset, sift recent turns for important content (decisions,
+    // corrections, milestones) and append them to MEMORY.md under
+    // /home/ubuntu/.openclaw/workspace/MEMORY.md so the next session has a
+    // running ledger of what's been settled.
+    pruneOnReset: boolean;
+  };
+
   // Local inference (ThunderMind / Ollama).
   // When reachable, runtime flips into LOCAL_INFERENCE processing mode:
   // larger context window targets, more RAG results, background pre-processing
@@ -251,6 +284,14 @@ const DEFAULT_CONFIG: Config = {
     surfaceModel: 'anthropic/claude-sonnet-4-6',
     surfaceMaxTokens: 5000,
     deepModeThreshold: 5         // 5+ tool calls = deep mode
+  },
+
+  context: {
+    sessionTtl: '1h',
+    cacheRetention: 'long',
+    compaction: 'smart',
+    maxTokens: 150000,
+    pruneOnReset: true
   },
 
   localInference: {
