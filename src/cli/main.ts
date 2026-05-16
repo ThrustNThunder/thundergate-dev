@@ -2475,4 +2475,28 @@ function shellQuoteCli(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+// ── tui ────────────────────────────────────────────────────────────────────
+//
+// Native terminal UI. Imported dynamically so unrelated subcommands don't
+// pull blessed (and its terminfo + child_process cold-start) into their
+// load path. The TUI takes over the TTY entirely until the user quits.
+
+program
+  .command('tui')
+  .description('Launch ThunderTUI — chat + browser terminal UI')
+  .option('--browser', 'Browser-only mode (no chat pane)')
+  .option('--split', 'Split pane: chat left, browser right (default)')
+  .option('--chat', 'Chat-only mode (no browser pane)')
+  .action(async (opts: { browser?: boolean; split?: boolean; chat?: boolean }) => {
+    const mode: 'chat' | 'browser' | 'split' =
+      opts.browser ? 'browser' : opts.chat ? 'chat' : 'split';
+    const { launchTui } = await import('../tui/index.js');
+    try {
+      await launchTui({ mode });
+    } catch (err) {
+      console.error(`  ✗ tui failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+
 program.parse();
