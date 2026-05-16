@@ -172,8 +172,14 @@ export async function compareResponses(
         cosine = cosineSimilarity(vecs[0], vecs[1]);
         embeddingPairCache.set(cacheKey, cosine);
       }
-    } catch {
+    } catch (err) {
       cosine = null;
+      const now = Date.now();
+      if (now - lastWarnedAt >= 60_000) {
+        lastWarnedAt = now;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[ghost/compare] voyage embed failed: ${msg}`);
+      }
     }
   }
 
@@ -439,6 +445,10 @@ embeddingPairCache.set = (k: string, v: number) => {
   return embeddingPairCache;
 };
 
+// Rate-limit for surfacing embed errors — once per minute is enough to
+// distinguish 429 from a key/network problem without flooding the log.
+let lastWarnedAt = 0;
+
 // ── Voyage embedding adapter ───────────────────────────────────────────────
 
 /**
@@ -459,28 +469,39 @@ export function voyageEmbedder(
   const model = opts.model ?? 'voyage-3-lite';
   const timeoutMs = opts.timeoutMs ?? 5000;
   return async (texts: string[]): Promise<number[][]> => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const res = await fetch('https://api.voyageai.com/v1/embeddings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({ input: texts, model }),
-        signal: ctrl.signal
-      });
-      if (!res.ok) {
-        throw new Error(`voyage HTTP ${res.status}`);
+    const callOnce = async () => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        return await fetch('https://api.voyageai.com/v1/embeddings', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({ input: texts, model }),
+          signal: ctrl.signal
+        });
+      } finally {
+        clearTimeout(timer);
       }
-      const data: any = await res.json();
-      if (!Array.isArray(data?.data)) throw new Error('voyage: malformed response');
-      return data.data
-        .map((row: any) => (Array.isArray(row?.embedding) ? row.embedding : null))
-        .filter((v: number[] | null): v is number[] => v !== null);
-    } finally {
-      clearTimeout(timer);
+    };
+
+    let res = await callOnce();
+    if (res.status === 429) {
+      await new Promise((r) => setTimeout(r, 500));
+      res = await callOnce();
+      if (res.status === 429) {
+        throw new Error('Voyage rate limited after retry');
+      }
     }
+    if (!res.ok) {
+      throw new Error(`voyage HTTP ${res.status}`);
+    }
+    const data: any = await res.json();
+    if (!Array.isArray(data?.data)) throw new Error('voyage: malformed response');
+    return data.data
+      .map((row: any) => (Array.isArray(row?.embedding) ? row.embedding : null))
+      .filter((v: number[] | null): v is number[] => v !== null);
   };
 }
