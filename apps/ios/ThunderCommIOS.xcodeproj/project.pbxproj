@@ -1,0 +1,326 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1A1111111111111111111101 /* ThunderCommApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222202 /* ThunderCommApp.swift */; };
+		1A1111111111111111111102 /* ThunderCommModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222203 /* ThunderCommModels.swift */; };
+		1A1111111111111111111103 /* ThunderCommWebSocketClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222204 /* ThunderCommWebSocketClient.swift */; };
+		1A1111111111111111111104 /* ThunderCommStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222205 /* ThunderCommStore.swift */; };
+		1A1111111111111111111105 /* ConnectionStatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222206 /* ConnectionStatusView.swift */; };
+		1A1111111111111111111106 /* MessageBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222207 /* MessageBubble.swift */; };
+		1A1111111111111111111107 /* MessageListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222208 /* MessageListView.swift */; };
+		1A1111111111111111111108 /* ComposerBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222209 /* ComposerBar.swift */; };
+		1A1111111111111111111109 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222210 /* ContentView.swift */; };
+		1A1111111111111111111110 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A2222222222222222222211 /* Assets.xcassets */; };
+		1B1111111111111111111101 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222201 /* AppDelegate.swift */; };
+		1B1111111111111111111102 /* AddAgentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222202 /* AddAgentView.swift */; };
+		1B1111111111111111111103 /* APNsManager.swift.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222203 /* APNsManager.swift.swift */; };
+		1B1111111111111111111104 /* AuthGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222204 /* AuthGate.swift */; };
+		1B1111111111111111111105 /* AuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222205 /* AuthManager.swift */; };
+		1B1111111111111111111106 /* DeliveryCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222206 /* DeliveryCore.swift */; };
+		1B1111111111111111111107 /* MultiDeviceConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222207 /* MultiDeviceConfig.swift */; };
+		1B1111111111111111111108 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222208 /* OnboardingView.swift */; };
+		1B1111111111111111111109 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222209 /* SettingsView.swift */; };
+		1B1111111111111111111110 /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222210 /* SignInView.swift */; };
+		1B1111111111111111111111 /* SignUpView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222211 /* SignUpView.swift */; };
+		1B1111111111111111111112 /* UserAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B2222222222222222222212 /* UserAccount.swift */; };
+		1C1111111111111111111101 /* DeliveryStateCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C2222222222222222222201 /* DeliveryStateCore.swift */; };
+		1C1111111111111111111102 /* LightweightContextEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C2222222222222222222202 /* LightweightContextEngine.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1A2222222222222222222201 /* ThunderCommIOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ThunderCommIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1A2222222222222222222202 /* ThunderCommApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThunderCommApp.swift; sourceTree = "<group>"; };
+		1A2222222222222222222203 /* ThunderCommModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThunderCommModels.swift; sourceTree = "<group>"; };
+		1A2222222222222222222204 /* ThunderCommWebSocketClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThunderCommWebSocketClient.swift; sourceTree = "<group>"; };
+		1A2222222222222222222205 /* ThunderCommStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThunderCommStore.swift; sourceTree = "<group>"; };
+		1A2222222222222222222206 /* ConnectionStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStatusView.swift; sourceTree = "<group>"; };
+		1A2222222222222222222207 /* MessageBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubble.swift; sourceTree = "<group>"; };
+		1A2222222222222222222208 /* MessageListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageListView.swift; sourceTree = "<group>"; };
+		1A2222222222222222222209 /* ComposerBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerBar.swift; sourceTree = "<group>"; };
+		1A2222222222222222222210 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		1A2222222222222222222211 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		1B2222222222222222222201 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		1B2222222222222222222202 /* AddAgentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddAgentView.swift; sourceTree = "<group>"; };
+		1B2222222222222222222203 /* APNsManager.swift.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APNsManager.swift.swift; sourceTree = "<group>"; };
+		1B2222222222222222222204 /* AuthGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthGate.swift; sourceTree = "<group>"; };
+		1B2222222222222222222205 /* AuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthManager.swift; sourceTree = "<group>"; };
+		1B2222222222222222222206 /* DeliveryCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeliveryCore.swift; sourceTree = "<group>"; };
+		1B2222222222222222222207 /* MultiDeviceConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiDeviceConfig.swift; sourceTree = "<group>"; };
+		1B2222222222222222222208 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		1B2222222222222222222209 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		1B2222222222222222222210 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
+		1B2222222222222222222211 /* SignUpView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignUpView.swift; sourceTree = "<group>"; };
+		1B2222222222222222222212 /* UserAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserAccount.swift; sourceTree = "<group>"; };
+		1C2222222222222222222201 /* DeliveryStateCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeliveryStateCore.swift; sourceTree = "<group>"; };
+		1C2222222222222222222202 /* LightweightContextEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LightweightContextEngine.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		1A4444444444444444444401 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1A3333333333333333333301 = {
+			isa = PBXGroup;
+			children = (
+				1A3333333333333333333302 /* ThunderCommIOS */,
+				1A3333333333333333333303 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		1A3333333333333333333302 /* ThunderCommIOS */ = {
+			isa = PBXGroup;
+			children = (
+				1B2222222222222222222201 /* AppDelegate.swift */,
+				1B2222222222222222222202 /* AddAgentView.swift */,
+				1B2222222222222222222203 /* APNsManager.swift.swift */,
+				1A2222222222222222222202 /* ThunderCommApp.swift */,
+				1A2222222222222222222211 /* Assets.xcassets */,
+				1B2222222222222222222204 /* AuthGate.swift */,
+				1B2222222222222222222205 /* AuthManager.swift */,
+				1A2222222222222222222210 /* ContentView.swift */,
+				1A2222222222222222222209 /* ComposerBar.swift */,
+				1A2222222222222222222206 /* ConnectionStatusView.swift */,
+				1B2222222222222222222206 /* DeliveryCore.swift */,
+				1C2222222222222222222201 /* DeliveryStateCore.swift */,
+				1C2222222222222222222202 /* LightweightContextEngine.swift */,
+				1A2222222222222222222207 /* MessageBubble.swift */,
+				1A2222222222222222222208 /* MessageListView.swift */,
+				1B2222222222222222222207 /* MultiDeviceConfig.swift */,
+				1B2222222222222222222208 /* OnboardingView.swift */,
+				1B2222222222222222222209 /* SettingsView.swift */,
+				1B2222222222222222222210 /* SignInView.swift */,
+				1B2222222222222222222211 /* SignUpView.swift */,
+				1A2222222222222222222203 /* ThunderCommModels.swift */,
+				1A2222222222222222222205 /* ThunderCommStore.swift */,
+				1A2222222222222222222204 /* ThunderCommWebSocketClient.swift */,
+				1B2222222222222222222212 /* UserAccount.swift */,
+			);
+			path = ThunderCommIOS;
+			sourceTree = "<group>";
+		};
+		1A3333333333333333333303 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1A2222222222222222222201 /* ThunderCommIOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1A5555555555555555555501 /* ThunderCommIOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1A8888888888888888888802 /* Build configuration list for PBXNativeTarget "ThunderCommIOS" */;
+			buildPhases = (
+				1A7777777777777777777701 /* Sources */,
+				1A4444444444444444444401 /* Frameworks */,
+				1A7777777777777777777702 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ThunderCommIOS;
+			productName = ThunderCommIOS;
+			productReference = 1A2222222222222222222201 /* ThunderCommIOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1A6666666666666666666601 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					1A5555555555555555555501 = {
+						CreatedOnToolsVersion = 26.4.1;
+						DevelopmentTeam = UY33JZTUP8;
+						ProvisioningStyle = Automatic;
+						SystemCapabilities = {
+							com.apple.BackgroundModes = {
+								enabled = 1;
+							};
+							com.apple.Push = {
+								enabled = 1;
+							};
+						};
+					};
+				};
+			};
+			buildConfigurationList = 1A8888888888888888888801 /* Build configuration list for PBXProject "ThunderCommIOS" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 1A3333333333333333333301;
+			productRefGroup = 1A3333333333333333333303 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1A5555555555555555555501 /* ThunderCommIOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		1A7777777777777777777702 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1A1111111111111111111110 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1A7777777777777777777701 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1B1111111111111111111101 /* AppDelegate.swift in Sources */,
+				1B1111111111111111111102 /* AddAgentView.swift in Sources */,
+				1B1111111111111111111103 /* APNsManager.swift.swift in Sources */,
+				1A1111111111111111111101 /* ThunderCommApp.swift in Sources */,
+				1B1111111111111111111104 /* AuthGate.swift in Sources */,
+				1B1111111111111111111105 /* AuthManager.swift in Sources */,
+				1A1111111111111111111109 /* ContentView.swift in Sources */,
+				1A1111111111111111111108 /* ComposerBar.swift in Sources */,
+				1A1111111111111111111105 /* ConnectionStatusView.swift in Sources */,
+				1B1111111111111111111106 /* DeliveryCore.swift in Sources */,
+				1C1111111111111111111101 /* DeliveryStateCore.swift in Sources */,
+				1C1111111111111111111102 /* LightweightContextEngine.swift in Sources */,
+				1A1111111111111111111106 /* MessageBubble.swift in Sources */,
+				1A1111111111111111111107 /* MessageListView.swift in Sources */,
+				1B1111111111111111111107 /* MultiDeviceConfig.swift in Sources */,
+				1B1111111111111111111108 /* OnboardingView.swift in Sources */,
+				1B1111111111111111111109 /* SettingsView.swift in Sources */,
+				1B1111111111111111111110 /* SignInView.swift in Sources */,
+				1B1111111111111111111111 /* SignUpView.swift in Sources */,
+				1A1111111111111111111102 /* ThunderCommModels.swift in Sources */,
+				1A1111111111111111111104 /* ThunderCommStore.swift in Sources */,
+				1A1111111111111111111103 /* ThunderCommWebSocketClient.swift in Sources */,
+				1B1111111111111111111112 /* UserAccount.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		1A9999999999999999999901 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		1A9999999999999999999902 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+		1A9999999999999999999903 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = ThunderCommIOS/ThunderCommIOSDebug.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 27;
+				DEVELOPMENT_TEAM = UY33JZTUP8;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ThunderCommIOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.thrustnthunder.thundercommios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		1A9999999999999999999904 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = ThunderCommIOS/ThunderCommIOSRelease.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 27;
+				DEVELOPMENT_TEAM = UY33JZTUP8;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ThunderCommIOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.thrustnthunder.thundercommios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1A8888888888888888888801 /* Build configuration list for PBXProject "ThunderCommIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A9999999999999999999901 /* Debug */,
+				1A9999999999999999999902 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1A8888888888888888888802 /* Build configuration list for PBXNativeTarget "ThunderCommIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A9999999999999999999903 /* Debug */,
+				1A9999999999999999999904 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 1A6666666666666666666601 /* Project object */;
+}
