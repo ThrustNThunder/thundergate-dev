@@ -36,6 +36,7 @@ import { getGhostSystemPrompt, setGhostContextDB } from '../ghost/context.js';
 import { WorldState, ProcessingMode } from '../world/state.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
 import { BrowserBridge, DEFAULT_BROWSER_BRIDGE_PORT } from '../browser/bridge.js';
+import { SurfaceAttach, DEFAULT_SURFACE_ATTACH_PORT } from '../surface/attach.js';
 import { LocalInferenceProvider } from '../inference/local_provider.js';
 import { PromiseTracker } from '../memory/promises.js';
 import { FrameManager } from '../memory/frame.js';
@@ -81,6 +82,7 @@ export class ThunderGateRuntime {
   // queueing, no per-peer audit chain, just request/response over a
   // single live extension socket. Absence of an extension is a no-op.
   private browser!: BrowserBridge;
+  private surface!: SurfaceAttach;
   // Persistent-memory subsystems wired in Build 28 — promise tracker,
   // continuity frame manager, untrain audit, and the provisional-memory
   // promoter. All four read/write to context.db so they survive
@@ -271,6 +273,33 @@ export class ThunderGateRuntime {
       console.warn('  ⚠ BrowserBridge start error (non-fatal):', (err as Error).message);
     }
 
+    // SurfaceAttach — native IPC for non-channel surfaces (ThunderTUI today,
+    // future iOS-on-LAN). Bound to 127.0.0.1 so it stays local. Same
+    // non-fatal contract as BrowserBridge: bind failure → log and continue.
+    // Principle 31: every surface attaches to the same runtime, the same
+    // session model, the same callLLM — TUI doesn't spin up a new Jon.
+    this.surface = new SurfaceAttach(
+      {
+        db: this.db,
+        provenance: this.provenance,
+        getSessionId: () => this.state.sessionId ?? null,
+        getModel: () => this.config.runtime.model,
+        callLLM: (messages) => this.callLLM(messages)
+      },
+      { port: DEFAULT_SURFACE_ATTACH_PORT }
+    );
+    try {
+      await this.surface.start();
+      const ss = this.surface.getStats();
+      if (ss.listening) {
+        console.log(`  ✓ SurfaceAttach listening on ws://127.0.0.1:${ss.port} (TUI / native surfaces)`);
+      } else {
+        console.log(`  ℹ SurfaceAttach not listening on :${ss.port} — bind failed, see provenance`);
+      }
+    } catch (err) {
+      console.warn('  ⚠ SurfaceAttach start error (non-fatal):', (err as Error).message);
+    }
+
     // Start doctor monitoring
     this.doctor = new Doctor(this);
     this.doctor.startMonitoring();
@@ -431,6 +460,19 @@ export class ThunderGateRuntime {
       }
     });
 
+    // ── One session, one history (Principle 31) ────────────────────────
+    // Persist the inbound to SessionDB so every native surface — channels,
+    // surface attach, future watchers — sees the same conversation. The
+    // WAL is the durability seam for crash recovery; this is the recall
+    // seam for "what did the user just say across all surfaces."
+    persistChannelMessage(
+      this.db,
+      this.state.sessionId,
+      channelId,
+      'user',
+      entry.text
+    );
+
     // ── Vault protocol short-circuit ────────────────────────────────────
     // If a vault unlock request is pending on this channel and the
     // inbound looks like the user's answer, divert *before* any other
@@ -467,6 +509,13 @@ export class ThunderGateRuntime {
             vault_unlock_outcome: result.status
           }
         });
+        persistChannelMessage(
+          this.db,
+          this.state.sessionId,
+          channelId,
+          'assistant',
+          replyText
+        );
         this.channels.broadcast(delivery);
         return;
       } catch (err) {
@@ -585,6 +634,14 @@ export class ThunderGateRuntime {
         model: delivery.model
       }
     });
+
+    persistChannelMessage(
+      this.db,
+      this.state.sessionId,
+      channelId,
+      'assistant',
+      composedText
+    );
 
     this.channels.broadcast(delivery);
   }
@@ -1219,6 +1276,9 @@ export class ThunderGateRuntime {
     // rejects any in-flight commands so awaiting callers fail fast.
     try { await this.browser?.stop(); } catch { /* ignore */ }
 
+    // Stop SurfaceAttach — closes any TUI client sockets.
+    try { await this.surface?.stop(); } catch { /* ignore */ }
+
     // Stop channels — drain client connections.
     try { await this.channels.stopAll(); } catch { /* ignore */ }
     console.log('  ✓ Channels stopped');
@@ -1264,6 +1324,32 @@ export class ThunderGateRuntime {
  * sequence would start with an assistant turn we drop it — the first
  * turn of an Anthropic call must be `user`.
  */
+/**
+ * Persist one turn (user or assistant) to SessionDB. Native channels and
+ * the surface attach both call this so every surface sees the same recall
+ * history — Principle 31's "one runtime, one session model" expressed as
+ * one writer interface, one rows-table. We ensure the session row exists
+ * before insertion because the messages FK constraints would otherwise
+ * throw on a fresh checkpoint where the runtime has a sessionId but the
+ * sessions table hasn't been touched yet (Doctor and ghost paths exhibit
+ * the same shape).
+ */
+function persistChannelMessage(
+  db: SessionDB,
+  sessionId: string | null,
+  channel: string,
+  role: 'user' | 'assistant',
+  content: string
+): void {
+  try {
+    if (!sessionId) return;
+    db.ensureSession(sessionId);
+    db.storeMessage({ sessionId, channel, role, content });
+  } catch (err) {
+    console.warn('  ⚠ persistChannelMessage skipped:', (err as Error).message);
+  }
+}
+
 function sanitizeHistory(history: GhostTurn[]): Array<{ role: string; content: string }> {
   const cleaned: Array<{ role: 'user' | 'assistant'; content: string }> = [];
   for (const turn of history) {

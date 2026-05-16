@@ -33,6 +33,8 @@ import { join } from 'path';
 import { ensureConfig } from '../config/index.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
 
+void existsSync;
+void readFileSync;
 const THUNDERGATE_DIR = join(process.env.HOME || '', '.thundergate');
 const CDP_PORT = 9222;
 const BROWSER_REFRESH_MS = 3000;
@@ -220,29 +222,38 @@ interface ChatClient {
   close(): void;
 }
 
+/**
+ * Chat pane now attaches directly to ThunderGate's SurfaceAttach endpoint
+ * (ws://127.0.0.1:8772) instead of routing through bridge.mjs → OpenClaw.
+ * Same Jon, same session, same callLLM — Principle 31. The wire protocol
+ * is the one defined by src/surface/attach.ts:
+ *   on connect : server sends `attached` { sessionId, model, history }
+ *   user typed : client sends `send` { text, correlationId }
+ *   inference  : server sends `thinking` then `message` (or `error`)
+ */
 function attachChat(host: ChatHost, opts: TuiOptions): void {
   const url = resolveChatUrl(opts);
   const append = (line: string) => {
     host.history.add(line);
     host.screen.render();
   };
-  append('{gray-fg}Connecting to ' + url.replace(/\?.*$/, '?…') + '…{/gray-fg}');
+  append('{gray-fg}Attaching to ThunderGate session at ' + url + '…{/gray-fg}');
 
-  const client = openChatClient(url, {
-    onStatus: (gateway, model) => {
-      append(`{green-fg}● connected{/green-fg} {gray-fg}gateway=${gateway} model=${model ?? 'unknown'}{/gray-fg}`);
-    },
-    onHistory: (msgs) => {
-      if (msgs.length === 0) {
-        append('{gray-fg}(no recent history){/gray-fg}');
+  const client = openSurfaceClient(url, {
+    onAttached: (sessionId, model, history) => {
+      append(`{green-fg}● attached{/green-fg} {gray-fg}session=${sessionId?.slice(0, 8) ?? 'none'} model=${model}{/gray-fg}`);
+      if (history.length === 0) {
+        append('{gray-fg}(no prior history in this session){/gray-fg}');
       } else {
-        for (const m of msgs) append(renderMessage(m.sender, m.text, m.timestamp));
+        append(`{gray-fg}─── ${history.length} prior turn${history.length === 1 ? '' : 's'} ───{/gray-fg}`);
+        for (const m of history) append(renderMessage(m.sender, m.text, m.timestamp));
       }
     },
     onMessage: (m) => append(renderMessage(m.sender, m.text, m.timestamp)),
     onThinking: (agentId) => append(`{magenta-fg}… ${agentId} is thinking{/magenta-fg}`),
-    onClose: (reason) => append(`{red-fg}● disconnected{/red-fg} {gray-fg}${reason}{/gray-fg}`),
-    onError: (err) => append(`{red-fg}● error: ${escapeTags(err.message)}{/red-fg}`)
+    onClose: (reason) => append(`{red-fg}● detached{/red-fg} {gray-fg}${reason}{/gray-fg}`),
+    onError: (err) => append(`{red-fg}● error: ${escapeTags(err.message)}{/red-fg}`),
+    onServerError: (code, message) => append(`{red-fg}● ${code}: ${escapeTags(message)}{/red-fg}`)
   });
 
   host.input.on('submit', (text: string) => {
@@ -273,31 +284,14 @@ function attachChat(host: ChatHost, opts: TuiOptions): void {
 
 function resolveChatUrl(opts: TuiOptions): string {
   if (opts.chatUrl) return opts.chatUrl;
-  // The live bridge.mjs accepts the literal string "Michael" as a token
-  // shortcut for the federation gateway token. The TUI is a local
-  // operator surface, so we use the same shortcut every other local
-  // client uses rather than reading the channel token out of config.json.
-  const port = readTcPort() ?? 8765;
-  return `ws://localhost:${port}/?token=Michael&deviceId=tui`;
+  // SurfaceAttach is localhost-bound by design; cross-host TUIs would
+  // tunnel ssh-forwarded or wrap a proxy. Port comes from the runtime's
+  // default — config doesn't currently expose this knob and we don't
+  // need it until a second concurrent runtime exists.
+  return `ws://127.0.0.1:${SURFACE_ATTACH_PORT}`;
 }
 
-function readTcPort(): number | null {
-  try {
-    const cfg = ensureConfig();
-    return cfg.channels.thundercommo.port ?? null;
-  } catch {
-    return null;
-  }
-}
-
-interface ChatHooks {
-  onStatus: (gateway: string, model: string | undefined) => void;
-  onHistory: (msgs: ChatMessage[]) => void;
-  onMessage: (msg: ChatMessage) => void;
-  onThinking: (agentId: string) => void;
-  onClose: (reason: string) => void;
-  onError: (err: Error) => void;
-}
+const SURFACE_ATTACH_PORT = 8772;
 
 interface ChatMessage {
   sender: string;
@@ -305,35 +299,38 @@ interface ChatMessage {
   timestamp: number;
 }
 
-function openChatClient(url: string, hooks: ChatHooks): ChatClient {
+interface SurfaceHooks {
+  onAttached: (sessionId: string | null, model: string, history: ChatMessage[]) => void;
+  onMessage: (msg: ChatMessage) => void;
+  onThinking: (agentId: string) => void;
+  onClose: (reason: string) => void;
+  onError: (err: Error) => void;
+  onServerError: (code: string, message: string) => void;
+}
+
+function openSurfaceClient(url: string, hooks: SurfaceHooks): ChatClient {
   let ws: WebSocket | null = new WebSocket(url);
   let closed = false;
-
-  ws.on('open', () => {
-    ws!.send(JSON.stringify({ type: 'subscribe', lastMessageId: null }));
-  });
 
   ws.on('message', (raw) => {
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     const t = typeof msg.type === 'string' ? msg.type : '';
-    if (t === 'status') {
-      hooks.onStatus(
-        typeof msg.gateway === 'string' ? msg.gateway : 'unknown',
-        typeof msg.model === 'string' ? msg.model : undefined
-      );
-    } else if (t === 'history') {
-      const arr = Array.isArray(msg.messages) ? msg.messages : [];
-      hooks.onHistory(arr.map(coerceChatMessage));
+    if (t === 'attached') {
+      const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : null;
+      const model = typeof msg.model === 'string' ? msg.model : 'unknown';
+      const arr = Array.isArray(msg.history) ? msg.history : [];
+      hooks.onAttached(sessionId, model, arr.map(coerceChatMessage));
     } else if (t === 'message') {
       hooks.onMessage(coerceChatMessage(msg));
     } else if (t === 'thinking') {
       const agentId = typeof msg.agentId === 'string' ? msg.agentId : 'agent';
       hooks.onThinking(agentId);
+    } else if (t === 'error') {
+      const code = typeof msg.code === 'string' ? msg.code : 'ERROR';
+      const message = typeof msg.message === 'string' ? msg.message : 'unknown error';
+      hooks.onServerError(code, message);
     }
-    // stream_chunk is intentionally ignored for now — the bridge also
-    // emits a final `message` once the stream completes, so we render
-    // that instead of redrawing on every delta.
   });
 
   ws.on('error', (err) => hooks.onError(err as Error));
@@ -346,12 +343,9 @@ function openChatClient(url: string, hooks: ChatHooks): ChatClient {
     send: (text: string) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       ws.send(JSON.stringify({
-        type: 'message',
+        type: 'send',
         text,
-        channel: 'tnt',
-        sender: 'Michael',
-        timestamp: Date.now(),
-        idempotencyKey: randomKey()
+        correlationId: randomKey()
       }));
     },
     close: () => {
