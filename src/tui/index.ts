@@ -106,6 +106,12 @@ interface ChatHost {
   history: blessed.Widgets.Log;
   input: blessed.Widgets.TextboxElement;
   screen: blessed.Widgets.Screen;
+  // The slash popup is a separate widget that overlays the chat pane just
+  // above the input. We park it here so handlers reach it without globals.
+  slashPopup?: blessed.Widgets.ListElement;
+  // Tracks the most recent Jon message so /copy has something to ship to
+  // the clipboard without re-scraping the rendered history.
+  lastAssistantText?: string;
 }
 
 interface BrowserHost {
@@ -247,14 +253,23 @@ function attachChat(host: ChatHost, opts: TuiOptions): void {
       } else {
         append(`{gray-fg}─── ${history.length} prior turn${history.length === 1 ? '' : 's'} ───{/gray-fg}`);
         for (const m of history) append(renderMessage(m.sender, m.text, m.timestamp));
+        const lastJon = [...history].reverse().find((m) => m.sender !== 'Michael');
+        if (lastJon) host.lastAssistantText = lastJon.text;
       }
     },
-    onMessage: (m) => append(renderMessage(m.sender, m.text, m.timestamp)),
+    onMessage: (m) => {
+      append(renderMessage(m.sender, m.text, m.timestamp));
+      if (m.sender !== 'Michael') host.lastAssistantText = m.text;
+    },
     onThinking: (agentId) => append(`{magenta-fg}… ${agentId} is thinking{/magenta-fg}`),
     onClose: (reason) => append(`{red-fg}● detached{/red-fg} {gray-fg}${reason}{/gray-fg}`),
     onError: (err) => append(`{red-fg}● error: ${escapeTags(err.message)}{/red-fg}`),
     onServerError: (code, message) => append(`{red-fg}● ${code}: ${escapeTags(message)}{/red-fg}`)
   });
+
+  // Slash command popup. Wired *before* the submit handler so dispatching
+  // a slash command can short-circuit the regular "send to runtime" path.
+  installSlashPopup(host, append, client);
 
   host.input.on('submit', (text: string) => {
     const trimmed = (text || '').trim();
@@ -265,9 +280,10 @@ function attachChat(host: ChatHost, opts: TuiOptions): void {
       host.input.readInput();
       return;
     }
-    if (trimmed === '/quit' || trimmed === '/exit') {
-      client.close();
-      exitClean(host.screen);
+    if (trimmed.startsWith('/')) {
+      // Slash commands run locally — they don't go to the surface runtime.
+      void dispatchSlashCommand(trimmed, host, append, client);
+      host.input.readInput();
       return;
     }
     append(renderMessage('Michael', trimmed, Date.now()));
@@ -280,6 +296,388 @@ function attachChat(host: ChatHost, opts: TuiOptions): void {
   // First-time arming — textbox stays cold until readInput() is called or
   // the user clicks/tabs in.
   host.input.readInput();
+}
+
+// ── slash commands ───────────────────────────────────────────────────────
+
+interface SlashCommand {
+  name: string;
+  signature: string;
+  description: string;
+  /** True if the command needs at least one argument before submit makes sense. */
+  takesArgs?: boolean;
+}
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: '/navigate', signature: '/navigate <url>', description: 'Drive the browser to a URL', takesArgs: true },
+  { name: '/read',     signature: '/read',           description: 'Print visible page text into chat' },
+  { name: '/click',    signature: '/click <selector>', description: 'Click an element (CSS or text=Foo)', takesArgs: true },
+  { name: '/fill',     signature: '/fill <selector> <value>', description: 'Fill an input field', takesArgs: true },
+  { name: '/status',   signature: '/status',         description: 'Show runtime + browser + Ghost snapshot' },
+  { name: '/copy',     signature: '/copy',           description: "Copy Jon's last reply to the clipboard" },
+  { name: '/clear',    signature: '/clear',          description: 'Clear the chat history pane' },
+  { name: '/quit',     signature: '/quit',           description: 'Exit ThunderTUI' }
+];
+
+/**
+ * Build the slash popup and wire keypresses on the chat input. The popup
+ * is a blessed.list overlaid just above the input rectangle. While it's
+ * visible, Up/Down on the textbox navigate the list, Tab/Enter completes
+ * the current selection into the input, and Escape (or typing past the
+ * command word with a space) hides it.
+ *
+ * We do NOT change focus into the list — that would break blessed
+ * textbox's readInput loop. Instead we use the textbox's keypress events
+ * to drive the list via its public `.up/.down/.select` API, then peek
+ * the highlighted item back out via `getItem(selected)`.
+ */
+function installSlashPopup(
+  host: ChatHost,
+  append: (line: string) => void,
+  client: ChatClient
+): void {
+  const popup = blessed.list({
+    parent: host.pane,
+    bottom: 3,
+    left: 1,
+    right: 1,
+    height: Math.min(SLASH_COMMANDS.length + 2, 10),
+    border: { type: 'line' },
+    label: ' slash commands ',
+    tags: true,
+    keys: false,
+    mouse: true,
+    interactive: true,
+    style: {
+      border: { fg: 'yellow' },
+      selected: { bg: 'yellow', fg: 'black' }
+    },
+    items: []
+  });
+  popup.hide();
+  host.slashPopup = popup;
+
+  // Track which commands the current filter would match. Rebuilt on every
+  // keypress; null = popup closed.
+  let filtered: SlashCommand[] = [];
+
+  const showAndFilter = (rawValue: string) => {
+    if (!rawValue.startsWith('/')) {
+      hide();
+      return;
+    }
+    // If the user has typed past the command head (i.e. value contains a
+    // space), they're entering arguments — hide the menu.
+    if (rawValue.includes(' ')) {
+      hide();
+      return;
+    }
+    const needle = rawValue.toLowerCase();
+    filtered = SLASH_COMMANDS.filter((c) => c.name.startsWith(needle));
+    if (filtered.length === 0) {
+      hide();
+      return;
+    }
+    popup.setItems(filtered.map((c) => `${c.signature} {gray-fg}— ${c.description}{/gray-fg}`));
+    popup.select(0);
+    popup.show();
+    popup.setFront();
+    host.screen.render();
+  };
+
+  const hide = () => {
+    if (!popup.hidden) {
+      popup.hide();
+      host.screen.render();
+    }
+    filtered = [];
+  };
+
+  const completeWith = (cmd: SlashCommand) => {
+    // Always set the value to the command's name. For arg-taking commands
+    // append a space so the user can keep typing the argument.
+    const next = cmd.takesArgs ? cmd.name + ' ' : cmd.name;
+    host.input.setValue(next);
+    hide();
+    host.input.focus();
+    host.screen.render();
+  };
+
+  // Keypress fires BEFORE textbox applies the key — so we read the current
+  // value, then queue a microtask to read the value AFTER application. For
+  // the navigation keys (Up/Down/Tab/Escape/Enter while popup is open) we
+  // intercept here and stop them reaching the textbox.
+  host.input.on('keypress', (_ch: string, key: { name: string; full?: string; ctrl?: boolean }) => {
+    if (!popup.hidden && filtered.length > 0) {
+      // Cast — blessed's runtime accepts up()/down() with no args; the
+      // @types/blessed declaration requires a number, but the no-arg form
+      // moves selection by 1 in either direction.
+      const p = popup as unknown as { up: (n?: number) => void; down: (n?: number) => void; selected: number };
+      if (key.name === 'up') { p.up(1); host.screen.render(); return; }
+      if (key.name === 'down') { p.down(1); host.screen.render(); return; }
+      if (key.name === 'escape') { hide(); return; }
+      if (key.name === 'tab' || (key.name === 'return' && p.selected !== undefined)) {
+        const idx = p.selected ?? 0;
+        const pick = filtered[idx];
+        if (pick) {
+          completeWith(pick);
+          // For Enter on a no-arg command, also submit immediately so the
+          // muscle memory is "/ → r → Enter → reads the page."
+          if (!pick.takesArgs && key.name === 'return') {
+            void dispatchSlashCommand(pick.name, host, append, client);
+            host.input.clearValue();
+            host.screen.render();
+          }
+        }
+        return;
+      }
+    }
+    // setImmediate so we read the post-key value, not the pre-key one.
+    setImmediate(() => showAndFilter(host.input.getValue() ?? ''));
+  });
+}
+
+/**
+ * Parse + dispatch one slash command. Local-only — none of these hit the
+ * surface chat protocol. Output, if any, lands in the chat pane via
+ * `append()` so the operator sees results inline with the conversation.
+ */
+async function dispatchSlashCommand(
+  raw: string,
+  host: ChatHost,
+  append: (line: string) => void,
+  client: ChatClient
+): Promise<void> {
+  const parts = raw.trim().split(/\s+/);
+  const head = parts[0].toLowerCase();
+  const args = parts.slice(1);
+  const echo = (line: string) => append(`{yellow-fg}${escapeTags(raw)}{/yellow-fg}\n${line}`);
+
+  try {
+    switch (head) {
+      case '/quit':
+      case '/exit':
+        client.close();
+        exitClean(host.screen);
+        return;
+      case '/clear':
+        host.history.setContent('');
+        host.screen.render();
+        return;
+      case '/copy':
+        await runCopy(host, echo);
+        return;
+      case '/read':
+        await runRead(echo);
+        return;
+      case '/navigate':
+        if (args.length === 0) { echo('{red-fg}usage: /navigate <url>{/red-fg}'); return; }
+        await runNavigate(args[0], echo);
+        return;
+      case '/click':
+        if (args.length === 0) { echo('{red-fg}usage: /click <selector|text=Foo>{/red-fg}'); return; }
+        await runClick(args.join(' '), echo);
+        return;
+      case '/fill':
+        if (args.length < 2) { echo('{red-fg}usage: /fill <selector> <value>{/red-fg}'); return; }
+        await runFill(args[0], args.slice(1).join(' '), echo);
+        return;
+      case '/status':
+        await runStatus(echo);
+        return;
+      default:
+        echo(`{red-fg}unknown command: ${escapeTags(head)}{/red-fg}`);
+    }
+  } catch (err) {
+    echo(`{red-fg}${escapeTags((err as Error).message)}{/red-fg}`);
+  }
+}
+
+async function runRead(echo: (line: string) => void): Promise<void> {
+  const text = await readPageText();
+  const lines = text.split('\n').slice(0, 60).join('\n');
+  echo(`{gray-fg}page text (first ${Math.min(60, text.split('\n').length)} lines):{/gray-fg}\n${escapeTags(lines)}`);
+}
+
+async function runNavigate(url: string, echo: (line: string) => void): Promise<void> {
+  if (!/^https?:\/\//i.test(url)) {
+    echo('{red-fg}url must start with http(s)://{/red-fg}');
+    return;
+  }
+  await navigateViaCDP(url);
+  echo(`{green-fg}✓ navigated to ${escapeTags(url)}{/green-fg}`);
+}
+
+async function runClick(selector: string, echo: (line: string) => void): Promise<void> {
+  const expr = buildClickExpr(selector);
+  await evalOnPageOnce(expr);
+  echo(`{green-fg}✓ clicked ${escapeTags(selector)}{/green-fg}`);
+}
+
+async function runFill(selector: string, value: string, echo: (line: string) => void): Promise<void> {
+  const expr = `(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) throw new Error('element_not_found');
+    if ('value' in el) {
+      el.focus();
+      el.value = ${JSON.stringify(value)};
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } else if (el.isContentEditable) {
+      el.textContent = ${JSON.stringify(value)};
+    } else {
+      throw new Error('element_not_fillable');
+    }
+    return true;
+  })()`;
+  await evalOnPageOnce(expr);
+  echo(`{green-fg}✓ filled ${escapeTags(selector)} (${value.length} chars){/green-fg}`);
+}
+
+async function runStatus(echo: (line: string) => void): Promise<void> {
+  // Gather a small composite: ThunderGate context snapshot + browser state.
+  // We don't have a runtime status RPC, so we read the same provenance the
+  // CLI's `browser status` reads + ask SurfaceAttach for context snapshot.
+  const parts: string[] = [];
+  try {
+    const snap = await fetchContextStatusViaSurface();
+    if (snap) {
+      const ageMin = Math.floor(snap.msSinceLastActivity / 60_000);
+      parts.push(`{cyan-fg}runtime:{/cyan-fg} session=${snap.sessionId?.slice(0,16) ?? '(none)'} turns=${snap.sessionTurnCount} tokens≈${snap.sessionTokensEstimate} age=${ageMin}m`);
+      parts.push(`{cyan-fg}context:{/cyan-fg} ttl=${snap.cfg.sessionTtl} compaction=${snap.cfg.compaction} cache=${snap.cfg.cacheRetention}`);
+    } else {
+      parts.push('{red-fg}runtime: unreachable on 127.0.0.1:8772{/red-fg}');
+    }
+  } catch (err) {
+    parts.push(`{red-fg}runtime: ${escapeTags((err as Error).message)}{/red-fg}`);
+  }
+  const browser = readBrowserSnapshot();
+  parts.push(`{cyan-fg}browser:{/cyan-fg} ${browser.connected ? '{green-fg}● connected{/green-fg}' : '{red-fg}● disconnected{/red-fg}'} url=${escapeTags(browser.url || '(none)')}`);
+  // Ghost score — read from the scores file if present.
+  parts.push(`{cyan-fg}ghost:{/cyan-fg} ${readGhostScoreLine()}`);
+  echo(parts.join('\n'));
+}
+
+interface ContextSnapshot {
+  sessionId: string | null;
+  msSinceLastActivity: number;
+  sessionTurnCount: number;
+  sessionTokensEstimate: number;
+  cfg: { sessionTtl: string; cacheRetention: string; compaction: string; maxTokens: number; pruneOnReset: boolean };
+}
+
+async function fetchContextStatusViaSurface(): Promise<ContextSnapshot | null> {
+  return await new Promise<ContextSnapshot | null>((resolve) => {
+    const sock = new WebSocket(`ws://127.0.0.1:${SURFACE_ATTACH_PORT}`);
+    const timer = setTimeout(() => {
+      try { sock.close(); } catch { /* ignore */ }
+      resolve(null);
+    }, 1500);
+    sock.on('open', () => sock.send(JSON.stringify({ type: 'status_request' })));
+    sock.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as { type?: string; snapshot?: ContextSnapshot };
+        if (msg?.type === 'status') {
+          clearTimeout(timer);
+          try { sock.close(); } catch { /* ignore */ }
+          resolve(msg.snapshot ?? null);
+        }
+      } catch { /* keep waiting */ }
+    });
+    sock.on('error', () => { clearTimeout(timer); resolve(null); });
+    sock.on('close', () => { clearTimeout(timer); resolve(null); });
+  });
+}
+
+function readGhostScoreLine(): string {
+  try {
+    const cfg = ensureConfig();
+    const raw = readFileSync(cfg.ghost?.scores_file ?? '', 'utf-8');
+    const j = JSON.parse(raw) as { weighted?: number; overall?: number; updated_at?: number; categories?: Record<string, { score?: number }> };
+    const score = typeof j.weighted === 'number' ? j.weighted : (j.overall ?? null);
+    if (score === null || score === undefined) return '(no score yet)';
+    return `weighted=${score.toFixed(3)}`;
+  } catch {
+    return '(scores file missing)';
+  }
+}
+
+async function runCopy(host: ChatHost, echo: (line: string) => void): Promise<void> {
+  if (!host.lastAssistantText) {
+    echo('{red-fg}nothing to copy yet — wait for Jon to respond.{/red-fg}');
+    return;
+  }
+  const bytes = host.lastAssistantText.length;
+  // Try the system clipboard first (xsel / xclip / wl-copy). On headless
+  // hosts these need an X / Wayland display we don't have over SSH, so we
+  // always also drop the text into ~/.thundergate/last-jon-reply.txt as a
+  // belt-and-suspenders path — operators can `scp` or `cat` that file
+  // from anywhere even when the clipboard backend is missing.
+  let clipboardOk = false;
+  try {
+    await copyToClipboard(host.lastAssistantText);
+    clipboardOk = true;
+  } catch { /* fall through to file path */ }
+
+  const filePath = join(THUNDERGATE_DIR, 'last-jon-reply.txt');
+  try {
+    const { writeFileSync, mkdirSync: mk } = await import('fs');
+    mk(THUNDERGATE_DIR, { recursive: true });
+    writeFileSync(filePath, host.lastAssistantText);
+  } catch (err) {
+    if (!clipboardOk) {
+      echo(`{red-fg}copy failed (no clipboard, file write failed too): ${escapeTags((err as Error).message)}{/red-fg}`);
+      return;
+    }
+  }
+  if (clipboardOk) {
+    echo(`{green-fg}✓ copied last Jon reply to clipboard (${bytes} chars){/green-fg}\n{gray-fg}also saved → ${escapeTags(filePath)}{/gray-fg}`);
+  } else {
+    echo(`{yellow-fg}● no X clipboard available — saved last Jon reply to file (${bytes} chars){/yellow-fg}\n{gray-fg}${escapeTags(filePath)}{/gray-fg}`);
+  }
+}
+
+/**
+ * Pipe a string into xsel (X11 clipboard) or xclip if available. We pick
+ * the first binary found on PATH. Headless EC2 has xsel installed; falling
+ * back to xclip and then to a warning keeps the command useful for any
+ * box where one or the other is missing.
+ */
+async function copyToClipboard(text: string): Promise<void> {
+  const { spawn } = await import('child_process');
+  const candidates: Array<{ bin: string; args: string[] }> = [
+    { bin: 'xsel', args: ['-bi'] },
+    { bin: 'xclip', args: ['-selection', 'clipboard', '-in'] },
+    { bin: 'wl-copy', args: [] }
+  ];
+  return await new Promise<void>((resolve, reject) => {
+    let lastErr: Error | null = null;
+    const tryNext = (idx: number) => {
+      if (idx >= candidates.length) {
+        reject(lastErr ?? new Error('no clipboard backend (install xsel or xclip)'));
+        return;
+      }
+      const c = candidates[idx];
+      let proc;
+      try {
+        proc = spawn(c.bin, c.args, { stdio: ['pipe', 'ignore', 'pipe'] });
+      } catch (err) {
+        lastErr = err as Error;
+        tryNext(idx + 1);
+        return;
+      }
+      proc.on('error', (err) => {
+        lastErr = err;
+        tryNext(idx + 1);
+      });
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else { lastErr = new Error(`${c.bin} exited ${code}`); tryNext(idx + 1); }
+      });
+      proc.stdin?.end(text);
+    };
+    tryNext(0);
+  });
 }
 
 function resolveChatUrl(opts: TuiOptions): string {

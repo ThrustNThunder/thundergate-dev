@@ -47,6 +47,7 @@ import {
   estimateTokens,
   type Turn
 } from '../context/manager.js';
+import { loadIdentity, summarizeIdentity } from '../identity/bootstrap.js';
 import { LocalInferenceProvider } from '../inference/local_provider.js';
 import { PromiseTracker } from '../memory/promises.js';
 import { FrameManager } from '../memory/frame.js';
@@ -65,6 +66,10 @@ interface RuntimeState {
   deepModeActive: boolean;
   surfaceLayerActive: boolean;
   lastActivity: Date;
+  // Cached identity prompt — built once on boot from SOUL.md / USER.md /
+  // MEMORY.md (head) / today's memory log. Prepended to every callLLM
+  // turn so every surface speaks as the same Jon (Principle 31).
+  systemPrompt: string;
 }
 
 export class ThunderGateRuntime {
@@ -130,7 +135,8 @@ export class ThunderGateRuntime {
       contextTokens: 0,
       deepModeActive: false,
       surfaceLayerActive: false,
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      systemPrompt: ''
     };
   }
 
@@ -434,6 +440,29 @@ export class ThunderGateRuntime {
         console.warn('  ⚠ Ghost harness failed to start:', err);
         this.ghost = null;
       }
+    }
+
+    // Identity bootstrap — read SOUL/USER/MEMORY/today's-log once and
+    // cache the assembled system prompt. Every callLLM turn after this
+    // prepends it. Fires once per runtime boot; operators rotate by
+    // restarting after editing the source files. Failure is non-fatal —
+    // missing files just mean a shorter prompt.
+    try {
+      const id = loadIdentity();
+      this.state.systemPrompt = id.systemPrompt;
+      console.log(`  ✓ Identity loaded (${summarizeIdentity(id)})`);
+      this.provenance.append({
+        actor: 'identity-bootstrap',
+        action: 'loaded',
+        target: 'system-prompt',
+        data: {
+          parts: id.parts.map((p) => ({ name: p.name, bytes: p.bytes, lines: p.lines })),
+          missing: id.missing,
+          totalBytes: id.parts.reduce((a, p) => a + p.bytes, 0)
+        }
+      });
+    } catch (err) {
+      console.warn('  ⚠ Identity bootstrap failed (non-fatal):', (err as Error).message);
     }
 
     // Ready
@@ -995,7 +1024,19 @@ export class ThunderGateRuntime {
    * the path that runs every time ThunderMind isn't up.
    */
   private async processCloud(message: Message): Promise<Response> {
-    const text = await this.callLLM([{ role: 'user', content: message.content }]);
+    // Channel inbound path. Identity prompt rides along here too so Slack /
+    // ThunderCommo / future channel surfaces all speak as the same Jon.
+    // We do NOT apply context.compaction here yet — that's the surface
+    // pipeline's responsibility; this single-turn channel call has nothing
+    // to compact.
+    const messages: Array<{ role: string; content: string }> = [];
+    if (this.state.systemPrompt) {
+      messages.push({ role: 'system', content: this.state.systemPrompt });
+    }
+    messages.push({ role: 'user', content: message.content });
+    const ctxCfg = effectiveContextConfig(this.config);
+    const cacheHint = cacheHintForRetention(ctxCfg.cacheRetention);
+    const text = await this.callLLM(messages, { cacheHint });
     return { content: text, type: 'normal' };
   }
 
@@ -1388,7 +1429,16 @@ export class ThunderGateRuntime {
     }
 
     const cacheHint = cacheHintForRetention(ctxCfg.cacheRetention);
-    const messages = compactResult.turns.map((t) => ({ role: t.role, content: t.content }));
+    // Prepend the identity prompt as a `system` turn — callLLM splits
+    // `role:'system'` messages into Anthropic's top-level system field
+    // and applies the cache hint, so identity stays warm across turns.
+    const messages: Array<{ role: string; content: string }> = [];
+    if (this.state.systemPrompt) {
+      messages.push({ role: 'system', content: this.state.systemPrompt });
+    }
+    for (const t of compactResult.turns) {
+      messages.push({ role: t.role, content: t.content });
+    }
     const replyText = await this.callLLM(messages, { cacheHint });
 
     if (replyText) {

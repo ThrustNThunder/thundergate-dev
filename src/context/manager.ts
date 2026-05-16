@@ -196,6 +196,12 @@ export function compactForInference(
  * in sync — callLLM reads the returned `betaHeader` and stamps it.
  */
 export function cacheHintForRetention(retention: CacheRetention): CacheControlHint {
+  // Anthropic's current ephemeral cache TTL surface accepts ONLY '5m'
+  // (default — omitted) and '1h' (via the extended-cache-ttl beta). 4h
+  // hasn't shipped on this API path yet; we keep the operator-facing
+  // "extended" label and fall back to '1h' under the hood so the
+  // selection round-trips a valid request. When 4h ships we lift the
+  // floor on this branch in one place.
   switch (retention) {
     case 'short':
       return {
@@ -211,9 +217,9 @@ export function cacheHintForRetention(retention: CacheRetention): CacheControlHi
       };
     case 'extended':
       return {
-        cacheControl: { type: 'ephemeral', ttl: '4h' },
+        cacheControl: { type: 'ephemeral', ttl: '1h' },
         betaHeader: 'extended-cache-ttl-2025-04-11',
-        label: 'extended (4h)'
+        label: 'extended (1h — 4h pending API support)'
       };
   }
 }
