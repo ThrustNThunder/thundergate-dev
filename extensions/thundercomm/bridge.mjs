@@ -21,6 +21,8 @@ import { readFileSync, watchFile, statSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { createServer } from 'http';
+import { homedir } from 'os';
+import path from 'path';
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -203,7 +205,7 @@ function broadcast(msg) {
 function broadcastAgentMessage(id, text, timestamp) {
   console.log(`[Bridge] Broadcasting agent message: ${text.slice(0, 60)}…`);
   const msgTimestamp = timestamp || Date.now();
-  
+
   // Broadcast to local web clients
   broadcast({
     type: 'message',
@@ -213,7 +215,7 @@ function broadcastAgentMessage(id, text, timestamp) {
     text,
     timestamp: msgTimestamp,
   });
-  
+
   // Also send to federation relay so other agents can see Jon's responses
   if (federationWs && federationWs.readyState === WebSocket.OPEN) {
     federationWs.send(JSON.stringify({
@@ -225,6 +227,74 @@ function broadcastAgentMessage(id, text, timestamp) {
       agentId: AGENT_ID,
       timestamp: msgTimestamp,
     }));
+  }
+
+  // Wake the iOS app via silent push so DeliveryCore.drainInbox runs and the
+  // badge increments per BUILD_54_BADGE_BRIEF.md. Best-effort: failures only
+  // log; the message is already broadcast and persisted upstream.
+  const deviceToken = loadMostRecentApnsToken();
+  if (deviceToken) {
+    void sendApnsSilentPush(deviceToken);
+  }
+}
+
+// ── APNs silent push ──────────────────────────────────────────────────────
+
+const APNS_PUSH_URL = process.env.TC_APNS_PUSH_URL
+  || 'http://localhost:18794/api/apns/push';
+const APNS_TOKENS_PATH = process.env.TC_APNS_TOKENS_PATH
+  || path.join(homedir(), '.thundergate', 'apns_tokens.json');
+
+// Expected file shape:
+//   { "tokens": [ { "device_token": "...", "registered_at": "ISO-8601" }, ... ] }
+// We pick the entry with the most recent `registered_at`. Missing file,
+// malformed JSON, missing/empty tokens array, or no parseable timestamps all
+// return null — push is best-effort and silently skipped.
+function loadMostRecentApnsToken() {
+  try {
+    const raw = readFileSync(APNS_TOKENS_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    const tokens = parsed?.tokens;
+    if (!Array.isArray(tokens) || tokens.length === 0) return null;
+    const sorted = [...tokens].sort((a, b) => {
+      const ta = Date.parse(a?.registered_at ?? '') || 0;
+      const tb = Date.parse(b?.registered_at ?? '') || 0;
+      return tb - ta;
+    });
+    const top = sorted[0];
+    return typeof top?.device_token === 'string' && top.device_token.length > 0
+      ? top.device_token
+      : null;
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.warn(`[Bridge] apns_tokens.json read failed: ${err.message}`);
+    }
+    return null;
+  }
+}
+
+// POSTs to the local APNs server. Empty title/body is the server's contract
+// for silent wakeup — the server formats the actual content-available:1
+// payload. iOS wakes the app, DeliveryCore.drainInbox fetches new messages,
+// and the badge increments inside drainInbox when sceneIsActive is false.
+async function sendApnsSilentPush(deviceToken) {
+  const body = {
+    device_token: deviceToken,
+    title: '',
+    body: '',
+    channel: 'tnt',
+  };
+  try {
+    const resp = await fetch(APNS_PUSH_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      console.warn(`[Bridge] APNs push non-2xx: ${resp.status}`);
+    }
+  } catch (err) {
+    console.warn(`[Bridge] APNs push failed: ${err.message}`);
   }
 }
 
