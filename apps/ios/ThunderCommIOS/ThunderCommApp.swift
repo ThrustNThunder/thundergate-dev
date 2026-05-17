@@ -12,10 +12,12 @@ struct ThunderCommApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environmentObject(DeliveryCore.shared)
-                .environmentObject(AuthManager.shared)
-                .environmentObject(AccountStore.shared)
+            SplashGate {
+                RootView()
+            }
+            .environmentObject(DeliveryCore.shared)
+            .environmentObject(AuthManager.shared)
+            .environmentObject(AccountStore.shared)
         }
         .onChange(of: scenePhase) { _, phase in
             DeliveryCore.shared.handleScenePhase(phase)
@@ -27,6 +29,31 @@ struct ThunderCommApp: App {
             }
             if phase == .background {
                 APNsManager.shared.scheduleNextBackgroundRefresh()
+            }
+        }
+    }
+}
+
+// Shows SplashView first, then swaps to the wrapped content once the launch
+// sequence (logo hold + relay-connected banner + fade) completes. DeliveryCore's
+// connect path runs off scenePhase, not off the view tree, so the splash
+// doesn't gate the connection from starting.
+private struct SplashGate<Content: View>: View {
+    @State private var showSplash = true
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ZStack {
+            if showSplash {
+                SplashView(onComplete: {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        showSplash = false
+                    }
+                })
+                .transition(.opacity)
+            } else {
+                content()
+                    .transition(.opacity)
             }
         }
     }
