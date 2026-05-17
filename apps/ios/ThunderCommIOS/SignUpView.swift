@@ -139,7 +139,6 @@ public struct SignUpView: View {
                         .keyboardType(.numberPad)
                         .textContentType(.telephoneNumber)
                         .onChange(of: phone) { _, newValue in
-                            // Strip anything that isn't a digit — numeric only.
                             let digits = newValue.filter { $0.isNumber }
                             if digits != newValue { phone = digits }
                         }

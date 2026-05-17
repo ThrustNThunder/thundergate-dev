@@ -17,7 +17,7 @@ private struct ActiveConnection {
     let endpoint: URL
     let token: String
     let peerId: String
-    let channel: String
+    let channels: [String]
 }
 
 final class ThunderCommWebSocketClient: NSObject {
@@ -38,16 +38,21 @@ final class ThunderCommWebSocketClient: NSObject {
     var onEvent: ((ThunderCommInboundEvent) -> Void)?
     var onMessageSent: ((String) -> Void)?
     var onMessageFailed: ((String, String) -> Void)?
+    // Asked at (re)connect time so the auth handshake can carry the
+    // highest timestamp the store already has for the active channel.
+    // The relay uses this to skip messages the client has already seen
+    // and prevent the burst replay seen in Build 28.
+    var onResolveAfterTimestamp: ((String) -> Int64)?
 
     private func debug(_ message: String) {
         print("[ThunderComm] \(message)")
     }
 
-    func connect(endpoint: URL, token: String, peerId: String, channel: String) {
+    func connect(endpoint: URL, token: String, peerId: String, channels: [String] = []) {
         endpointCandidates = Self.makeEndpointCandidates(from: endpoint)
-        debug("connect requested with candidates: \(endpointCandidates.map { $0.absoluteString }.joined(separator: ", "))")
+        debug("connect requested with candidates: \(endpointCandidates.map { $0.absoluteString }.joined(separator: ", ")) channels=\(channels.joined(separator: ","))")
         currentEndpointIndex = 0
-        activeConnection = ActiveConnection(endpoint: endpointCandidates[0], token: token, peerId: peerId, channel: channel)
+        activeConnection = ActiveConnection(endpoint: endpointCandidates[0], token: token, peerId: peerId, channels: channels)
         reconnectAttempt = 0
         isManualDisconnect = false
         shouldRetry = true
@@ -104,7 +109,26 @@ final class ThunderCommWebSocketClient: NSObject {
     }
 
     func sendHistoryRequest(channel: String, limit: Int) {
-        send(ThunderCommHistoryRequestPayload(channel: channel, limit: limit))
+        let afterTimestamp = onResolveAfterTimestamp?(channel) ?? 0
+        send(ThunderCommHistoryRequestPayload(
+            channel: channel,
+            limit: limit,
+            afterTimestamp: afterTimestamp > 0 ? afterTimestamp : nil
+        ))
+    }
+
+    /// Broadcasts a channel_created frame so other members can mirror the
+    /// channel locally. Presentation-layer privacy only (v1) — receivers
+    /// filter by membership; the relay does not.
+    func sendChannelCreated(channel: ThunderChannel, by peerId: String) {
+        let payload = ChannelCreatedOutboundPayload(
+            channelId: channel.id,
+            name: channel.name,
+            members: channel.members,
+            createdBy: peerId,
+            createdAt: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        send(payload)
     }
 
     private func openConnection() {
@@ -116,7 +140,7 @@ final class ThunderCommWebSocketClient: NSObject {
         let endpoint = endpointCandidates.indices.contains(currentEndpointIndex)
             ? endpointCandidates[currentEndpointIndex]
             : activeConnection.endpoint
-        activeConnection = ActiveConnection(endpoint: endpoint, token: activeConnection.token, peerId: activeConnection.peerId, channel: activeConnection.channel)
+        activeConnection = ActiveConnection(endpoint: endpoint, token: activeConnection.token, peerId: activeConnection.peerId, channels: activeConnection.channels)
         self.activeConnection = activeConnection
 
         pingWorkItem?.cancel()
@@ -138,7 +162,7 @@ final class ThunderCommWebSocketClient: NSObject {
         let currentTask = task
 
         onStateChange?(.authenticating)
-        sendAuth(token: activeConnection.token, peerId: activeConnection.peerId, channels: [activeConnection.channel])
+        sendAuth(token: activeConnection.token, peerId: activeConnection.peerId, channels: activeConnection.channels)
         scheduleAuthTimeout(for: epoch)
         if let currentTask {
             receiveLoop(task: currentTask, epoch: epoch)
@@ -147,7 +171,22 @@ final class ThunderCommWebSocketClient: NSObject {
     }
 
     private func sendAuth(token: String, peerId: String, channels: [String]) {
-        let payload = FederationAuthPayload(token: token, peerId: peerId, channels: channels)
+        // When one socket subscribes to multiple channels, using the newest
+        // timestamp as the replay floor can starve quieter threads, especially
+        // direct:agent DMs behind a noisy #tnt. Use the oldest positive floor
+        // instead. That can replay a few already-seen room messages after a
+        // reconnect, but the store de-dupes by message id and it keeps DMs
+        // from disappearing.
+        let floors = channels.compactMap { channel -> Int64? in
+            guard let ts = onResolveAfterTimestamp?(channel), ts > 0 else { return nil }
+            return ts
+        }
+        let payload = FederationAuthPayload(
+            token: token,
+            peerId: peerId,
+            channels: channels,
+            afterTimestamp: floors.min()
+        )
         send(payload)
     }
 
@@ -296,6 +335,10 @@ final class ThunderCommWebSocketClient: NSObject {
             if let value = try? decoder.decode(ThunderCommErrorPayload.self, from: data) {
                 return .error(value)
             }
+        case "channel_created":
+            if let value = try? decoder.decode(ChannelCreatedPayload.self, from: data) {
+                return .channelCreated(value)
+            }
         default:
             return .unknown(text)
         }
@@ -311,7 +354,7 @@ final class ThunderCommWebSocketClient: NSObject {
             self.scheduleReconnect(because: "auth timeout", for: epoch)
         }
         authTimeoutWorkItem = workItem
-        DispatchQueue.global().asyncAfter(deadline: .now() + 12, execute: workItem)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: workItem)
     }
 
     private func scheduleNextPing(after delay: TimeInterval, for epoch: Int) {

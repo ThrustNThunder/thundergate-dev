@@ -33,10 +33,6 @@ struct MessageBubble: View {
                 Spacer(minLength: 52)
             }
 
-            if !isLocal {
-                avatarBadge
-            }
-
             VStack(alignment: isLocal ? .trailing : .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     if isLocal {
@@ -48,7 +44,7 @@ struct MessageBubble: View {
                         .foregroundStyle(senderColor)
 
                     Text(timestampText)
-                        .font(.caption)
+                        .font(.system(size: 10))
                         .foregroundStyle(.secondary)
 
                     if let deliveryState, isLocal {
@@ -63,7 +59,7 @@ struct MessageBubble: View {
                         case .text(let text):
                             if !text.isEmpty {
                                 Text(text)
-                                    .font(.body)
+                                    .font(.system(size: 14))
                                     .foregroundStyle(.primary)
                                     .multilineTextAlignment(isLocal ? .trailing : .leading)
                                     .textSelection(.enabled)
@@ -123,9 +119,7 @@ struct MessageBubble: View {
             }
             .frame(maxWidth: .infinity, alignment: isLocal ? .trailing : .leading)
 
-            if isLocal {
-                avatarBadge
-            } else {
+            if !isLocal {
                 Spacer(minLength: 52)
             }
         }
@@ -202,17 +196,6 @@ struct MessageBubble: View {
 
     private var bubbleMaxWidth: CGFloat {
         min(UIScreen.main.bounds.width * 0.74, 360)
-    }
-
-    private var avatarBadge: some View {
-        ZStack {
-            Circle()
-                .fill(senderColor.opacity(0.2))
-            Text(String(senderLine.prefix(1)).uppercased())
-                .font(.caption.weight(.bold))
-                .foregroundStyle(senderColor)
-        }
-        .frame(width: 28, height: 28)
     }
 
     @ViewBuilder

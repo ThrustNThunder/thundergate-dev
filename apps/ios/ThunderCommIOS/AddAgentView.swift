@@ -33,7 +33,7 @@ public struct AddAgentView: View {
         NavigationStack {
             Form {
                 Section("Agent") {
-                    TextField("Name (e.g. Jon, Mack, Rex)", text: $agentName)
+                    TextField("Name", text: $agentName)
                         .textInputAutocapitalization(.words)
                         .autocorrectionDisabled()
                     TextField("Emoji", text: $agentEmoji)
@@ -64,7 +64,25 @@ public struct AddAgentView: View {
                 }
 
                 Section {
-                    TextField("Session ID", text: $sessionID)
+                    HStack {
+                        Text("wss://relay.thunderai.us")
+                            .font(.callout.monospaced())
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Button {
+                            UIPasteboard.general.string = "wss://relay.thunderai.us"
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                    }
+                } header: {
+                    Text("Relay URL")
+                } footer: {
+                    Text("Share this token AND relay URL with your agent. They will need both to connect.")
+                }
+
+                Section {
+                    TextField("Session ID (optional)", text: $sessionID)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.callout.monospaced())

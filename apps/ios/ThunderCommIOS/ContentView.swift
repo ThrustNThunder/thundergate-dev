@@ -1,8 +1,10 @@
 
 import SwiftUI
+import UserNotifications
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.colorScheme) private var colorScheme
     @State private var store = ThunderCommStore()
     @State private var draft = ""
     @State private var composerResetID = UUID()
@@ -10,78 +12,122 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingAddAgent = false
     @State private var showingAddHuman = false
-    @State private var showingAddChannel = false
     @State private var headerCollapsed = true
+    @State private var showingNotificationsBanner = false
+    @State private var wasBackgrounded = false
 
     // Build 55 final: the post-signup wizard (Your Token → Add Agent) runs as
     // a fullScreenCover the first time we land here after a fresh signup.
-    // `OnboardingFlag.reset()` is called by SignUpView.advanceFromProfile when
-    // the new tc-h- token is minted, which arms this cover; the wizard's
-    // onFinished sets the flag and dismisses.
+    // SignUpView.advanceFromProfile calls OnboardingFlag.reset() when the new
+    // tc-h- token is minted, which arms this cover; the wizard's onFinished
+    // sets the flag and dismisses.
     @State private var showingPostSignupWizard: Bool = !OnboardingFlag.isCompleted
 
     var body: some View {
-        ZStack {
-            Color(uiColor: .systemGroupedBackground)
-                .ignoresSafeArea()
+        GeometryReader { geometry in
+            ZStack(alignment: .center) {
+                Color(uiColor: .systemGroupedBackground)
+                    .ignoresSafeArea()
 
-            VStack(spacing: 14) {
-                header
+                Image("TNTWatermark")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: UIScreen.main.bounds.width * 0.80)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .opacity(0.18)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                    .offset(y: 28)
 
-                Group {
-                    if store.messages.isEmpty && store.streamingPreviews.isEmpty {
-                        ContentUnavailableView(
-                            "No messages yet",
-                            systemImage: "bubble.left.and.bubble.right",
-                            description: Text(emptyStateLabel)
-                        )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(
-                            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                                .fill(Color(uiColor: .secondarySystemBackground))
-                        )
-                    } else {
-                        MessageListView(
-                            messages: store.messages,
-                            localSender: store.senderName,
-                            localPeerId: store.peerId,
-                            activeIndicators: store.activeIndicators,
-                            streamingPreviews: store.streamingPreviews,
-                            hasOlderMessages: store.hasOlderMessages,
-                            loadOlderMessages: store.loadOlderMessages,
-                            deleteMessage: store.deleteMessage,
-                            retryMessage: { store.retrySend(messageID: $0.id) },
-                            deliveryState: store.deliveryState
-                        )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(
-                            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                                .fill(Color(uiColor: .secondarySystemBackground))
-                        )
+                VStack(spacing: 10) {
+                    topChrome(topInset: geometry.safeAreaInsets.top)
+
+                    VStack(spacing: 14) {
+                        Group {
+                            if store.messages.isEmpty && store.streamingPreviews.isEmpty {
+                                ContentUnavailableView(
+                                    "No messages yet",
+                                    systemImage: "bubble.left.and.bubble.right",
+                                    description: Text(emptyStateLabel)
+                                )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(chatSurfaceBackground)
+                            } else {
+                                MessageListView(
+                                    messages: store.messages,
+                                    localSender: store.senderName,
+                                    localPeerId: store.peerId,
+                                    activeIndicators: store.activeIndicators,
+                                    streamingPreviews: store.streamingPreviews,
+                                    hasOlderMessages: store.hasOlderMessages,
+                                    loadOlderMessages: store.loadOlderMessages,
+                                    deleteMessage: store.deleteMessage,
+                                    retryMessage: { store.retrySend(messageID: $0.id) },
+                                    deliveryState: store.deliveryState
+                                )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(chatSurfaceBackground)
+                            }
+                        }
+
+                        ComposerBar(draft: $draft, placeholder: store.composePlaceholder) {
+                            let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else { return }
+                            store.sendDraft(&draft)
+                            draft = ""
+                            composerResetID = UUID()
+                        }
+                        .id(composerResetID)
                     }
+                    .padding(.horizontal)
+                    .padding(.bottom)
                 }
-
-                ComposerBar(draft: $draft, placeholder: store.composePlaceholder) {
-                    let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty else { return }
-                    store.sendDraft(&draft)
-                    draft = ""
-                    composerResetID = UUID()
-                }
-                .id(composerResetID)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .ignoresSafeArea(.container, edges: .bottom)
             }
-            .padding()
         }
         .task {
             store.connectIfNeeded()
+            await refreshNotificationsBanner()
+            await ensureNotificationAuthorization()
+            APNsManager.shared.retryTokenUploadIfNeeded()
         }
         .onChange(of: draft) { _, newValue in
             store.draftDidChange(newValue)
         }
         .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .active {
-                store.connectIfNeeded()
+            switch newPhase {
+            case .active:
+                // BUILD_54_P7_BRIEF: on a genuine background→foreground
+                // transition, force a roster refresh so stale entries from
+                // the prior session can't leak into the who's-online view.
+                // .inactive↔.active (notification center, control center,
+                // incoming-call sheet) keeps the existing cheap path.
+                if wasBackgrounded {
+                    store.refreshRoster()
+                    wasBackgrounded = false
+                } else {
+                    store.connectIfNeeded()
+                }
+                Task {
+                    await refreshNotificationsBanner()
+                }
+            case .background:
+                wasBackgrounded = true
+            case .inactive:
+                break
+            @unknown default:
+                break
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .notificationsDeclined)) { _ in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showingNotificationsBanner = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openChannel)) { note in
+            guard let channel = note.userInfo?["channel"] as? String else { return }
+            applyOpenChannel(channel)
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(connectionStore: store)
@@ -92,9 +138,6 @@ struct ContentView: View {
         .sheet(isPresented: $showingAddHuman) {
             AddHumanInviteView()
         }
-        .sheet(isPresented: $showingAddChannel) {
-            AddChannelView(connectionStore: store)
-        }
         .fullScreenCover(isPresented: $showingPostSignupWizard) {
             OnboardingView {
                 OnboardingFlag.markCompleted()
@@ -104,29 +147,34 @@ struct ContentView: View {
         .sheet(isPresented: $showingOnlinePeers) {
             NavigationStack {
                 List {
-                    ForEach(store.orderedPeerIDs(), id: \.self) { participantID in
-                        let status = store.statusForParticipantID(participantID)
-                        let senderType = store.senderType(forParticipantID: participantID)
-                        HStack(spacing: 12) {
-                            Circle()
-                                .fill(statusColor(for: status))
-                                .frame(width: 10, height: 10)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(store.displayName(forParticipantID: participantID))
-                                    .foregroundStyle(peerColor(for: participantID, senderType: senderType))
-                                Text(statusLabel(for: status))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                    // BUILD_54_P7_BRIEF: split into People + Agents using
+                    // the token-prefix-first classifier so tc-h-* always
+                    // lands in People and tc-a-* always lands in Agents.
+                    // Each participantID is classified once, so the same
+                    // identity never appears in both sections.
+                    let (people, agents) = partitionedRoster(store.orderedPeerIDs())
+
+                    Section("People") {
+                        if people.isEmpty {
+                            Text("No people online yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(people, id: \.self) { participantID in
+                                peerRow(participantID: participantID)
                             }
-                            Spacer()
-                            HStack(spacing: 6) {
-                                Text(store.roleLabel(forParticipantID: participantID))
-                                if let model = store.modelForParticipantID(participantID) {
-                                    Text(model)
-                                }
+                        }
+                    }
+
+                    Section("Agents") {
+                        if agents.isEmpty {
+                            Text("No agents online yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(agents, id: \.self) { participantID in
+                                peerRow(participantID: participantID)
                             }
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -143,58 +191,164 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private func topChrome(topInset: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            if showingNotificationsBanner {
+                notificationsDeclinedBanner
+            }
+
+            header
+        }
+        .padding(.horizontal)
+        .padding(.top, max(topInset - 92, 0))
+        .padding(.bottom, 0)
+        .frame(maxWidth: .infinity)
+        .background(topChromeBackground)
+    }
+
+    private var topChromeBackground: some View {
+        UnevenRoundedRectangle(
+            topLeadingRadius: 0,
+            bottomLeadingRadius: 28,
+            bottomTrailingRadius: 28,
+            topTrailingRadius: 0,
+            style: .continuous
+        )
+        .fill(Color(uiColor: .secondarySystemBackground))
+        .ignoresSafeArea(edges: .top)
+    }
+
+    private var chatSurfaceBackground: some View {
+        RoundedRectangle(cornerRadius: 24, style: .continuous)
+            .fill(Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    private var notificationsDeclinedBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bell.slash.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Notifications off")
+                    .font(.subheadline.weight(.semibold))
+                Text("Enable notifications to get alerts when new messages arrive.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showingNotificationsBanner = false
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    private func refreshNotificationsBanner() async {
+        let status = await APNsManager.shared.currentAuthorizationStatus()
+        await MainActor.run {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showingNotificationsBanner = status == .denied
+            }
+        }
+    }
+
+    // First-launch-after-sign-in primer. Onboarding's notifications step
+    // also requests authorization, but a user who signed into an existing
+    // account on a new device skips onboarding entirely and would otherwise
+    // never see the system prompt. .notDetermined ensures we only ask once
+    // per install — if the user has already accepted or denied, iOS won't
+    // re-prompt anyway.
+    private func ensureNotificationAuthorization() async {
+        let status = await APNsManager.shared.currentAuthorizationStatus()
+        if status == .notDetermined {
+            _ = await APNsManager.shared.requestUserAuthorization()
+        }
+    }
+
+    private func applyOpenChannel(_ raw: String) {
+        let normalized = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "#", with: "")
+            .lowercased()
+        guard !normalized.isEmpty else { return }
+
+        if normalized == "direct" {
+            store.setRoute(.direct)
+        } else {
+            store.setRoute(.channel, channelName: normalized)
+        }
+    }
+
     private var emptyStateLabel: String {
         // Build 55 final: no hardcoded channel/route copy. Single generic
-        // empty-state string, regardless of route — the chat is intentionally
+        // empty-state string regardless of route — the chat is intentionally
         // blank until the user adds channels or agents themselves.
         "Messages will appear here."
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: headerCollapsed ? 8 : 12) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: "bolt.fill")
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(brandGradient)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("ThunderCommo")
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(brandGradient)
-                    if !headerCollapsed {
-                        Text("Humans + agents, in sync")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: headerCollapsed ? 2 : 6) {
+            ZStack {
+                headerBrandLockup
+
+                HStack(alignment: .center, spacing: 6) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            headerCollapsed.toggle()
+                        }
+                    } label: {
+                        Image(systemName: headerCollapsed ? "chevron.down" : "chevron.up")
+                            .font(.caption.weight(.bold))
+                            .frame(width: 22, height: 22)
                     }
-                }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel(headerCollapsed ? "Expand header" : "Collapse header")
 
-                Spacer()
+                    Spacer()
 
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        headerCollapsed.toggle()
+                    Button {
+                        showingSettings = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(width: 22, height: 22)
                     }
-                } label: {
-                    Image(systemName: headerCollapsed ? "chevron.down" : "chevron.up")
-                        .font(.caption.weight(.bold))
-                        .frame(width: 22, height: 22)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel("Settings")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityLabel(headerCollapsed ? "Expand header" : "Collapse header")
-
-                Button {
-                    showingSettings = true
-                } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityLabel("Settings")
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 routeMenu
 
                 headerActionButton(systemName: "bolt.badge.automatic", accessibilityLabel: "Add agent") {
@@ -203,10 +357,6 @@ struct ContentView: View {
 
                 headerActionButton(systemName: "person.badge.plus", accessibilityLabel: "Add human") {
                     showingAddHuman = true
-                }
-
-                headerActionButton(systemName: "number.square", accessibilityLabel: "Add channel") {
-                    showingAddChannel = true
                 }
 
                 Spacer()
@@ -238,11 +388,8 @@ struct ContentView: View {
                 }
             }
         }
-        .padding(headerCollapsed ? 12 : 13)
-        .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemBackground))
-        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 0)
         .gesture(
             DragGesture(minimumDistance: 14)
                 .onEnded { value in
@@ -259,15 +406,23 @@ struct ContentView: View {
         )
     }
 
+    private var headerBrandLockup: some View {
+        Text("ThunderCommo")
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(headerTitleGradient)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+    }
+
     private var routeMenu: some View {
         Menu {
-            // Build 55 final: no hardcoded #tnt / #jmab seed entries. The
-            // user creates channels via the "+" button and direct chats
-            // appear here only when they've added an agent.
+            // Build 55 final: no hardcoded #tnt / #jmab seed entries. Channels
+            // appear only after the user creates them; direct chats appear
+            // only once the user has added agents.
             if !store.customChannels.isEmpty {
                 Section("Channels") {
                     ForEach(store.customChannels, id: \.self) { channel in
-                        Button("#\(channel)") {
+                        Button(channel.channelDisplayName) {
                             store.setRoute(.channel, channelName: channel)
                         }
                     }
@@ -286,7 +441,7 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 Image(systemName: routeIconName)
                     .font(.subheadline.weight(.semibold))
-                Text(store.routeLabel)
+                Text(routeMenuLabel)
                     .font(.subheadline.weight(.semibold))
                 Image(systemName: "chevron.down")
                     .font(.caption2.weight(.bold))
@@ -301,10 +456,33 @@ struct ContentView: View {
     private var routeIconName: String {
         switch store.currentRoute {
         case .tnt, .jmab, .channel:
-            return "number"
+            return "bubble.left.and.bubble.right.fill"
         case .direct:
-            return "at"
+            return "person.crop.circle"
         }
+    }
+
+    private var routeMenuLabel: String {
+        switch store.currentRoute {
+        case .tnt, .jmab:
+            return "Messages"
+        case .channel:
+            return store.selectedChannelName.channelDisplayName
+        case .direct:
+            return store.displayName(forParticipantID: store.directAgentId)
+        }
+    }
+
+    private var headerTitleGradient: LinearGradient {
+        LinearGradient(
+            colors: [
+                Color(red: 0.0, green: 0.80, blue: 1.0),
+                Color(red: 1.0, green: 0.45, blue: 0.10),
+                Color(red: 1.0, green: 0.85, blue: 0.0)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
     }
 
     private var brandGradient: LinearGradient {
@@ -340,16 +518,62 @@ struct ContentView: View {
         }
     }
 
+    /// Splits the active participant list into (people, agents) by token
+    /// prefix first, then explicit role, then canonical name. tc-h-* and
+    /// tc-a-* are authoritative; everything else falls back to the safe
+    /// default of "agent" per BUILD_54_P7_BRIEF.
+    private func partitionedRoster(_ participantIDs: [String]) -> (people: [String], agents: [String]) {
+        var people: [String] = []
+        var agents: [String] = []
+        for participantID in participantIDs {
+            let explicitRole = store.rosterRole(forParticipantID: participantID)
+            switch ThunderCommParticipantIdentity.rosterSection(
+                forParticipantID: participantID,
+                explicitRole: explicitRole
+            ) {
+            case .human:
+                people.append(participantID)
+            case .agent:
+                agents.append(participantID)
+            }
+        }
+        return (people, agents)
+    }
+
+    @ViewBuilder
+    private func peerRow(participantID: String) -> some View {
+        let status = store.statusForParticipantID(participantID)
+        let senderType = store.senderType(forParticipantID: participantID)
+        HStack(spacing: 12) {
+            Circle()
+                .fill(statusColor(for: status))
+                .frame(width: 10, height: 10)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(store.displayName(forParticipantID: participantID))
+                    .foregroundStyle(peerColor(for: participantID, senderType: senderType))
+                Text(statusLabel(for: status))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            HStack(spacing: 6) {
+                Text(store.roleLabel(forParticipantID: participantID))
+                if let model = store.modelForParticipantID(participantID) {
+                    Text(model)
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+        }
+    }
+
     private func peerColor(for sender: String, senderType: ThunderCommSenderType?) -> Color {
-        let key = ThunderCommParticipantIdentity.canonicalID(sender: sender, agentId: nil, participantId: sender, senderType: senderType)
-        switch key {
-        case "jon":
-            return Color(red: 0.96, green: 0.82, blue: 0.24)
-        case "michael":
+        switch senderType {
+        case .human:
             return Color(red: 0.73, green: 0.58, blue: 0.98)
-        case "mack":
-            return Color(red: 0.47, green: 0.80, blue: 1.0)
-        default:
+        case .agent:
+            return Color(red: 0.96, green: 0.82, blue: 0.24)
+        case .none:
             return .green
         }
     }
@@ -363,6 +587,14 @@ struct ContentView: View {
         .buttonStyle(.bordered)
         .controlSize(.small)
         .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+private extension String {
+    var channelDisplayName: String {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        let bare = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        return "#\(bare)"
     }
 }
 
@@ -406,64 +638,6 @@ private struct AddHumanInviteView: View {
                 }
             }
         }
-    }
-}
-
-private struct AddChannelView: View {
-    @Environment(\.dismiss) private var dismiss
-
-    let connectionStore: ThunderCommStore
-
-    @State private var channelName = ""
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Channel") {
-                    TextField("channel-name", text: $channelName)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Text("Creates a local ThunderCommo route and reconnects chat to that channel immediately.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if !connectionStore.customChannels.isEmpty {
-                    Section("Existing") {
-                        ForEach(connectionStore.customChannels, id: \.self) { channel in
-                            Button("#\(channel)") {
-                                connectionStore.setRoute(.channel, channelName: channel)
-                                dismiss()
-                            }
-                        }
-                    }
-                }
-
-                Section {
-                    Button("Add channel") {
-                        connectionStore.addChannel(named: channelName)
-                        dismiss()
-                    }
-                    .disabled(normalizedChannelName.isEmpty)
-                }
-            }
-            .navigationTitle("Add Channel")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-            }
-        }
-    }
-
-    private var normalizedChannelName: String {
-        channelName
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "#", with: "")
-            .lowercased()
     }
 }
 

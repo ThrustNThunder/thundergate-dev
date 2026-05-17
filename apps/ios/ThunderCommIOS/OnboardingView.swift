@@ -34,7 +34,6 @@ public struct OnboardingView: View {
 
     @State private var step: Step = .yourToken
 
-    // Add-agent screen state
     @State private var generatedAgentToken: String?
     @State private var agentLabel: String = ""
     @State private var agentSessionID: String = ""
@@ -141,7 +140,7 @@ public struct OnboardingView: View {
                     Text("Step 1 — Give your agent a token")
                         .font(.headline)
 
-                    TextField("Agent name (e.g. Jon, Mack, Rex)", text: $agentLabel)
+                    TextField("Agent name", text: $agentLabel)
                         .textInputAutocapitalization(.words)
                         .autocorrectionDisabled()
                         .textFieldStyle(.roundedBorder)
@@ -156,7 +155,19 @@ public struct OnboardingView: View {
 
                     if let token = generatedAgentToken {
                         agentTokenCard(token: token)
-                        banner("Post this token to your agent.")
+                        // Relay URL copy row
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Relay URL").font(.caption).foregroundStyle(.secondary)
+                                Text("wss://relay.thunderai.us").font(.callout.monospaced()).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button {
+                                UIPasteboard.general.string = "wss://relay.thunderai.us"
+                            } label: { Image(systemName: "doc.on.doc") }
+                        }
+                        .padding(.top, 4)
+                        banner("Share this token AND relay URL with your agent. They need both to connect.")
                     }
                 }
 
@@ -306,11 +317,6 @@ public struct OnboardingView: View {
             connectError = "Generate a token and paste the agent's session ID first."
             return
         }
-        // Save the agent into the user's account. The wsURL/httpURL fields are
-        // re-used here to hold the agent session ID — Build 55 doesn't model
-        // a separate "session id" field on AgentConnection yet, and Account-
-        // Store's connection contract still expects URLs in these slots. The
-        // session ID the user pastes is opaque to this view.
         let connection = AgentConnection(
             agentName: name,
             agentEmoji: "⚡",
@@ -321,5 +327,30 @@ public struct OnboardingView: View {
         )
         UserStore.shared.addAgent(connection, token: token)
         step = .done
+    }
+}
+
+// MARK: - OnboardingGate
+//
+// Build 55 final: defensive gate that only checks the user has a `tc-h-`
+// session token. AuthGate is the upstream gate that handles sign-up /
+// sign-in; this gate exists to make sure ContentView is never rendered for
+// a logged-out device even if AuthGate's state goes stale. No AccountStore
+// seeding, no default agent — the user starts with an empty roster.
+
+public struct OnboardingGate<Content: View>: View {
+    @StateObject private var auth = AuthManager.shared
+    @ViewBuilder var content: () -> Content
+
+    public init(@ViewBuilder content: @escaping () -> Content) {
+        self.content = content
+    }
+
+    public var body: some View {
+        if auth.peekToken() != nil {
+            content()
+        } else {
+            SignUpView()
+        }
     }
 }

@@ -1,56 +1,112 @@
 // SplashView.swift
 //
-// First screen the user sees on cold launch. Brand mark + product name, sized
-// large enough to feel like a launch screen (260pt — bumped from 200pt per
-// Build 55 final). Auto-dismisses to whatever the parent decides comes next
-// (typically SignIn / SignUp).
+// P8 — Launch splash. Sequence:
+//   1. Logo + "ThunderCommo" appear instantly on a dark background.
+//   2. Hold the logo for at least 3 seconds.
+//   3. When the relay is connected AND the 3-second hold has elapsed, the
+//      "Connected to ThunderBase" banner animates in from the bottom.
+//      Whichever lands later — connection or 3-second mark — is the trigger.
+//   4. Banner stays visible 2 seconds, fades out, then onComplete fires and
+//      the main UI takes over.
 //
-// The splash holds for `displayDuration` so the brand has a moment to land
-// before the next screen comes up. We tolerate the user tapping through if
-// the parent wires it that way; this view itself is dumb on input.
+// DeliveryCore handles the actual connect under the hood — its scenePhase
+// observer in ThunderCommApp fires on .active regardless of which view is on
+// screen, so the splash doesn't block the connect from starting.
 
 import SwiftUI
 
-public struct SplashView: View {
+struct SplashView: View {
+    @EnvironmentObject private var deliveryCore: DeliveryCore
 
-    public init(displayDuration: TimeInterval = 1.2, onFinished: @escaping () -> Void = {}) {
-        self.displayDuration = displayDuration
-        self.onFinished = onFinished
-    }
+    let onComplete: () -> Void
 
-    private let displayDuration: TimeInterval
-    private let onFinished: () -> Void
+    @State private var bannerShown = false
+    @State private var bannerVisible = false
 
-    public var body: some View {
+    var body: some View {
         ZStack {
-            Color(uiColor: .systemBackground).ignoresSafeArea()
+            Color.black
+                .ignoresSafeArea()
 
             VStack(spacing: 18) {
-                Image(systemName: "bolt.fill")
+                Image("SplashLogo")
                     .resizable()
+                    .interpolation(.high)
                     .scaledToFit()
                     .frame(width: 260, height: 260)
-                    .foregroundStyle(brandGradient)
+                    .accessibilityHidden(true)
 
                 Text("ThunderCommo")
-                    .font(.largeTitle.bold())
-                    .foregroundStyle(brandGradient)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
+            }
+
+            VStack {
+                Spacer()
+                if bannerShown {
+                    HStack(spacing: 10) {
+                        Image(systemName: "bolt.fill")
+                            .foregroundStyle(.yellow)
+                        Text("Connected to ThunderBase")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(
+                        Capsule().fill(Color.white.opacity(0.08))
+                    )
+                    .overlay(
+                        Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
+                    )
+                    .opacity(bannerVisible ? 1 : 0)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .padding(.bottom, 64)
+                }
             }
         }
         .task {
-            try? await Task.sleep(nanoseconds: UInt64(displayDuration * 1_000_000_000))
-            onFinished()
+            await runSequence()
         }
     }
 
-    private var brandGradient: LinearGradient {
-        LinearGradient(
-            colors: [
-                Color(red: 0.66, green: 0.42, blue: 0.98),
-                Color(red: 0.92, green: 0.55, blue: 1.0)
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
+    private func runSequence() async {
+        let launchedAt = Date()
+        let hardCapSeconds: TimeInterval = 10
+
+        // Minimum 3-second logo hold.
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        if Task.isCancelled { return }
+
+        // Wait until the relay reports connected. If already connected the
+        // banner shows immediately; otherwise we hold here until it is — but
+        // never past the 10-second hard cap. On cap, skip the banner and
+        // drop straight to main UI so the user is never stuck on splash.
+        while !deliveryCore.isRelayConnected {
+            if Date().timeIntervalSince(launchedAt) >= hardCapSeconds {
+                onComplete()
+                return
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            if Task.isCancelled { return }
+        }
+
+        // Animate banner in.
+        withAnimation(.easeOut(duration: 0.45)) {
+            bannerShown = true
+            bannerVisible = true
+        }
+
+        // Stay 2 seconds.
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        if Task.isCancelled { return }
+
+        // Fade out.
+        withAnimation(.easeIn(duration: 0.4)) {
+            bannerVisible = false
+        }
+        try? await Task.sleep(nanoseconds: 450_000_000)
+
+        onComplete()
     }
 }

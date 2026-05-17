@@ -15,16 +15,12 @@ public struct SettingsView: View {
 
     @State private var displayName = ""
     @State private var phone = ""
+    @State private var phoneDisplay = ""
     @State private var showSignOutConfirm = false
     @State private var showAddAgent = false
     @State private var showChangePassword = false
     @State private var biometricsError: String?
-    @State private var endpointDraft = ""
-    @State private var tokenDraft = ""
-    @State private var senderDraft = ""
-    @State private var connectionDraftsLoaded = false
-    @State private var isSavingConnection = false
-    @State private var isTokenVisible = false
+    @State private var profileSaved = false
 
     public var onSignedOut: (() -> Void)?
 
@@ -49,6 +45,12 @@ public struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .onAppear {
+                syncFromStore()
+            }
+            .onChange(of: store.currentUser?.displayName) { _, _ in
+                syncFromStore()
+            }
+            .onChange(of: store.currentUser?.phoneNumber) { _, _ in
                 syncFromStore()
             }
             .sheet(isPresented: $showAddAgent) {
@@ -76,14 +78,7 @@ public struct SettingsView: View {
     private func syncFromStore() {
         displayName = store.currentUser?.displayName ?? ""
         phone = store.currentUser?.phoneNumber ?? ""
-    }
-
-    private func syncConnectionDraftsIfNeeded() {
-        guard !connectionDraftsLoaded, let connectionStore else { return }
-        endpointDraft = connectionStore.endpointText
-        tokenDraft = connectionStore.token
-        senderDraft = connectionStore.senderName
-        connectionDraftsLoaded = true
+        phoneDisplay = formatPhone(phone)
     }
 
     // MARK: - Account
@@ -100,10 +95,22 @@ public struct SettingsView: View {
             TextField("Display name", text: $displayName)
                 .onSubmit { saveProfileEdits() }
 
-            TextField("Phone", text: $phone)
+            TextField("Phone", text: $phoneDisplay)
                 .keyboardType(.phonePad)
                 .textContentType(.telephoneNumber)
+                .onChange(of: phoneDisplay) { _, newValue in
+                    let digits = String(newValue.filter(\.isNumber).prefix(10))
+                    phone = digits
+                    let formatted = formatPhone(digits)
+                    if formatted != newValue {
+                        phoneDisplay = formatted
+                    }
+                }
                 .onSubmit { saveProfileEdits() }
+
+            Button(profileSaved ? "Profile saved" : "Save profile") {
+                saveProfileEdits()
+            }
 
             if let role = store.currentUser?.role {
                 HStack {
@@ -117,21 +124,32 @@ public struct SettingsView: View {
     }
 
     private func saveProfileEdits() {
-        guard var user = store.currentUser else { return }
         let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        user.displayName = trimmedName
-        user.phoneNumber = phone.isEmpty ? nil : phone
-        // Mutating UserStore from here is fine — currentUser's setter is private,
-        // so we re-add the user via the same code path sign-up uses.
-        UserDefaults.standard.set(
-            try? JSONEncoder().encode(user),
-            forKey: "thunder.user.account.v1"
-        )
+        store.updateProfile(displayName: trimmedName, phoneNumber: phone)
+        displayName = store.currentUser?.displayName ?? trimmedName
+        phone = store.currentUser?.phoneNumber ?? phone
+        phoneDisplay = formatPhone(phone)
+        profileSaved = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            profileSaved = false
+        }
         // Propagate the new display name to the live wire sender so outgoing
-        // messages don't keep using the stale name until a cold launch. The
-        // helper no-ops if the user has set an explicit Connection-section
-        // override, so this can't clobber a conscious chat-sender choice.
+        // messages don't keep using the stale name until a cold launch.
         connectionStore?.applyProfileDisplayName(trimmedName)
+    }
+
+    private func formatPhone(_ digits: String) -> String {
+        let clean = Array(digits.filter(\.isNumber).prefix(10))
+        switch clean.count {
+        case 0:
+            return ""
+        case 1...3:
+            return "(" + String(clean)
+        case 4...6:
+            return "(" + String(clean[0..<3]) + ") " + String(clean[3..<clean.count])
+        default:
+            return "(" + String(clean[0..<3]) + ") " + String(clean[3..<6]) + "-" + String(clean[6..<clean.count])
+        }
     }
 
     // MARK: - Connection info
@@ -139,8 +157,7 @@ public struct SettingsView: View {
     // Build 55 final: the legacy custom-endpoint / gateway-token editor was
     // removed. There is exactly one user-facing surface for their personal
     // credential — MyConnectionInfoView — and exactly one place the relay
-    // URL is visible — the About section at the bottom of Settings. There
-    // is no per-user gateway token to edit anymore.
+    // URL is visible — the About section at the bottom of Settings.
 
     private var connectionInfoSection: some View {
         Section {
@@ -200,7 +217,6 @@ public struct SettingsView: View {
                 }
             }
         } else {
-            // Disabling is a local-only flip; we don't need to re-prompt for it.
             if var user = store.currentUser {
                 user.biometricsEnabled = false
                 UserDefaults.standard.set(

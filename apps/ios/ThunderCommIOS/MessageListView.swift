@@ -75,6 +75,10 @@ struct MessageListView: View {
             .onChange(of: streamingPreviews.map { "\($0.id)-\($0.text)" }.joined(separator: ",")) { _, _ in
                 scrollToBottom(proxy: proxy, animated: true)
             }
+            .onChange(of: activeIndicators.map { "\($0.id)-\($0.updatedAt)" }.joined(separator: ",")) { _, newValue in
+                guard !newValue.isEmpty else { return }
+                scrollToBottom(proxy: proxy, animated: true)
+            }
         }
     }
 

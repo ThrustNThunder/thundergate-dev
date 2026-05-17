@@ -174,6 +174,37 @@ enum ThunderCommParticipantIdentity {
             .replacingOccurrences(of: "_", with: "-")
             .replacingOccurrences(of: " ", with: "-")
     }
+
+    /// Roster-section classification per BUILD_54_P7_BRIEF:
+    ///  - `tc-h-*` prefix → .human (People section)
+    ///  - `tc-a-*` prefix → .agent (Agents section)
+    ///  - no tc- prefix → trust the relay's explicit role field if present,
+    ///    then fall back to the canonical name table (michael/alex → human,
+    ///    jon/mack/rex/burt/sasha/system → agent), and finally default to
+    ///    .agent. The default-to-agent step matches the brief's "safe
+    ///    default" for unknown ids — once P7b clean-slate lands, every id
+    ///    will carry a tc- prefix and the fallbacks become dormant.
+    static func rosterSection(forParticipantID participantID: String, explicitRole: String? = nil) -> ThunderCommSenderType {
+        let lower = participantID.lowercased()
+        if lower.hasPrefix("tc-h-") { return .human }
+        if lower.hasPrefix("tc-a-") { return .agent }
+
+        if let trimmed = explicitRole?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !trimmed.isEmpty {
+            if trimmed == "human" { return .human }
+            if trimmed == "agent" { return .agent }
+        }
+
+        let canonical = canonicalID(sender: nil, agentId: participantID, participantId: participantID, senderType: nil)
+        switch canonical {
+        case "michael", "alex":
+            return .human
+        case "jon", "mack", "rex", "burt", "sasha", "system":
+            return .agent
+        default:
+            return .agent
+        }
+    }
 }
 
 struct ThunderCommMessage: Identifiable, Codable, Equatable {
@@ -273,6 +304,42 @@ struct ThunderCommMessage: Identifiable, Codable, Equatable {
         try container.encodeIfPresent(contentKind, forKey: .contentKind)
         try container.encodeIfPresent(attachment, forKey: .attachment)
     }
+
+    // Bridge from DeliveryCore's wire-level InboxMessage into the rich store
+    // shape. ThunderCommStore.merge(_:) re-runs normalize on these, so the
+    // display name / canonical agentId here are best-effort — merge fixes them.
+    // Channel defaults to "tnt"; routed-direct delivery can override later.
+    init(from inbox: InboxMessage) {
+        let derivedSenderType = ThunderCommParticipantIdentity.senderType(
+            sender: inbox.from,
+            agentId: nil,
+            participantId: nil,
+            explicitRawValue: nil
+        )
+        let canonical = ThunderCommParticipantIdentity.canonicalID(
+            sender: inbox.from,
+            agentId: nil,
+            participantId: nil,
+            senderType: derivedSenderType
+        )
+        let derivedAgentId: String? = derivedSenderType == .agent ? canonical : nil
+        let kind = ThunderCommContentKind(rawValue: inbox.kind ?? "") ?? .text
+
+        self.init(
+            id: inbox.id,
+            channel: "tnt",
+            sender: inbox.from,
+            senderType: derivedSenderType,
+            agentId: derivedAgentId,
+            text: inbox.body,
+            timestamp: inbox.createdAtMs,
+            originPeer: inbox.from,
+            relayedAt: nil,
+            relayedBy: nil,
+            contentKind: kind,
+            attachment: nil
+        )
+    }
 }
 
 struct FederationAuthPayload: Encodable {
@@ -281,6 +348,12 @@ struct FederationAuthPayload: Encodable {
     let peerId: String
     let channels: [String]
     let model: String? = nil
+    // Single replay floor for the subscribed bundle. We intentionally use the
+    // oldest known channel timestamp when subscribing to multiple channels so
+    // a busy room like #tnt cannot suppress replay for a quieter DM thread.
+    // This may allow some duplicate replay on reconnect, but merge() de-dupes
+    // by message id and correctness matters more than shaving a few repeats.
+    let afterTimestamp: Int64?
 }
 
 struct FederationMessagePayload: Encodable {
@@ -311,6 +384,8 @@ struct ThunderCommHistoryRequestPayload: Encodable {
     let channel: String
     let limit: Int
     let lastMessageId: String? = nil
+    // See FederationAuthPayload.afterTimestamp — same semantics.
+    let afterTimestamp: Int64?
 }
 
 struct ThunderCommTypingPayload: Codable, Equatable {
@@ -361,6 +436,36 @@ struct ThunderCommErrorPayload: Codable, Equatable {
     let message: String
 }
 
+// MARK: - Channels (P5c)
+
+/// Member-scoped private channel. Privacy is presentation-layer only for v1 —
+/// the relay broadcasts channel_created frames to all peers; clients filter by
+/// membership. Server-side enforcement is future work.
+struct ThunderChannel: Identifiable, Codable, Equatable {
+    let id: String          // canonical lowercase channel id (e.g. "tnt", "ops-2026")
+    var name: String        // display name (free-form; defaults to id if absent)
+    var members: [String]   // peer IDs of channel members
+    var isDefault: Bool     // tnt is the team-wide default; visible to everyone
+}
+
+struct ChannelCreatedPayload: Codable, Equatable {
+    let type: String
+    let channelId: String
+    let name: String
+    let members: [String]
+    let createdBy: String?
+    let createdAt: Int64?
+}
+
+struct ChannelCreatedOutboundPayload: Encodable {
+    let type: String = "channel_created"
+    let channelId: String
+    let name: String
+    let members: [String]
+    let createdBy: String
+    let createdAt: Int64
+}
+
 struct ThunderCommParticipant: Identifiable, Codable, Equatable {
     let id: String
     let name: String
@@ -409,6 +514,7 @@ struct ThunderCommActivityIndicator: Identifiable, Equatable {
     let id: String
     let displayName: String
     let senderType: ThunderCommSenderType
+    let channel: String
     let updatedAt: Int64
 }
 
@@ -433,6 +539,7 @@ enum ThunderCommInboundEvent {
     case ack(ThunderCommAckPayload)
     case systemEvent(ThunderCommSystemEventPayload)
     case error(ThunderCommErrorPayload)
+    case channelCreated(ChannelCreatedPayload)
     case unknown(String)
 }
 
