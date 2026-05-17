@@ -560,6 +560,58 @@ body {
   color: var(--michael);
   background: rgba(167,139,250,0.07);
 }
+.sidebar-add-btn.channel:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(245,158,11,0.07);
+}
+
+/* Add Channel modal */
+#add-channel-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 90;
+  backdrop-filter: blur(4px);
+}
+#add-channel-modal.hidden { display: none; }
+#add-channel-box {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 24px 22px;
+  width: min(320px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+#add-channel-box h3 {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-strong, var(--text));
+  margin: 0;
+}
+#add-channel-box p {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin: 0;
+}
+#add-channel-box input {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  padding: 8px 11px;
+  outline: none;
+  width: 100%;
+  transition: border-color 0.15s;
+}
+#add-channel-box input:focus { border-color: var(--accent); }
 
 /* Add Human modal */
 #add-human-modal {

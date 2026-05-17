@@ -169,13 +169,20 @@ function hideLlmIndicator() {
 
 // ── Auth & connect ────────────────────────────────────────────────────────
 
-// Restore credentials from localStorage (never bake secrets into source)
+// Restore credentials from localStorage and auto-connect if present
 {
   const savedToken = localStorage.getItem('tc_token');
   const savedHost  = localStorage.getItem('tc_host');
   if (savedToken) tokenInput.value = savedToken;
   if (savedHost)  hostInput.value  = savedHost;
-  // Don't auto-connect — let user confirm
+  // Auto-connect on page load if credentials exist
+  if (savedToken && savedHost) {
+    state.token = savedToken;
+    state.host  = savedHost;
+    state.authFailed = false;
+    // Defer one tick so DOM is fully ready
+    setTimeout(() => connect(), 0);
+  }
 }
 
 connectBtn.addEventListener('click', () => {
@@ -1028,6 +1035,71 @@ function setupHeaderCollapse() {
   });
 }
 
+// ── Add Channel modal ───────────────────────────────────────────────────────
+
+function setupAddChannel() {
+  const openBtn   = document.getElementById('add-channel-btn');
+  const modal     = document.getElementById('add-channel-modal');
+  const cancelBtn = document.getElementById('add-channel-cancel');
+  const confirmBtn= document.getElementById('add-channel-confirm');
+  const nameInput = document.getElementById('add-channel-name');
+  if (!openBtn || !modal) return;
+
+  openBtn.addEventListener('click', () => {
+    modal.classList.remove('hidden');
+    nameInput && nameInput.focus();
+  });
+
+  const closeModal = () => {
+    modal.classList.add('hidden');
+    if (nameInput) nameInput.value = '';
+  };
+
+  cancelBtn && cancelBtn.addEventListener('click', closeModal);
+
+  confirmBtn && confirmBtn.addEventListener('click', () => {
+    const raw = nameInput ? nameInput.value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') : '';
+    if (!raw) { nameInput && nameInput.focus(); return; }
+    // Check if already exists
+    if (document.querySelector(`.channel-btn[data-channel="${raw}"][data-agent=""]`)) {
+      addSystemMsg(`Channel #${raw} already in sidebar.`);
+      closeModal();
+      return;
+    }
+    // Inject channel button before sidebar-footer
+    const nav = document.getElementById('channels');
+    const btn = document.createElement('button');
+    btn.className = 'channel-btn';
+    btn.dataset.channel = raw;
+    btn.dataset.agent = '';
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-selected', 'false');
+    btn.textContent = `# ${raw}`;
+    // Wire click via existing delegation
+    nav.appendChild(btn);
+    // Save to localStorage so it persists on reload
+    const saved = JSON.parse(localStorage.getItem('tc_custom_channels') || '[]');
+    if (!saved.includes(raw)) {
+      saved.push(raw);
+      localStorage.setItem('tc_custom_channels', JSON.stringify(saved));
+    }
+    addSystemMsg(`Channel #${raw} added.`);
+    closeModal();
+    // Auto-switch to the new channel
+    btn.click();
+  });
+
+  // Close on backdrop click
+  modal.addEventListener('click', e => {
+    if (e.target === modal) closeModal();
+  });
+
+  nameInput && nameInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') confirmBtn && confirmBtn.click();
+    if (e.key === 'Escape') closeModal();
+  });
+}
+
 // ── Add Human modal ───────────────────────────────────────────────────────
 
 function setupAddHuman() {
@@ -1089,7 +1161,25 @@ function setupAddHuman() {
   autoResize();
   setupMobileSidebar();
   setupHeaderCollapse();
+  setupAddChannel();
   setupAddHuman();
+  // Restore any custom channels saved from previous sessions
+  {
+    const saved = JSON.parse(localStorage.getItem('tc_custom_channels') || '[]');
+    const nav = document.getElementById('channels');
+    saved.forEach(raw => {
+      if (!document.querySelector(`.channel-btn[data-channel="${raw}"][data-agent=""]`)) {
+        const btn = document.createElement('button');
+        btn.className = 'channel-btn';
+        btn.dataset.channel = raw;
+        btn.dataset.agent = '';
+        btn.setAttribute('role', 'tab');
+        btn.setAttribute('aria-selected', 'false');
+        btn.textContent = `# ${raw}`;
+        nav.appendChild(btn);
+      }
+    });
+  }
   // Focus token input if visible (no saved creds)
   if (!tokenInput.value) tokenInput.focus();
 })();

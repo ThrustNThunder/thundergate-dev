@@ -41,10 +41,24 @@
     </nav>
 
     <div id="sidebar-footer">
+      <button class="sidebar-add-btn channel" id="add-channel-btn" type="button" title="Add channel">+ Channel</button>
       <button class="sidebar-add-btn agent" id="add-agent-btn" type="button" title="Add agent">+ Agent</button>
       <button class="sidebar-add-btn human" id="add-human-btn" type="button" title="Invite a human by phone number">+ Human</button>
     </div>
   </aside>
+
+  <!-- Add Channel modal -->
+  <div id="add-channel-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="add-channel-title">
+    <div id="add-channel-box">
+      <h3 id="add-channel-title"># Add Channel</h3>
+      <p>Enter a channel name to add it to the sidebar.</p>
+      <input id="add-channel-name" type="text" placeholder="e.g. jmab" autocomplete="off" />
+      <div class="add-human-actions">
+        <button id="add-channel-cancel" type="button">Cancel</button>
+        <button id="add-channel-confirm" type="button" class="primary">Add</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Add Human modal -->
   <div id="add-human-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="add-human-title">
