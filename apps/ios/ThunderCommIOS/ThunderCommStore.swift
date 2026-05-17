@@ -85,10 +85,21 @@ import Combine
             client.onStateChange = { [weak self] state in
                 DispatchQueue.main.async {
                     self?.connectionState = state
-                    if case .connected = state {
+                    switch state {
+                    case .connecting:
+                        // BUILD_54_P7_BRIEF: on every reconnect, drop the
+                        // local roster so stale entries from the prior
+                        // session never bleed into the fresh view. The
+                        // relay re-sends a full roster frame as part of
+                        // the auth handshake, which repopulates state.
+                        self?.rosterByParticipantID.removeAll()
+                        self?.rosterOrder.removeAll()
+                    case .connected:
                         self?.requestRecentHistoryIfAvailable()
                         self?.resendFailedMessagesIfNeeded()
                         self?.sendAutoProbeIfNeeded()
+                    case .disconnected, .authenticating, .reconnecting, .failed:
+                        break
                     }
                 }
             }
@@ -154,6 +165,24 @@ import Combine
             case .connecting, .authenticating, .connected:
                 return
             case .reconnecting, .disconnected, .failed:
+                connect()
+            }
+        }
+
+        /// Force a fresh roster from the relay. The local roster is cleared
+        /// automatically on the `.connecting` transition, so a reconnect is
+        /// the canonical refresh path. Called from the scene-phase observer
+        /// on a genuine background→foreground transition; see ContentView.
+        func refreshRoster() {
+            switch connectionState {
+            case .connected, .authenticating:
+                disconnect()
+                connect()
+            case .connecting, .reconnecting:
+                // A connect cycle is already in flight; let it finish and
+                // deliver the fresh roster.
+                return
+            case .disconnected, .failed:
                 connect()
             }
         }
@@ -804,6 +833,14 @@ import Combine
                 return rosterName
             }
             return ThunderCommParticipantIdentity.displayName(sender: nil, agentId: participantID, participantId: participantID, senderType: senderType(forParticipantID: participantID))
+        }
+
+        /// Returns the raw `role` string the relay attached to this peer in
+        /// its most recent roster frame, if any. Surfaced for the roster
+        /// sectioning helper in ContentView, which weighs explicit role
+        /// after token-prefix but before canonical name fallback.
+        func rosterRole(forParticipantID participantID: String) -> String? {
+            rosterByParticipantID[participantID]?.role
         }
 
         func roleLabel(forParticipantID participantID: String) -> String {

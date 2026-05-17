@@ -15,6 +15,7 @@ struct ContentView: View {
     @State private var showingAddChannel = false
     @State private var headerCollapsed = true
     @State private var showingNotificationsBanner = false
+    @State private var wasBackgrounded = false
 
     var body: some View {
         GeometryReader { geometry in
@@ -89,11 +90,28 @@ struct ContentView: View {
             store.draftDidChange(newValue)
         }
         .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .active {
-                store.connectIfNeeded()
+            switch newPhase {
+            case .active:
+                // BUILD_54_P7_BRIEF: on a genuine background→foreground
+                // transition, force a roster refresh so stale entries from
+                // the prior session can't leak into the who's-online view.
+                // .inactive↔.active (notification center, control center,
+                // incoming-call sheet) keeps the existing cheap path.
+                if wasBackgrounded {
+                    store.refreshRoster()
+                    wasBackgrounded = false
+                } else {
+                    store.connectIfNeeded()
+                }
                 Task {
                     await refreshNotificationsBanner()
                 }
+            case .background:
+                wasBackgrounded = true
+            case .inactive:
+                break
+            @unknown default:
+                break
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .notificationsDeclined)) { _ in
@@ -120,29 +138,34 @@ struct ContentView: View {
         .sheet(isPresented: $showingOnlinePeers) {
             NavigationStack {
                 List {
-                    ForEach(store.orderedPeerIDs(), id: \.self) { participantID in
-                        let status = store.statusForParticipantID(participantID)
-                        let senderType = store.senderType(forParticipantID: participantID)
-                        HStack(spacing: 12) {
-                            Circle()
-                                .fill(statusColor(for: status))
-                                .frame(width: 10, height: 10)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(store.displayName(forParticipantID: participantID))
-                                    .foregroundStyle(peerColor(for: participantID, senderType: senderType))
-                                Text(statusLabel(for: status))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                    // BUILD_54_P7_BRIEF: split into People + Agents using
+                    // the token-prefix-first classifier so tc-h-* always
+                    // lands in People and tc-a-* always lands in Agents.
+                    // Each participantID is classified once, so the same
+                    // identity never appears in both sections.
+                    let (people, agents) = partitionedRoster(store.orderedPeerIDs())
+
+                    Section("People") {
+                        if people.isEmpty {
+                            Text("No people online yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(people, id: \.self) { participantID in
+                                peerRow(participantID: participantID)
                             }
-                            Spacer()
-                            HStack(spacing: 6) {
-                                Text(store.roleLabel(forParticipantID: participantID))
-                                if let model = store.modelForParticipantID(participantID) {
-                                    Text(model)
-                                }
+                        }
+                    }
+
+                    Section("Agents") {
+                        if agents.isEmpty {
+                            Text("No agents online yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(agents, id: \.self) { participantID in
+                                peerRow(participantID: participantID)
                             }
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -500,6 +523,55 @@ struct ContentView: View {
             return "Busy"
         case .offline:
             return "Offline"
+        }
+    }
+
+    /// Splits the active participant list into (people, agents) by token
+    /// prefix first, then explicit role, then canonical name. tc-h-* and
+    /// tc-a-* are authoritative; everything else falls back to the safe
+    /// default of "agent" per BUILD_54_P7_BRIEF.
+    private func partitionedRoster(_ participantIDs: [String]) -> (people: [String], agents: [String]) {
+        var people: [String] = []
+        var agents: [String] = []
+        for participantID in participantIDs {
+            let explicitRole = store.rosterRole(forParticipantID: participantID)
+            switch ThunderCommParticipantIdentity.rosterSection(
+                forParticipantID: participantID,
+                explicitRole: explicitRole
+            ) {
+            case .human:
+                people.append(participantID)
+            case .agent:
+                agents.append(participantID)
+            }
+        }
+        return (people, agents)
+    }
+
+    @ViewBuilder
+    private func peerRow(participantID: String) -> some View {
+        let status = store.statusForParticipantID(participantID)
+        let senderType = store.senderType(forParticipantID: participantID)
+        HStack(spacing: 12) {
+            Circle()
+                .fill(statusColor(for: status))
+                .frame(width: 10, height: 10)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(store.displayName(forParticipantID: participantID))
+                    .foregroundStyle(peerColor(for: participantID, senderType: senderType))
+                Text(statusLabel(for: status))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            HStack(spacing: 6) {
+                Text(store.roleLabel(forParticipantID: participantID))
+                if let model = store.modelForParticipantID(participantID) {
+                    Text(model)
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
         }
     }
 

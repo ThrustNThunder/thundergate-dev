@@ -182,6 +182,37 @@ enum ThunderCommParticipantIdentity {
             .replacingOccurrences(of: "_", with: "-")
             .replacingOccurrences(of: " ", with: "-")
     }
+
+    /// Roster-section classification per BUILD_54_P7_BRIEF:
+    ///  - `tc-h-*` prefix → .human (People section)
+    ///  - `tc-a-*` prefix → .agent (Agents section)
+    ///  - no tc- prefix → trust the relay's explicit role field if present,
+    ///    then fall back to the canonical name table (michael/alex → human,
+    ///    jon/mack/rex/burt/sasha/system → agent), and finally default to
+    ///    .agent. The default-to-agent step matches the brief's "safe
+    ///    default" for unknown ids — once P7b clean-slate lands, every id
+    ///    will carry a tc- prefix and the fallbacks become dormant.
+    static func rosterSection(forParticipantID participantID: String, explicitRole: String? = nil) -> ThunderCommSenderType {
+        let lower = participantID.lowercased()
+        if lower.hasPrefix("tc-h-") { return .human }
+        if lower.hasPrefix("tc-a-") { return .agent }
+
+        if let trimmed = explicitRole?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !trimmed.isEmpty {
+            if trimmed == "human" { return .human }
+            if trimmed == "agent" { return .agent }
+        }
+
+        let canonical = canonicalID(sender: nil, agentId: participantID, participantId: participantID, senderType: nil)
+        switch canonical {
+        case "michael", "alex":
+            return .human
+        case "jon", "mack", "rex", "burt", "sasha", "system":
+            return .agent
+        default:
+            return .agent
+        }
+    }
 }
 
 struct ThunderCommMessage: Identifiable, Codable, Equatable {
