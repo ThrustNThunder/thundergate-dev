@@ -29,6 +29,7 @@ const state = {
   allMessages: [],        // all messages across all channels, for filtering
   seenIds: new Set(),     // server message ids we've already rendered (dedup history on reconnect)
   typingIndicators: {},   // { participantId: timeoutId } — active typing indicators
+  batchingHistory: false, // suppress scrollBottom during batch history render
   authFailed: false,      // bad token — stop reconnecting
   hasConnected: false,    // first connection vs reconnect (status colour)
   lastDisconnectMsg: 0,   // throttle "Disconnected" system messages
@@ -349,6 +350,12 @@ function handleMessage(msg) {
 
     case 'history':
       if (msg.messages && msg.messages.length) {
+        // Batch into a DocumentFragment — one DOM write, one scroll, fast.
+        state.batchingHistory = true;
+        const frag = document.createDocumentFragment();
+        const origAppend = messagesEl.appendChild.bind(messagesEl);
+        // Temporarily redirect appends into the fragment
+        messagesEl.appendChild = (el) => frag.appendChild(el);
         msg.messages.forEach(m => {
           if (m.id && state.seenIds.has(m.id)) return; // dedup on reconnect
           if (m.sender) {
@@ -357,6 +364,10 @@ function handleMessage(msg) {
             renderAgentMsg(m.agentId, m.text, m.channel, m.id, m.timestamp);
           }
         });
+        messagesEl.appendChild = origAppend; // restore
+        state.batchingHistory = false;
+        origAppend(frag); // single DOM write
+        requestAnimationFrame(() => scrollBottom(true)); // scroll once after paint
       }
       break;
 
@@ -971,6 +982,8 @@ function isNearBottom() {
 }
 
 function scrollBottom(force) {
+  // Suppressed during batch history load (state.batchingHistory)
+  if (state.batchingHistory) return;
   // Don't yank the scroll back down if the user is reading history.
   if (force || isNearBottom()) {
     messagesEl.scrollTop = messagesEl.scrollHeight;
