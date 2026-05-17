@@ -50,7 +50,9 @@ export async function launchTui(opts: TuiOptions): Promise<void> {
     smartCSR: true,
     title: 'ThunderTUI',
     fullUnicode: true,
-    autoPadding: true
+    autoPadding: true,
+    mouse: false,
+    sendFocus: false
   });
 
   const chatHost = opts.mode === 'browser' ? null : makeChatHost(screen, opts);
