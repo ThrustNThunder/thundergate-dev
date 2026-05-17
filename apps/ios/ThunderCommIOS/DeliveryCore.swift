@@ -35,8 +35,10 @@
 
 import Foundation
 import SwiftUI
+import UIKit
 import Combine
 import Network
+import UserNotifications
 
 // MARK: - Wire types
 
@@ -317,15 +319,23 @@ public final class DeliveryCore: ObservableObject {
             }
 
             guard !collected.isEmpty else { return }
+            var newMessageCount = 0
             for m in collected where !seenIdsSet.contains(m.id) {
                 inbound.append(m)
                 markSeen(m.id)
+                newMessageCount += 1
             }
             capInboundIfNeeded()
             saveSeenIds()
             try? await api.ack(ids: collected.map(\.id))
             let newest = collected.map(\.createdAtMs).max() ?? lastDrainAt
             updateLastDrainAt(max(newest, lastDrainAt))
+            // Increment the icon badge only when the user can't already see
+            // the new messages on screen. ThunderCommApp clears to 0 on
+            // .active, so foreground drains intentionally skip the bump.
+            if newMessageCount > 0 && !sceneIsActive {
+                await incrementBadge(by: newMessageCount)
+            }
         } catch {
             // Swallow — next foreground or push will retry. Do not crash.
             NSLog("[DeliveryCore] drain failed: \(error)")
@@ -641,6 +651,17 @@ public final class DeliveryCore: ObservableObject {
 
     private func nowMs() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    // MARK: - Badge
+
+    // applicationIconBadgeNumber was deprecated in iOS 17, but Apple provided
+    // no read replacement. Per BUILD_54_BADGE_BRIEF.md we cannot maintain a
+    // UserDefaults counter, so reading the deprecated property is the
+    // practical source of truth for the increment math.
+    private func incrementBadge(by count: Int) async {
+        let current = UIApplication.shared.applicationIconBadgeNumber
+        try? await UNUserNotificationCenter.current().setBadgeCount(current + count)
     }
 
     // MARK: - Seen-ids dedup (persistent, FIFO, capped at seenIdsCap)

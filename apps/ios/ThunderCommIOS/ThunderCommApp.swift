@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 @main
 struct ThunderCommApp: App {
@@ -20,7 +21,9 @@ struct ThunderCommApp: App {
             DeliveryCore.shared.handleScenePhase(phase)
             if phase == .active {
                 AuthManager.shared.handleScenePhaseActive()
-                APNsManager.shared.clearBadge()
+                UNUserNotificationCenter.current().setBadgeCount(0) { error in
+                    if let error { NSLog("[Badge] clear failed: \(error)") }
+                }
             }
             if phase == .background {
                 APNsManager.shared.scheduleNextBackgroundRefresh()
