@@ -27,7 +27,7 @@ import { createServer } from 'http';
 const BRIDGE_PORT     = parseInt(process.env.TC_BRIDGE_PORT || '8765', 10);
 const GATEWAY_TOKEN   = process.env.TC_GATEWAY_TOKEN || '4ca1100a180ad68a94b004056e56fd39c81bdccb742d2926';
 const GATEWAY_URL     = process.env.TC_GATEWAY_URL   || 'ws://localhost:18789';
-const SESSION_KEY     = process.env.TC_SESSION_KEY   || 'agent:main:slack:channel:c0anl10aamv';
+const SESSION_KEY     = process.env.TC_SESSION_KEY   || 'agent:main:thundercomm:main';
 const SESSIONS_JSON   = process.env.TC_SESSIONS_JSON  || '/home/ubuntu/.openclaw/agents/main/sessions/sessions.json';
 const FEDERATION_RELAY = process.env.TC_FEDERATION_RELAY || 'ws://localhost:8767';
 const FEDERATION_TOKEN = process.env.TC_FEDERATION_TOKEN || 'jmab-federation-2026';

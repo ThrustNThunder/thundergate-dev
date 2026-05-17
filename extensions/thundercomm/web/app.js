@@ -169,20 +169,12 @@ function hideLlmIndicator() {
 
 // ── Auth & connect ────────────────────────────────────────────────────────
 
-// Restore credentials from localStorage and auto-connect if present
+// Restore credentials from localStorage (never auto-connect — let user confirm)
 {
   const savedToken = localStorage.getItem('tc_token');
   const savedHost  = localStorage.getItem('tc_host');
   if (savedToken) tokenInput.value = savedToken;
   if (savedHost)  hostInput.value  = savedHost;
-  // Auto-connect on page load if credentials exist
-  if (savedToken && savedHost) {
-    state.token = savedToken;
-    state.host  = savedHost;
-    state.authFailed = false;
-    // Defer one tick so DOM is fully ready
-    setTimeout(() => connect(), 0);
-  }
 }
 
 connectBtn.addEventListener('click', () => {
