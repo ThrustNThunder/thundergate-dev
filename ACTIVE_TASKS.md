@@ -269,3 +269,9 @@
 - `<all_urls>` content-script matcher is the Phase 1 dev posture only —
   TB-1-13 (allowlist) replaces it with the manifest-immutable allowlist
   before any production cut.
+
+## Build 54 P1 — GATED ✅ (May 17 2026 03:00 ET)
+- ThunderCommModels.swift: added ThunderCommMessage.init(from inbox: InboxMessage)
+- ThunderCommStore.swift: import Combine, cancellables, DeliveryCore.$inbound subscription, handleInboundUpdate via merge(_:)
+- APNs stack untouched
+- Gated by Jon. Awaiting Mack push + build 54 archive.
