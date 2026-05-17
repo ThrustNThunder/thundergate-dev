@@ -443,7 +443,8 @@ function handleMessage(msg) {
         authOverlay.style.display = 'flex';
         showAuthError(`Auth failed: ${msg.message || 'invalid token'}`);
         setConnStatus('offline');
-      } else {
+      } else if (msg.code !== 'INVALID_MESSAGE') {
+        // Suppress low-level protocol errors from chat UI
         addSystemMsg(`Error: ${msg.message || msg.code || 'unknown'}`);
       }
       break;

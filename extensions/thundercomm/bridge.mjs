@@ -518,8 +518,16 @@ wss.on('connection', (ws, req) => {
         break;
       }
       
+      case 'ping':
+        ws.send(JSON.stringify({ type: 'pong' }));
+        break;
+
+      case 'pong':
+        break; // ignore
+
       default:
-        ws.send(JSON.stringify({ type: 'error', code: 'INVALID_MESSAGE', message: `Unknown: ${msg.type}` }));
+        console.warn(`[Bridge] Unknown message type: ${msg.type}`);
+        // Don't send error back — silently ignore unknown types to avoid UI noise
     }
   });
   
