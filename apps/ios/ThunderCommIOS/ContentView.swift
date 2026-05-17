@@ -115,7 +115,7 @@ struct ContentView: View {
             AddHumanInviteView()
         }
         .sheet(isPresented: $showingAddChannel) {
-            AddChannelView(connectionStore: store)
+            ChannelListView(connectionStore: store)
         }
         .sheet(isPresented: $showingOnlinePeers) {
             NavigationStack {
@@ -339,7 +339,7 @@ struct ContentView: View {
                     showingAddHuman = true
                 }
 
-                headerActionButton(systemName: "number.square", accessibilityLabel: "Add channel") {
+                headerActionButton(systemName: "number.square", accessibilityLabel: "Channels") {
                     showingAddChannel = true
                 }
 
@@ -577,64 +577,6 @@ private struct AddHumanInviteView: View {
                 }
             }
         }
-    }
-}
-
-private struct AddChannelView: View {
-    @Environment(\.dismiss) private var dismiss
-
-    let connectionStore: ThunderCommStore
-
-    @State private var channelName = ""
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Channel") {
-                    TextField("channel-name", text: $channelName)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Text("Creates a local ThunderCommo route and reconnects chat to that channel immediately.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if !connectionStore.customChannels.isEmpty {
-                    Section("Existing") {
-                        ForEach(connectionStore.customChannels, id: \.self) { channel in
-                            Button("#\(channel)") {
-                                connectionStore.setRoute(.channel, channelName: channel)
-                                dismiss()
-                            }
-                        }
-                    }
-                }
-
-                Section {
-                    Button("Add channel") {
-                        connectionStore.addChannel(named: channelName)
-                        dismiss()
-                    }
-                    .disabled(normalizedChannelName.isEmpty)
-                }
-            }
-            .navigationTitle("Add Channel")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-            }
-        }
-    }
-
-    private var normalizedChannelName: String {
-        channelName
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "#", with: "")
-            .lowercased()
     }
 }
 

@@ -13,6 +13,7 @@ import Combine
         private static let directAgentDefaultsKey = "ThunderComm.directAgent"
         private static let selectedChannelDefaultsKey = "ThunderComm.selectedChannel"
         private static let customChannelsDefaultsKey = "ThunderComm.customChannels"
+        private static let channelsDefaultsKey = "ThunderComm.channels"
         private static let userAccountDefaultsKey = "thunder.user.account.v1"
         private static let initialVisibleMessageCount = 100
         private static let historyPageSize = 100
@@ -30,6 +31,7 @@ import Combine
         var directAgentId: String = ThunderCommStore.loadDirectAgentId()
         var selectedChannelName: String = ThunderCommStore.loadSelectedChannel()
         var customChannels: [String] = ThunderCommStore.loadCustomChannels()
+        var channels: [ThunderChannel] = ThunderCommStore.loadChannels()
         let peerId: String = ThunderCommIdentity.loadOrCreatePeerId(forUserKey: ThunderCommStore.signedInUserKey())
 
         var activeIndicators: [ThunderCommActivityIndicator] = []
@@ -73,6 +75,8 @@ import Combine
                     customChannels.insert(selectedChannelName, at: 0)
                 }
             }
+
+            seedDefaultChannelsIfNeeded()
 
             loadPersistedMessages()
             refreshVisibleMessages()
@@ -201,6 +205,122 @@ import Combine
         func addChannel(named name: String) {
             guard let normalizedChannel = normalizeCustomChannel(name) else { return }
             setRoute(.channel, channelName: normalizedChannel)
+        }
+
+        // MARK: - Channels (P5c)
+        //
+        // Member-scoped channel list parallel to the existing route system.
+        // tnt + jmab are seeded as default channels (visible to everyone).
+        // Created channels are mirrored into customChannels so the existing
+        // .channel route handles wire-level subscription unchanged.
+
+        /// Channels the local user should see in the Channels list. tnt and
+        /// jmab are isDefault → always visible. Custom channels show only
+        /// when the local peerId is in the members list.
+        var visibleChannels: [ThunderChannel] {
+            channels.filter { $0.isDefault || $0.members.contains(peerId) }
+        }
+
+        /// Creates a channel locally and broadcasts a channel_created frame so
+        /// other members can mirror it. v1 privacy is presentation-layer only —
+        /// the wire frame is broadcast to all peers and clients self-filter.
+        func createChannel(name: String, members: [String]) {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "#", with: "")
+                .lowercased()
+            guard !trimmed.isEmpty else { return }
+            guard trimmed != "tnt", trimmed != "jmab", trimmed != "direct",
+                  !trimmed.hasPrefix("direct:") else { return }
+            guard !channels.contains(where: { $0.id == trimmed }) else { return }
+
+            var memberSet = Set(members)
+            memberSet.insert(peerId) // creator is always a member
+            let channel = ThunderChannel(
+                id: trimmed,
+                name: trimmed,
+                members: Array(memberSet).sorted(),
+                isDefault: false
+            )
+            channels.append(channel)
+            persistChannels()
+
+            // Mirror into the existing customChannels list so .channel route
+            // wiring (subscription, route menu, filtering) works unchanged.
+            if !customChannels.contains(trimmed) {
+                customChannels.append(trimmed)
+                customChannels.sort()
+                UserDefaults.standard.set(customChannels, forKey: Self.customChannelsDefaultsKey)
+            }
+
+            client.sendChannelCreated(channel: channel, by: peerId)
+        }
+
+        private func seedDefaultChannelsIfNeeded() {
+            var changed = false
+            if !channels.contains(where: { $0.id == "tnt" }) {
+                channels.insert(
+                    ThunderChannel(id: "tnt", name: "TNT", members: [], isDefault: true),
+                    at: 0
+                )
+                changed = true
+            }
+            if !channels.contains(where: { $0.id == "jmab" }) {
+                channels.append(
+                    ThunderChannel(id: "jmab", name: "JMAB", members: [], isDefault: true)
+                )
+                changed = true
+            }
+            // Backfill ThunderChannel entries for pre-existing customChannels
+            // so the Channels UI shows everything the user already has.
+            for custom in customChannels where !channels.contains(where: { $0.id == custom }) {
+                channels.append(
+                    ThunderChannel(id: custom, name: custom, members: [peerId], isDefault: false)
+                )
+                changed = true
+            }
+            if changed { persistChannels() }
+        }
+
+        private func handleChannelCreated(_ payload: ChannelCreatedPayload) {
+            let trimmedId = payload.channelId
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !trimmedId.isEmpty else { return }
+            // Presentation-layer privacy — only adopt channels we're a member of.
+            guard payload.members.contains(peerId) else { return }
+            guard !channels.contains(where: { $0.id == trimmedId }) else { return }
+
+            let displayName = payload.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? trimmedId
+                : payload.name
+            let channel = ThunderChannel(
+                id: trimmedId,
+                name: displayName,
+                members: payload.members,
+                isDefault: false
+            )
+            channels.append(channel)
+            persistChannels()
+
+            if !customChannels.contains(trimmedId) {
+                customChannels.append(trimmedId)
+                customChannels.sort()
+                UserDefaults.standard.set(customChannels, forKey: Self.customChannelsDefaultsKey)
+            }
+        }
+
+        private func persistChannels() {
+            if let data = try? JSONEncoder().encode(channels) {
+                UserDefaults.standard.set(data, forKey: Self.channelsDefaultsKey)
+            }
+        }
+
+        private static func loadChannels() -> [ThunderChannel] {
+            guard let data = UserDefaults.standard.data(forKey: channelsDefaultsKey),
+                  let channels = try? JSONDecoder().decode([ThunderChannel].self, from: data) else {
+                return []
+            }
+            return channels
         }
 
         /// Adopt a new account-level display name as the wire-level sender so
@@ -402,6 +522,8 @@ import Combine
                 handleSystemEvent(payload)
             case .error(let payload):
                 handleError(payload)
+            case .channelCreated(let payload):
+                handleChannelCreated(payload)
             case .unknown(let text):
                 debug("event: \(text)")
             }

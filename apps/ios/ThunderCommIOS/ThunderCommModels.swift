@@ -413,6 +413,36 @@ struct ThunderCommErrorPayload: Codable, Equatable {
     let message: String
 }
 
+// MARK: - Channels (P5c)
+
+/// Member-scoped private channel. Privacy is presentation-layer only for v1 —
+/// the relay broadcasts channel_created frames to all peers; clients filter by
+/// membership. Server-side enforcement is future work.
+struct ThunderChannel: Identifiable, Codable, Equatable {
+    let id: String          // canonical lowercase channel id (e.g. "tnt", "ops-2026")
+    var name: String        // display name (free-form; defaults to id if absent)
+    var members: [String]   // peer IDs of channel members
+    var isDefault: Bool     // tnt is the team-wide default; visible to everyone
+}
+
+struct ChannelCreatedPayload: Codable, Equatable {
+    let type: String
+    let channelId: String
+    let name: String
+    let members: [String]
+    let createdBy: String?
+    let createdAt: Int64?
+}
+
+struct ChannelCreatedOutboundPayload: Encodable {
+    let type: String = "channel_created"
+    let channelId: String
+    let name: String
+    let members: [String]
+    let createdBy: String
+    let createdAt: Int64
+}
+
 struct ThunderCommParticipant: Identifiable, Codable, Equatable {
     let id: String
     let name: String
@@ -486,6 +516,7 @@ enum ThunderCommInboundEvent {
     case ack(ThunderCommAckPayload)
     case systemEvent(ThunderCommSystemEventPayload)
     case error(ThunderCommErrorPayload)
+    case channelCreated(ChannelCreatedPayload)
     case unknown(String)
 }
 

@@ -44,6 +44,7 @@ public struct SettingsView: View {
             Form {
                 accountSection
                 connectionSection
+                sharingSection
                 securitySection
                 agentsSection
             }
@@ -234,6 +235,31 @@ public struct SettingsView: View {
             } footer: {
                 Text("Live chat endpoint, token, and the display name other peers see.")
             }
+        }
+    }
+
+    // MARK: - Sharing & Tokens
+
+    @ViewBuilder
+    private var sharingSection: some View {
+        Section {
+            NavigationLink {
+                AgentTokenView()
+            } label: {
+                Label("Connect an Agent", systemImage: "key.horizontal.fill")
+            }
+
+            if let connectionStore {
+                NavigationLink {
+                    MyConnectionInfoView(connectionStore: connectionStore)
+                } label: {
+                    Label("My Connection Info", systemImage: "person.crop.circle.badge.questionmark")
+                }
+            }
+        } header: {
+            Text("Sharing & Tokens")
+        } footer: {
+            Text("Generate a token for an agent to connect with, or view your own connection info.")
         }
     }
 

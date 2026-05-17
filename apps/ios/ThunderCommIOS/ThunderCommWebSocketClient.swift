@@ -113,6 +113,20 @@ final class ThunderCommWebSocketClient: NSObject {
         ))
     }
 
+    /// Broadcasts a channel_created frame so other members can mirror the
+    /// channel locally. Presentation-layer privacy only (v1) — receivers
+    /// filter by membership; the relay does not.
+    func sendChannelCreated(channel: ThunderChannel, by peerId: String) {
+        let payload = ChannelCreatedOutboundPayload(
+            channelId: channel.id,
+            name: channel.name,
+            members: channel.members,
+            createdBy: peerId,
+            createdAt: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        send(payload)
+    }
+
     private func openConnection() {
         guard var activeConnection else {
             onStateChange?(.failed("Missing connection config"))
@@ -316,6 +330,10 @@ final class ThunderCommWebSocketClient: NSObject {
         case "error":
             if let value = try? decoder.decode(ThunderCommErrorPayload.self, from: data) {
                 return .error(value)
+            }
+        case "channel_created":
+            if let value = try? decoder.decode(ChannelCreatedPayload.self, from: data) {
+                return .channelCreated(value)
             }
         default:
             return .unknown(text)
