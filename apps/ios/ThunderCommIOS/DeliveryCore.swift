@@ -91,11 +91,16 @@ public enum WireMessage: Decodable, Sendable {
     case status(gateway: String, model: String?)           // type: "status"
     case systemMessage(text: String)                       // type: "system"
     case error(code: String, message: String?)             // type: "error"
+    case vaultUnlockRequest(requestId: String, task: String, reason: String, ttlMs: Int)
     case unknown
 
     private enum CodingKeys: String, CodingKey {
         case type, delta, agentId, id, agents, messages
         case gateway, model, text, code, message
+        case requestId = "request_id"
+        case task
+        case reason
+        case ttlMs = "ttl_ms"
     }
 
     public init(from decoder: Decoder) throws {
@@ -133,6 +138,12 @@ public enum WireMessage: Decodable, Sendable {
             let code    = (try? c.decode(String.self, forKey: .code))    ?? ""
             let message = try? c.decode(String.self, forKey: .message)
             self = .error(code: code, message: message)
+        case "vault_unlock_request":
+            let requestId = (try? c.decode(String.self, forKey: .requestId)) ?? ""
+            let task      = (try? c.decode(String.self, forKey: .task))      ?? ""
+            let reason    = (try? c.decode(String.self, forKey: .reason))    ?? ""
+            let ttlMs     = (try? c.decode(Int.self,    forKey: .ttlMs))     ?? 0
+            self = .vaultUnlockRequest(requestId: requestId, task: task, reason: reason, ttlMs: ttlMs)
         default:
             // Tolerate legacy bare-InboxMessage frames (no `type` field) so
             // older relays still deliver into `.inboxMessage`.
@@ -195,6 +206,25 @@ public struct OutboxItem: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+// MARK: - Vault unlock types
+
+// Agent-initiated vault access request. Rendered by VaultUnlockSheet, which
+// gates the OS biometric prompt behind an explicit in-app Approve tap so the
+// server-supplied `reason` is never the only consent surface.
+public struct VaultUnlockRequest: Identifiable, Equatable, Sendable {
+    public let requestId: String
+    public let task: String
+    public let reason: String
+    public let expiresAtMs: Int64
+
+    public var id: String { requestId }
+}
+
+public enum VaultUnlockOutcome: Sendable {
+    case approved
+    case denied
+}
+
 // MARK: - DeliveryCore (the public surface)
 
 @MainActor
@@ -206,6 +236,8 @@ public final class DeliveryCore: ObservableObject {
     public static let maxOutboxAttempts = 10
     public static let seenIdsCap = 500
     private static let thinkingTimeoutNs: UInt64 = 30 * 1_000_000_000
+    private static let vaultMaxTtlMs: Int = 5 * 60_000
+    private static let vaultRequestReplayWindow = 50
 
     @Published public private(set) var isWSConnected: Bool = false
     @Published public private(set) var isRelayConnected: Bool = false
@@ -217,6 +249,10 @@ public final class DeliveryCore: ObservableObject {
     @Published public private(set) var thinkingAgentId: String? = nil
     @Published public private(set) var gatewayStatus: String = ""
     @Published public private(set) var modelName: String? = nil
+    @Published public private(set) var pendingVaultRequest: VaultUnlockRequest?
+
+    private var recentVaultRequestIds: [String] = []
+    private var vaultExpiryTask: Task<Void, Never>?
 
     private var ws: WebSocketManager?
     private let api = InboxAPI()
@@ -442,8 +478,109 @@ public final class DeliveryCore: ObservableObject {
         case .error(let code, let message):
             NSLog("[WS] relay error code=\(code) message=\(message ?? "")")
 
+        case .vaultUnlockRequest(let requestId, let task, let reason, let ttlMs):
+            handleVaultUnlockRequest(requestId: requestId, task: task, reason: reason, ttlMs: ttlMs)
+
         case .unknown:
             break
+        }
+    }
+
+    // MARK: - Vault unlock
+
+    // Validates the inbound request and either drops, auto-denies, or stages a
+    // pending VaultUnlockRequest for the SwiftUI sheet to render. The OS
+    // biometric prompt does NOT fire here — only after explicit in-app Approve.
+    private func handleVaultUnlockRequest(requestId: String, task: String, reason: String, ttlMs: Int) {
+        let trimmedId = requestId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTask = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedId.isEmpty, !trimmedTask.isEmpty, !trimmedReason.isEmpty else {
+            NSLog("[Vault] dropping request: empty field(s) in payload")
+            return
+        }
+        guard ttlMs > 0, ttlMs <= Self.vaultMaxTtlMs else {
+            NSLog("[Vault] denying \(trimmedId): ttl_ms out of range (\(ttlMs))")
+            Task { await self.sendVaultReply(requestId: trimmedId, outcome: .denied) }
+            return
+        }
+        // Never fire biometric in background — user can't have meant to approve
+        // something they aren't looking at.
+        guard sceneIsActive else {
+            NSLog("[Vault] denying \(trimmedId): scene not active")
+            Task { await self.sendVaultReply(requestId: trimmedId, outcome: .denied) }
+            return
+        }
+        if recentVaultRequestIds.contains(trimmedId) {
+            NSLog("[Vault] dropping \(trimmedId): replay")
+            return
+        }
+        rememberVaultRequestId(trimmedId)
+        // One in-flight at a time; auto-deny anything that arrives while a
+        // pending request is on screen.
+        if pendingVaultRequest != nil {
+            NSLog("[Vault] auto-denying \(trimmedId): another request already pending")
+            Task { await self.sendVaultReply(requestId: trimmedId, outcome: .denied) }
+            return
+        }
+        let expiresAt = nowMs() + Int64(ttlMs)
+        pendingVaultRequest = VaultUnlockRequest(
+            requestId: trimmedId,
+            task: trimmedTask,
+            reason: trimmedReason,
+            expiresAtMs: expiresAt
+        )
+        scheduleVaultExpiry(requestId: trimmedId, ttlMs: ttlMs)
+    }
+
+    public func resolveVaultRequest(_ requestId: String, outcome: VaultUnlockOutcome) {
+        guard let current = pendingVaultRequest, current.requestId == requestId else { return }
+        pendingVaultRequest = nil
+        vaultExpiryTask?.cancel()
+        vaultExpiryTask = nil
+        Task { await self.sendVaultReply(requestId: requestId, outcome: outcome) }
+    }
+
+    private func sendVaultReply(requestId: String, outcome: VaultUnlockOutcome) async {
+        let payload: [String: Any]
+        switch outcome {
+        case .approved:
+            payload = [
+                "type": "vault_unlock_approval",
+                "request_id": requestId,
+                "approved_at": nowMs()
+            ]
+        case .denied:
+            payload = [
+                "type": "vault_unlock_denied",
+                "request_id": requestId
+            ]
+        }
+        guard let manager = ws else {
+            NSLog("[Vault] no WS — cannot send reply for \(requestId)")
+            return
+        }
+        await manager.send(json: payload)
+    }
+
+    private func scheduleVaultExpiry(requestId: String, ttlMs: Int) {
+        vaultExpiryTask?.cancel()
+        vaultExpiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(ttlMs) * 1_000_000)
+            guard let self else { return }
+            if let current = self.pendingVaultRequest, current.requestId == requestId {
+                NSLog("[Vault] request \(requestId) expired client-side")
+                self.pendingVaultRequest = nil
+                await self.sendVaultReply(requestId: requestId, outcome: .denied)
+            }
+        }
+    }
+
+    private func rememberVaultRequestId(_ id: String) {
+        recentVaultRequestIds.append(id)
+        if recentVaultRequestIds.count > Self.vaultRequestReplayWindow {
+            recentVaultRequestIds.removeFirst(recentVaultRequestIds.count - Self.vaultRequestReplayWindow)
         }
     }
 
@@ -616,6 +753,27 @@ actor WebSocketManager {
         session = nil
         delegateAdapter = nil
         onStateChange(false)
+    }
+
+    // Outbound JSON frame. Symmetric to the inbound receiveLoop; used by
+    // DeliveryCore.sendVaultReply to ack vault_unlock_request frames.
+    func send(json: [String: Any]) {
+        guard let task else {
+            NSLog("[WS] send dropped — no active task")
+            return
+        }
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: json, options: []),
+            let payload = String(data: data, encoding: .utf8)
+        else {
+            NSLog("[WS] send failed — could not encode JSON payload")
+            return
+        }
+        task.send(.string(payload)) { error in
+            if let error {
+                NSLog("[WS] send error: \(error)")
+            }
+        }
     }
 
     private func wsURL() -> URL? {

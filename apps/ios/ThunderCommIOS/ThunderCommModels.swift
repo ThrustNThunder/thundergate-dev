@@ -281,6 +281,42 @@ struct ThunderCommMessage: Identifiable, Codable, Equatable {
         try container.encodeIfPresent(contentKind, forKey: .contentKind)
         try container.encodeIfPresent(attachment, forKey: .attachment)
     }
+
+    // Bridge from DeliveryCore's wire-level InboxMessage into the rich store
+    // shape. ThunderCommStore.merge(_:) re-runs normalize on these, so the
+    // display name / canonical agentId here are best-effort — merge fixes them.
+    // Channel defaults to "tnt"; routed-direct delivery can override later.
+    init(from inbox: InboxMessage) {
+        let derivedSenderType = ThunderCommParticipantIdentity.senderType(
+            sender: inbox.from,
+            agentId: nil,
+            participantId: nil,
+            explicitRawValue: nil
+        )
+        let canonical = ThunderCommParticipantIdentity.canonicalID(
+            sender: inbox.from,
+            agentId: nil,
+            participantId: nil,
+            senderType: derivedSenderType
+        )
+        let derivedAgentId: String? = derivedSenderType == .agent ? canonical : nil
+        let kind = ThunderCommContentKind(rawValue: inbox.kind ?? "") ?? .text
+
+        self.init(
+            id: inbox.id,
+            channel: "tnt",
+            sender: inbox.from,
+            senderType: derivedSenderType,
+            agentId: derivedAgentId,
+            text: inbox.body,
+            timestamp: inbox.createdAtMs,
+            originPeer: inbox.from,
+            relayedAt: nil,
+            relayedBy: nil,
+            contentKind: kind,
+            attachment: nil
+        )
+    }
 }
 
 struct FederationAuthPayload: Encodable {

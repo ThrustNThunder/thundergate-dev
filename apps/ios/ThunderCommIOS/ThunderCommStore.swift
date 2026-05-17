@@ -2,6 +2,7 @@
     import Foundation
 import SQLite3
 import Observation
+import Combine
 
     @Observable
     final class ThunderCommStore {
@@ -57,6 +58,7 @@ import Observation
         private var deliveryWatchdogs: [String: DispatchWorkItem] = [:]
         private var pendingMessages: [String: ThunderCommMessage] = [:]
         private var lastDispatchChannelByAgent: [String: String] = [:]
+        private var cancellables = Set<AnyCancellable>()
 
         private func debug(_ message: String) {
             print("[ThunderCommStore] \(message)")
@@ -108,6 +110,13 @@ import Observation
             client.onResolveAfterTimestamp = { [weak self] channel in
                 self?.lastMessageTimestamp(for: channel) ?? 0
             }
+
+            DeliveryCore.shared.$inbound
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] newInbound in
+                    self?.handleInboundUpdate(newInbound)
+                }
+                .store(in: &cancellables)
         }
 
         deinit {
@@ -734,7 +743,20 @@ import Observation
             return canonical
         }
 
-        private func merge(_ incomingMessages: [ThunderCommMessage]) {
+        // Drains DeliveryCore.inbound into the store. Brief BUILD_54_P1 wires
+    // silent-push → DeliveryCore.drainInbox → DeliveryCore.inbound → here.
+    // Dedup is by id against messageIDs (the store's authoritative id set
+    // tracking allMessages, not the filtered `messages` view). merge(_:)
+    // handles normalize, sort, cap, persistence, and visible-refresh.
+    private func handleInboundUpdate(_ inbound: [InboxMessage]) {
+        let newMessages = inbound
+            .filter { !messageIDs.contains($0.id) }
+            .map { ThunderCommMessage(from: $0) }
+        guard !newMessages.isEmpty else { return }
+        merge(newMessages)
+    }
+
+    private func merge(_ incomingMessages: [ThunderCommMessage]) {
             guard !incomingMessages.isEmpty else { return }
 
             var didChange = false

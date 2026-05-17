@@ -11,14 +11,10 @@ struct ThunderCommApp: App {
 
     var body: some Scene {
         WindowGroup {
-            AuthGate {
-                OnboardingGate {
-                    ContentView()
-                }
-            }
-            .environmentObject(DeliveryCore.shared)
-            .environmentObject(AuthManager.shared)
-            .environmentObject(AccountStore.shared)
+            RootView()
+                .environmentObject(DeliveryCore.shared)
+                .environmentObject(AuthManager.shared)
+                .environmentObject(AccountStore.shared)
         }
         .onChange(of: scenePhase) { _, phase in
             DeliveryCore.shared.handleScenePhase(phase)
@@ -29,6 +25,40 @@ struct ThunderCommApp: App {
             if phase == .background {
                 APNsManager.shared.scheduleNextBackgroundRefresh()
             }
+        }
+    }
+}
+
+// Hosts the auth + content stack and the agent-initiated vault unlock sheet.
+// The sheet binding treats any nil transition (swipe-to-dismiss or
+// programmatic clear) as a deny so an unresolved request never silently
+// disappears from the relay's point of view.
+private struct RootView: View {
+    @EnvironmentObject private var deliveryCore: DeliveryCore
+
+    var body: some View {
+        AuthGate {
+            OnboardingGate {
+                ContentView()
+            }
+        }
+        .sheet(item: Binding(
+            get: { deliveryCore.pendingVaultRequest },
+            set: { newValue in
+                if newValue == nil, let current = deliveryCore.pendingVaultRequest {
+                    deliveryCore.resolveVaultRequest(current.requestId, outcome: .denied)
+                }
+            }
+        )) { request in
+            VaultUnlockSheet(
+                request: request,
+                onApprove: {
+                    deliveryCore.resolveVaultRequest(request.requestId, outcome: .approved)
+                },
+                onDeny: {
+                    deliveryCore.resolveVaultRequest(request.requestId, outcome: .denied)
+                }
+            )
         }
     }
 }
