@@ -135,14 +135,19 @@ public struct SignUpView: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("+1").foregroundStyle(.secondary)
-                    TextField("Phone (optional)", text: $phone)
-                        .keyboardType(.phonePad)
+                    TextField("Phone", text: $phone)
+                        .keyboardType(.numberPad)
                         .textContentType(.telephoneNumber)
+                        .onChange(of: phone) { _, newValue in
+                            // Strip anything that isn't a digit — numeric only.
+                            let digits = newValue.filter { $0.isNumber }
+                            if digits != newValue { phone = digits }
+                        }
                 }
                 .padding(10)
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(.gray.opacity(0.3)))
 
-                Text("For account recovery. We won't text you.")
+                Text("Required for account recovery. Numbers only, 10+ digits.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -152,23 +157,45 @@ public struct SignUpView: View {
             Button("Continue") { advanceFromProfile() }
                 .buttonStyle(.borderedProminent)
                 .frame(maxWidth: .infinity)
-                .disabled(displayName.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(!profileFieldsValid)
 
             Spacer()
         }
         .padding()
     }
 
+    // Validation gate for the Continue button on the profile step. Phone is
+    // REQUIRED in Build 55 final — numeric, 10+ digits.
+    private var profileFieldsValid: Bool {
+        let nameOk = !displayName.trimmingCharacters(in: .whitespaces).isEmpty
+        let phoneOk = phone.count >= 10 && phone.allSatisfy { $0.isNumber }
+        return nameOk && phoneOk
+    }
+
     private func advanceFromProfile() {
         error = nil
+        let trimmedName = displayName.trimmingCharacters(in: .whitespaces)
+        let digitsOnly = phone.filter { $0.isNumber }
+        guard digitsOnly.count >= 10 else {
+            error = "Phone number must be at least 10 digits, numbers only."
+            return
+        }
+        guard !trimmedName.isEmpty else {
+            error = "Display name is required."
+            return
+        }
         Task {
             do {
                 try await store.signUp(
                     email: email,
                     password: password,
-                    displayName: displayName,
-                    phone: phone.isEmpty ? nil : "+1" + phone
+                    displayName: trimmedName,
+                    phone: "+1" + digitsOnly
                 )
+                // A fresh signup re-arms the post-signup wizard (Your Token →
+                // Add Agent). ContentView reads this flag from a fullScreenCover
+                // and clears it when the user closes the wizard.
+                OnboardingFlag.reset()
                 step = .biometrics
             } catch {
                 self.error = error.localizedDescription

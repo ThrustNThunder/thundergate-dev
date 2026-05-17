@@ -1,37 +1,27 @@
 // AddAgentView.swift
 //
-// Bring-Your-Own-Agent-Adapter (BYOAA) flow. Four steps:
-//   1. Choose: scan QR or enter manually.
-//   2a. QR — AVCaptureSession + AVCaptureMetadataOutput parse a
-//       thundercommo:// URL and pre-fill the form.
-//   2b. Manual — type host/token directly.
-//   3. KYA verify — hit GET {httpURL}/api/agent/identity with the token,
-//       show the agent's display name + emoji + fingerprint, ask "yes or no".
-//       The user is the trust anchor here. We don't auto-pin.
-//   4. Connected — write the connection + token to UserStore and dismiss.
+// Build 55 final: minimal "add an existing agent" form, reached from
+// Settings → Agents → "Add agent". The user enters the agent's name, the
+// token they want to use to connect, and the session ID their agent gave
+// them back. No QR scanner. No relay URL fields. No KYA verification fetch
+// — Build 55 final treats the BYOAA verification flow as out of scope and
+// stores the connection as-entered. Future builds can re-introduce a
+// verification step if needed.
 
 import SwiftUI
-import AVFoundation
-import UIKit
 
 public struct AddAgentView: View {
-
-    public enum Step { case choose, qr, manual, verify, done }
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var store = UserStore.shared
 
-    @State private var step: Step = .choose
-
-    @State private var agentName: String = "Jon"
+    @State private var agentName: String = ""
     @State private var agentEmoji: String = "⚡"
-    @State private var wsURL: String = "wss://relay.thunderai.us"
-    @State private var httpURL: String = "https://relay.thunderai.us"
     @State private var token: String = ""
-
-    @State private var isVerifying = false
-    @State private var fetchedKYA: KYAIdentity?
-    @State private var verifyError: String?
+    @State private var sessionID: String = ""
+    @State private var isTokenVisible: Bool = false
+    @State private var saveError: String?
+    @State private var didSave: Bool = false
 
     public var onAdded: ((AgentConnection) -> Void)?
 
@@ -41,361 +31,113 @@ public struct AddAgentView: View {
 
     public var body: some View {
         NavigationStack {
-            content
-                .navigationTitle("Add Agent")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Cancel") { dismiss() }
+            Form {
+                Section("Agent") {
+                    TextField("Name (e.g. Jon, Mack, Rex)", text: $agentName)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                    TextField("Emoji", text: $agentEmoji)
+                        .autocorrectionDisabled()
+                }
+
+                Section {
+                    Group {
+                        if isTokenVisible {
+                            TextField("Bearer token", text: $token)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .font(.callout.monospaced())
+                        } else {
+                            SecureField("Bearer token", text: $token)
+                                .textContentType(.password)
+                        }
+                    }
+
+                    Button(isTokenVisible ? "Hide token" : "Show token") {
+                        isTokenVisible.toggle()
+                    }
+                    .font(.caption.weight(.semibold))
+                } header: {
+                    Text("Token")
+                } footer: {
+                    Text("The bearer token your agent will use to authenticate against the relay.")
+                }
+
+                Section {
+                    TextField("Session ID", text: $sessionID)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.callout.monospaced())
+                } header: {
+                    Text("Session")
+                } footer: {
+                    Text("The session identifier your agent gives you after they connect.")
+                }
+
+                if let saveError {
+                    Section {
+                        Text(saveError)
+                            .font(.callout)
+                            .foregroundStyle(.red)
                     }
                 }
-        }
-    }
 
-    @ViewBuilder
-    private var content: some View {
-        switch step {
-        case .choose: chooseStep
-        case .qr:     qrStep
-        case .manual: manualStep
-        case .verify: verifyStep
-        case .done:   doneStep
-        }
-    }
-
-    // MARK: - Step 1: choose
-
-    private var chooseStep: some View {
-        VStack(spacing: 16) {
-            Spacer()
-            Text("Bring your own agent")
-                .font(.title2.bold())
-                .multilineTextAlignment(.center)
-
-            Text("Scan a QR code or enter the details manually. This is the BYOAA lane, and ThunderCommo verifies the agent identity before it joins your workspace.")
-                .font(.callout)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal)
-
-            Button {
-                step = .qr
-            } label: {
-                Label("Scan QR code", systemImage: "qrcode.viewfinder")
-                    .frame(maxWidth: .infinity)
-                    .padding()
+                Section {
+                    Button {
+                        save()
+                    } label: {
+                        Label(didSave ? "Added" : "Add Agent",
+                              systemImage: didSave ? "checkmark.circle.fill" : "plus.circle.fill")
+                    }
+                    .disabled(!isFormValid || didSave)
+                }
             }
-            .buttonStyle(.borderedProminent)
-
-            Button {
-                step = .manual
-            } label: {
-                Label("Enter manually", systemImage: "keyboard")
-                    .frame(maxWidth: .infinity)
-                    .padding()
-            }
-            .buttonStyle(.bordered)
-
-            Spacer()
-        }
-        .padding()
-    }
-
-    // MARK: - Step 2a: QR
-
-    private var qrStep: some View {
-        VStack {
-            QRScannerView { code in
-                if parse(qrPayload: code) { step = .verify }
-            }
-            .frame(maxHeight: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .padding()
-
-            Text("Point at the agent's QR code")
-                .foregroundStyle(.secondary)
-
-            Text("QR keeps the token out of the keyboard path and drops you straight into KYA verification.")
-                .font(.footnote)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal)
-
-            Button("Enter manually instead") { step = .manual }
-                .padding()
-        }
-    }
-
-    // Accepts thundercommo://add?ws=...&http=...&token=...&name=...&emoji=...
-    private func parse(qrPayload: String) -> Bool {
-        guard let comps = URLComponents(string: qrPayload),
-              comps.scheme == "thundercommo" else { return false }
-        let q = Dictionary(uniqueKeysWithValues:
-            (comps.queryItems ?? []).map { ($0.name, $0.value ?? "") }
-        )
-        if let v = q["ws"]    { wsURL = v }
-        if let v = q["http"]  { httpURL = v }
-        if let v = q["token"] { token = v }
-        if let v = q["name"]  { agentName = v }
-        if let v = q["emoji"] { agentEmoji = v }
-        return !token.isEmpty && !httpURL.isEmpty
-    }
-
-    // MARK: - Step 2b: manual
-
-    private var manualStep: some View {
-        Form {
-            Section("Agent") {
-                TextField("Name", text: $agentName)
-                TextField("Emoji", text: $agentEmoji)
-            }
-            Section("Endpoints") {
-                TextField("WebSocket URL", text: $wsURL)
-                    .keyboardType(.URL)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                TextField("HTTP URL", text: $httpURL)
-                    .keyboardType(.URL)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-            }
-            Section("Token") {
-                SecureField("Bearer token", text: $token)
-                    .textContentType(.password)
-                Text("Manual entry is the fallback. ThunderCommo still runs KYA verification before it saves this BYOAA connection.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            Section {
-                Button("Verify Agent") { step = .verify }
-                    .disabled(token.isEmpty || httpURL.isEmpty)
+            .navigationTitle("Add Agent")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
             }
         }
     }
 
-    // MARK: - Step 3: verify (KYA)
-
-    private var verifyStep: some View {
-        VStack(spacing: 20) {
-            if isVerifying {
-                ProgressView("Talking to gateway…")
-                    .padding(.top, 60)
-                Spacer()
-            } else if let kya = fetchedKYA {
-                Spacer()
-                Text(kya.emoji).font(.system(size: 84))
-                Text(kya.displayName).font(.largeTitle.bold())
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Identity fingerprint")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(kya.fingerprint)
-                        .font(.system(.body, design: .monospaced))
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.gray.opacity(0.12))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }.padding(.horizontal)
-
-                Spacer()
-
-                Button("Trust and connect this agent") { confirm(kya: kya) }
-                    .buttonStyle(.borderedProminent)
-                    .frame(maxWidth: .infinity)
-
-                Button("Something looks wrong") { step = .manual }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.red)
-            } else if let verifyError {
-                Spacer()
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 56))
-                    .foregroundStyle(.orange)
-                Text("Couldn't verify").font(.title2.bold())
-                Text(verifyError)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal)
-                Spacer()
-                Button("Try again") { fetchKYA() }
-                    .buttonStyle(.borderedProminent)
-                Button("Edit details") { step = .manual }
-                    .buttonStyle(.borderless)
-            } else {
-                Color.clear.onAppear { fetchKYA() }
-            }
-        }
-        .padding()
+    private var isFormValid: Bool {
+        !agentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func fetchKYA() {
-        verifyError = nil
-        fetchedKYA = nil
-        isVerifying = true
+    private func save() {
+        let trimmedName    = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEmoji   = agentEmoji.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedToken   = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSession = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard let url = URL(string: httpURL + "/api/agent/identity") else {
-            isVerifying = false
-            verifyError = "HTTP URL is invalid."
+        guard !trimmedName.isEmpty,
+              !trimmedToken.isEmpty,
+              !trimmedSession.isEmpty else {
+            saveError = "All fields are required."
             return
         }
 
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.timeoutInterval = 12
-
-        Task {
-            do {
-                let (data, resp) = try await URLSession.shared.data(for: req)
-                guard let http = resp as? HTTPURLResponse else {
-                    throw URLError(.badServerResponse)
-                }
-                if http.statusCode == 401 {
-                    isVerifying = false
-                    verifyError = "Token rejected. Double-check it."
-                    return
-                }
-                guard (200..<300).contains(http.statusCode) else {
-                    throw URLError(.badServerResponse)
-                }
-                struct Response: Decodable {
-                    let agent_id: String
-                    let display_name: String?
-                    let emoji: String?
-                    let fingerprint: String
-                }
-                let r = try JSONDecoder().decode(Response.self, from: data)
-                let kya = KYAIdentity(
-                    agentId: r.agent_id,
-                    displayName: r.display_name ?? agentName,
-                    emoji: r.emoji ?? agentEmoji,
-                    fingerprint: r.fingerprint,
-                    verifiedAt: Date()
-                )
-                isVerifying = false
-                fetchedKYA = kya
-            } catch {
-                isVerifying = false
-                verifyError = error.localizedDescription
-            }
-        }
-    }
-
-    private func confirm(kya: KYAIdentity) {
+        // wsURL / httpURL slots are repurposed to carry the agent's session
+        // identifier — Build 55 final does not yet model a dedicated
+        // sessionID field on AgentConnection, and the existing fields are
+        // opaque strings from the storage layer's perspective.
         let connection = AgentConnection(
-            agentName: kya.displayName,
-            agentEmoji: kya.emoji,
-            wsURL: wsURL,
-            httpURL: httpURL,
-            kya: kya,
-            isDefault: store.currentUser?.agents.isEmpty ?? true
+            agentName: trimmedName,
+            agentEmoji: trimmedEmoji.isEmpty ? "⚡" : trimmedEmoji,
+            wsURL: trimmedSession,
+            httpURL: trimmedSession,
+            kya: nil,
+            isDefault: false
         )
-        store.addAgent(connection, token: token)
+        store.addAgent(connection, token: trimmedToken)
+        didSave = true
         onAdded?(connection)
-        step = .done
-    }
-
-    // MARK: - Step 4: done
-
-    private var doneStep: some View {
-        VStack(spacing: 20) {
-            Spacer()
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 84))
-                .foregroundStyle(.green)
-            Text("Agent connected")
-                .font(.largeTitle.bold())
-            if let kya = fetchedKYA {
-                Text("\(kya.emoji) \(kya.displayName)")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button("Done") { dismiss() }
-                .buttonStyle(.borderedProminent)
-                .frame(maxWidth: .infinity)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            dismiss()
         }
-        .padding()
-    }
-}
-
-// MARK: - QR Scanner
-
-public struct QRScannerView: UIViewControllerRepresentable {
-
-    public var onCode: (String) -> Void
-
-    public init(onCode: @escaping (String) -> Void) {
-        self.onCode = onCode
-    }
-
-    public func makeUIViewController(context: Context) -> QRScannerController {
-        let vc = QRScannerController()
-        vc.onCode = onCode
-        return vc
-    }
-
-    public func updateUIViewController(_ uiViewController: QRScannerController,
-                                       context: Context) { }
-}
-
-public final class QRScannerController: UIViewController,
-                                        AVCaptureMetadataOutputObjectsDelegate {
-
-    fileprivate var onCode: ((String) -> Void)?
-
-    private let session = AVCaptureSession()
-    private var preview: AVCaptureVideoPreviewLayer?
-    private var hasFired = false
-
-    public override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .black
-        configureSession()
-    }
-
-    public override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        if !session.isRunning {
-            DispatchQueue.global(qos: .userInitiated).async { self.session.startRunning() }
-        }
-    }
-
-    public override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        if session.isRunning { session.stopRunning() }
-    }
-
-    public override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        preview?.frame = view.bounds
-    }
-
-    private func configureSession() {
-        guard let device = AVCaptureDevice.default(for: .video),
-              let input  = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input) else { return }
-        session.addInput(input)
-
-        let output = AVCaptureMetadataOutput()
-        guard session.canAddOutput(output) else { return }
-        session.addOutput(output)
-        output.setMetadataObjectsDelegate(self, queue: .main)
-        output.metadataObjectTypes = [.qr]
-
-        let layer = AVCaptureVideoPreviewLayer(session: session)
-        layer.videoGravity = .resizeAspectFill
-        layer.frame = view.bounds
-        view.layer.addSublayer(layer)
-        preview = layer
-    }
-
-    public func metadataOutput(_ output: AVCaptureMetadataOutput,
-                               didOutput metadataObjects: [AVMetadataObject],
-                               from connection: AVCaptureConnection) {
-        guard !hasFired,
-              let obj = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
-              let str = obj.stringValue else { return }
-        hasFired = true
-        onCode?(str)
     }
 }

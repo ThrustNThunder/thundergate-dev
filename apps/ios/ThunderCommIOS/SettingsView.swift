@@ -5,6 +5,7 @@
 // touches identity or credentials.
 
 import SwiftUI
+import UIKit
 
 public struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
@@ -41,14 +42,14 @@ public struct SettingsView: View {
         NavigationStack {
             Form {
                 accountSection
-                connectionSection
+                connectionInfoSection
                 securitySection
                 agentsSection
+                aboutSection
             }
             .navigationTitle("Settings")
             .onAppear {
                 syncFromStore()
-                syncConnectionDraftsIfNeeded()
             }
             .sheet(isPresented: $showAddAgent) {
                 AddAgentView { _ in showAddAgent = false }
@@ -60,7 +61,11 @@ public struct SettingsView: View {
                                 isPresented: $showSignOutConfirm,
                                 titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) {
+                    // Build 55 final: sign-out wipes ALL session-scoped state
+                    // so the next user who lands on this device starts blank.
                     store.signOut()
+                    AccountStore.shared.clearAll()
+                    OnboardingFlag.reset()
                     onSignedOut?()
                 }
                 Button("Cancel", role: .cancel) { }
@@ -95,8 +100,9 @@ public struct SettingsView: View {
             TextField("Display name", text: $displayName)
                 .onSubmit { saveProfileEdits() }
 
-            TextField("Phone (optional)", text: $phone)
+            TextField("Phone", text: $phone)
                 .keyboardType(.phonePad)
+                .textContentType(.telephoneNumber)
                 .onSubmit { saveProfileEdits() }
 
             if let role = store.currentUser?.role {
@@ -128,77 +134,25 @@ public struct SettingsView: View {
         connectionStore?.applyProfileDisplayName(trimmedName)
     }
 
-    // MARK: - Connection
+    // MARK: - Connection info
     //
-    // Same endpoint/token/sender knobs that used to live in the header's
-    // ellipsis menu. Folding them in here means there's exactly one
-    // settings surface — the gear — instead of two near-identical entry
-    // points. Only present when SettingsView is given a connectionStore;
-    // the public init (sign-up flow) skips this section because the chat
-    // shell hasn't booted yet.
+    // Build 55 final: the legacy custom-endpoint / gateway-token editor was
+    // removed. There is exactly one user-facing surface for their personal
+    // credential — MyConnectionInfoView — and exactly one place the relay
+    // URL is visible — the About section at the bottom of Settings. There
+    // is no per-user gateway token to edit anymore.
 
-    @ViewBuilder
-    private var connectionSection: some View {
-        if let connectionStore {
-            Section {
-                TextField("wss://relay.thunderai.us", text: $endpointDraft)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                    .font(.callout.monospaced())
-
-                Group {
-                    if isTokenVisible {
-                        TextField("Gateway token", text: $tokenDraft)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .font(.callout.monospaced())
-                    } else {
-                        SecureField("Gateway token", text: $tokenDraft)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                    }
-                }
-
-                Button(isTokenVisible ? "Hide token" : "Show token") {
-                    isTokenVisible.toggle()
-                }
-                .font(.caption.weight(.semibold))
-
-                TextField("Display name", text: $senderDraft)
-                    .textInputAutocapitalization(.words)
-                    .autocorrectionDisabled()
-
-                Button {
-                    isSavingConnection = true
-                    connectionStore.updateConnectionSettings(
-                        endpoint: endpointDraft,
-                        token: tokenDraft,
-                        senderName: senderDraft
-                    )
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        isSavingConnection = false
-                        dismiss()
-                    }
-                } label: {
-                    Label(isSavingConnection ? "Saving..." : "Save & reconnect",
-                          systemImage: isSavingConnection ? "checkmark.circle.fill" : "arrow.triangle.2.circlepath")
-                }
-                .disabled(isSavingConnection)
-
-                if connectionStore.isUsingCustomEndpoint {
-                    Button(role: .destructive) {
-                        connectionStore.resetEndpoint()
-                        endpointDraft = connectionStore.endpointText
-                    } label: {
-                        Label("Reset endpoint to default", systemImage: "arrow.uturn.backward")
-                    }
-                }
-            } header: {
-                Text("Connection")
-            } footer: {
-                Text("Live chat endpoint, token, and the display name other peers see.")
+    private var connectionInfoSection: some View {
+        Section {
+            NavigationLink {
+                MyConnectionInfoView()
+            } label: {
+                Label("My Connection Info", systemImage: "person.crop.circle.badge.questionmark")
             }
+        } header: {
+            Text("Connection")
+        } footer: {
+            Text("View and copy your personal token.")
         }
     }
 
@@ -296,6 +250,68 @@ public struct SettingsView: View {
             Text("Agents")
         } footer: {
             Text("Swipe to remove. The default agent is used when you start a chat.")
+        }
+    }
+
+    // MARK: - About
+    //
+    // Build 55 final: the relay URL is shown EXACTLY here and nowhere else in
+    // the app. Version + build come from the bundle. Copy buttons let support
+    // grab the relay endpoint without anyone hunting for it in the keychain.
+
+    private var aboutSection: some View {
+        Section {
+            HStack {
+                Text("ThunderCommo")
+                Spacer()
+                Text(Self.versionString)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Text("By")
+                Spacer()
+                Text("Boost and Bolt LLC")
+                    .foregroundStyle(.secondary)
+            }
+            RelayURLRow()
+        } header: {
+            Text("About")
+        }
+    }
+
+    private static var versionString: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "—"
+        let build = info?["CFBundleVersion"] as? String ?? "—"
+        return "\(short) (\(build))"
+    }
+}
+
+// MARK: - About: relay URL row
+
+private struct RelayURLRow: View {
+    private static let relayURL = "relay.thunderai.us"
+    @State private var didCopy: Bool = false
+
+    var body: some View {
+        HStack {
+            Text("Relay")
+            Spacer()
+            Text(Self.relayURL)
+                .font(.callout.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Button {
+                UIPasteboard.general.string = Self.relayURL
+                didCopy = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { didCopy = false }
+            } label: {
+                Image(systemName: didCopy ? "checkmark.circle.fill" : "doc.on.doc")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(didCopy ? "Copied" : "Copy relay URL")
         }
     }
 }

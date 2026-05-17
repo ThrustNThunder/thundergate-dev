@@ -1,461 +1,325 @@
 // OnboardingView.swift
 //
-// First-run setup for a new account on this device.
+// Build 55 final: post-signup wizard that runs AFTER SignUpView completes.
+// Three screens, in order:
 //
-// Five steps:
-//   1. Gateway URLs        (defaults: wss://relay.thunderai.us + https://relay.thunderai.us)
-//   2. Gateway token       (paste or scan; we don't validate format)
-//   3. Display name
-//   4. Connect test        (WS handshake AND GET /api/inbox?since=0 must succeed)
-//   5. Done                (saves Account + dismisses)
+//   1. Your Token   — show the user's `tc-h-` session token + copy button +
+//                     banner explaining what to do with it
+//   2. Add Agent    — optional. Generate a `tc-a-` agent token + paste an
+//                     agent session ID. "Skip for now" bails to chat.
+//   3. Done         — momentary "you're all set" pulse before handing back
+//                     to ContentView
 //
-// Multi-device note: this view is reachable both for first-run *and* from a
-// future "Add another account" entry in settings, so it does NOT assume an
-// empty AccountStore.
+// What this file does NOT do:
+//   - No URL fields, no relay-URL display (the relay is shown in Settings →
+//     About only).
+//   - No hardcoded Jon agent token, no hardcoded agent seeding into
+//     AccountStore. The user explicitly opts in by entering a session ID
+//     they got from their own agent.
+//   - No auto-add of a default agent. If the user skips, AccountStore stays
+//     empty until they add one through Settings later.
 
 import SwiftUI
+import UIKit
 
 public struct OnboardingView: View {
 
-    public init(onComplete: @escaping (Account) -> Void = { _ in }) {
-        self.onComplete = onComplete
+    public init(onFinished: @escaping () -> Void) {
+        self.onFinished = onFinished
     }
 
-    private let onComplete: (Account) -> Void
+    private let onFinished: () -> Void
 
-    @State private var step: Step = .gateway
-    @State private var wsURL: String = "wss://relay.thunderai.us"
-    @State private var httpURL: String = "https://relay.thunderai.us"
-    @State private var token: String = ""
-    @State private var displayName: String = ""
-    @State private var testState: TestState = .idle
-    @State private var savedAccount: Account?
-    @State private var notificationsRequested: Bool = false
+    private enum Step: Int { case yourToken, addAgent, done }
 
-    private enum Step: Int, CaseIterable {
-        case gateway, token, name, test, notifications, done
-    }
+    @State private var step: Step = .yourToken
 
-    private enum TestState: Equatable {
-        case idle, running, success, failure(String)
-    }
+    // Add-agent screen state
+    @State private var generatedAgentToken: String?
+    @State private var agentLabel: String = ""
+    @State private var agentSessionID: String = ""
+    @State private var didCopyAgentToken: Bool = false
+    @State private var didCopyHumanToken: Bool = false
+    @State private var isTokenVisible: Bool = false
+    @State private var connectError: String?
 
     public var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
-                header
-                progressBar
-                content
-                Spacer()
-                navButtons
+            VStack {
+                switch step {
+                case .yourToken: yourTokenScreen
+                case .addAgent:  addAgentScreen
+                case .done:      doneScreen
+                }
             }
-            .padding()
-            .navigationTitle("Set up account")
+            .animation(.easeInOut, value: step)
             .navigationBarTitleDisplayMode(.inline)
         }
     }
 
-    // MARK: - layout
+    // MARK: - Screen 1: Your Token
 
-    private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "bolt.fill")
-                .foregroundStyle(.yellow)
-                .font(.title2)
-            Text("ThunderCommo")
-                .font(.title2.bold())
+    private var yourTokenScreen: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header(title: "Your token", subtitle: "This is your personal connection token.")
+
+            tokenCard
+
+            banner("Share this token with your agent in their chat window or TUI interface.")
+
             Spacer()
-        }
-    }
 
-    private var progressBar: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 6) {
-                ForEach(Step.allCases, id: \.rawValue) { s in
-                    Capsule()
-                        .fill(s.rawValue <= step.rawValue ? Color.accentColor : Color.gray.opacity(0.25))
-                        .frame(height: 4)
-                }
-            }
-            HStack {
-                Text("Step \(step.rawValue + 1) of \(Step.allCases.count)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(stepTitle)
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var stepTitle: String {
-        switch step {
-        case .gateway:       return "Gateway"
-        case .token:         return "Token"
-        case .name:          return "Name"
-        case .test:          return "Connect test"
-        case .notifications: return "Notifications"
-        case .done:          return "Done"
-        }
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        switch step {
-        case .gateway:       gatewayStep
-        case .token:         tokenStep
-        case .name:          nameStep
-        case .test:          testStep
-        case .notifications: notificationsStep
-        case .done:          doneStep
-        }
-    }
-
-    // Apple shows the system permission alert once per install; route the
-    // user through a primer first so the prompt arrives expected. Silent push
-    // works without alert permission, but we still want users to opt into
-    // visible alerts so they actually see new messages.
-    private var notificationsStep: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Stay in the loop").font(.headline)
-            Text("ThunderCommo needs notifications to deliver messages when the app is in the background. Without this, you'll only see new messages the next time you open the app.")
-                .font(.subheadline).foregroundStyle(.secondary)
-
-            if notificationsRequested {
-                Label("Notifications configured", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .font(.title3.weight(.semibold))
-            } else {
-                Button {
-                    requestNotifications()
-                } label: {
-                    Label("Enable Notifications", systemImage: "bell.badge.fill")
-                }
-                .buttonStyle(.borderedProminent)
-
-                Text("You can change this later in Settings.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func requestNotifications() {
-        Task {
-            _ = await APNsManager.shared.requestUserAuthorization()
-            notificationsRequested = true
-        }
-    }
-
-    private var gatewayStep: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Gateway URLs").font(.headline)
-            Text("WebSocket and HTTP endpoints for your relay.")
-                .font(.subheadline).foregroundStyle(.secondary)
-
-            Text("WebSocket URL").font(.caption).foregroundStyle(.secondary)
-            TextField("wss://relay.thunderai.us", text: $wsURL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .textFieldStyle(.roundedBorder)
-                .keyboardType(.URL)
-
-            Text("HTTP URL").font(.caption).foregroundStyle(.secondary)
-            TextField("https://relay.thunderai.us", text: $httpURL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .textFieldStyle(.roundedBorder)
-                .keyboardType(.URL)
-        }
-    }
-
-    private var tokenStep: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Gateway token").font(.headline)
-            Text("Paste the token issued by your relay admin.").font(.subheadline).foregroundStyle(.secondary)
-            TextEditor(text: $token)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .frame(minHeight: 100)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.3)))
             Button {
-                if let s = UIPasteboard.general.string {
-                    token = s.trimmingCharacters(in: .whitespacesAndNewlines)
-                }
+                step = .addAgent
             } label: {
-                Label("Paste from clipboard", systemImage: "doc.on.clipboard")
+                Label("Next", systemImage: "arrow.right")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
         }
+        .padding()
     }
 
-    private var nameStep: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Display name").font(.headline)
-            Text("Shown to other users on this account.").font(.subheadline).foregroundStyle(.secondary)
-            TextField("e.g. Alex (iPhone)", text: $displayName)
-                .textFieldStyle(.roundedBorder)
-        }
-    }
-
-    private var testStep: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Connection test").font(.headline)
-            Text("We open a WebSocket and call /api/inbox to confirm the gateway and token are valid.")
-                .font(.subheadline).foregroundStyle(.secondary)
-
+    private var tokenCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
             Group {
-                switch testState {
-                case .idle:
+                if let token = AuthManager.shared.peekToken(), !token.isEmpty {
+                    if isTokenVisible {
+                        Text(token)
+                            .font(.system(.callout, design: .monospaced))
+                            .textSelection(.enabled)
+                    } else {
+                        Text(masked(token))
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("No token on this device yet.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(uiColor: .secondarySystemBackground))
+            )
+
+            if let token = AuthManager.shared.peekToken(), !token.isEmpty {
+                HStack(spacing: 12) {
+                    Button(isTokenVisible ? "Hide" : "Show") {
+                        isTokenVisible.toggle()
+                    }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.bordered)
+
                     Button {
-                        runConnectTest()
+                        UIPasteboard.general.string = token
+                        didCopyHumanToken = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { didCopyHumanToken = false }
                     } label: {
-                        Label("Run connect test", systemImage: "bolt.fill")
+                        Label(didCopyHumanToken ? "Copied" : "Copy Token",
+                              systemImage: didCopyHumanToken ? "checkmark.circle.fill" : "doc.on.doc")
                     }
                     .buttonStyle(.borderedProminent)
-                case .running:
-                    HStack(spacing: 10) {
-                        ProgressView()
-                            .progressViewStyle(.circular)
-                        Text("Connecting…").font(.body)
-                    }
-                case .success:
-                    Label("Connected (WS + inbox OK)", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                        .font(.title3.weight(.semibold))
-                case .failure(let msg):
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label("Connect failed", systemImage: "xmark.octagon.fill")
-                            .foregroundStyle(.red)
-                            .font(.title3.weight(.semibold))
-                        Text(msg)
-                            .font(.callout)
-                            .foregroundStyle(.red)
-                            .padding(8)
-                            .background(Color.red.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        Button {
-                            runConnectTest()
-                        } label: {
-                            Label("Retry", systemImage: "arrow.clockwise")
-                        }
-                        .buttonStyle(.bordered)
-                    }
+                    .disabled(didCopyHumanToken)
                 }
             }
         }
     }
 
-    private var doneStep: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "checkmark.seal.fill")
-                .font(.system(size: 64))
-                .foregroundStyle(.green)
-            Text("All set").font(.title2.bold())
-            if let a = savedAccount {
-                Text("Connected as \(a.name)").foregroundStyle(.secondary)
+    // MARK: - Screen 2: Add Agent
+
+    private var addAgentScreen: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                header(title: "Connect an agent", subtitle: "Optional — you can skip and add one later.")
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Step 1 — Give your agent a token")
+                        .font(.headline)
+
+                    TextField("Agent name (e.g. Jon, Mack, Rex)", text: $agentLabel)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                        .textFieldStyle(.roundedBorder)
+
+                    Button {
+                        generateAgentToken()
+                    } label: {
+                        Label("Generate Agent Token", systemImage: "bolt.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(agentLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    if let token = generatedAgentToken {
+                        agentTokenCard(token: token)
+                        banner("Post this token to your agent.")
+                    }
+                }
+
+                Divider().padding(.vertical, 6)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Step 2 — Connect using their session ID")
+                        .font(.headline)
+
+                    Text("Once your agent has the token, paste the session ID they give you back.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    TextField("Agent session ID", text: $agentSessionID)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.callout.monospaced())
+                        .textFieldStyle(.roundedBorder)
+
+                    if let err = connectError {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+
+                    Button {
+                        connectAgent()
+                    } label: {
+                        Label("Connect", systemImage: "link")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(agentSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || generatedAgentToken == nil)
+                }
+
+                Button("Skip for now") {
+                    step = .done
+                }
+                .buttonStyle(.borderless)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 6)
             }
+            .padding()
         }
-        .frame(maxWidth: .infinity)
     }
 
-    // MARK: - nav
+    private func agentTokenCard(token: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(token)
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color(uiColor: .secondarySystemBackground))
+                )
 
-    private var navButtons: some View {
-        HStack {
-            if step != .gateway && step != .done {
-                Button("Back") { goBack() }
+            Button {
+                UIPasteboard.general.string = token
+                didCopyAgentToken = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { didCopyAgentToken = false }
+            } label: {
+                Label(didCopyAgentToken ? "Copied" : "Copy Token",
+                      systemImage: didCopyAgentToken ? "checkmark.circle.fill" : "doc.on.doc")
             }
+            .buttonStyle(.borderedProminent)
+            .disabled(didCopyAgentToken)
+        }
+    }
+
+    // MARK: - Screen 3: Done
+
+    private var doneScreen: some View {
+        VStack(spacing: 22) {
             Spacer()
-            Button(primaryButtonTitle) { goForward() }
-                .buttonStyle(.borderedProminent)
-                .disabled(!canAdvance)
+            Image(systemName: "checkmark.seal.fill")
+                .font(.system(size: 80))
+                .foregroundStyle(.green)
+            Text("You're all set")
+                .font(.largeTitle.bold())
+            Text("Your chat is empty until you start a conversation.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+            Spacer()
+            Button {
+                onFinished()
+            } label: {
+                Label("Open ThunderCommo", systemImage: "bolt.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
         }
+        .padding()
     }
 
-    private var primaryButtonTitle: String {
-        switch step {
-        case .gateway, .token, .name: return "Next"
-        case .test: return testState == .success ? "Finish" : "Skip"
-        case .notifications: return notificationsRequested ? "Continue" : "Not now"
-        case .done: return "Open ThunderCommo"
+    // MARK: - Shared helpers
+
+    private func header(title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.largeTitle.bold())
+            Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8)
     }
 
-    private var canAdvance: Bool {
-        switch step {
-        case .gateway:
-            return !wsURL.trimmingCharacters(in: .whitespaces).isEmpty
-                && !httpURL.trimmingCharacters(in: .whitespaces).isEmpty
-        case .token:         return !token.trimmingCharacters(in: .whitespaces).isEmpty
-        case .name:          return !displayName.trimmingCharacters(in: .whitespaces).isEmpty
-        case .test:          return testState != .running
-        case .notifications: return true
-        case .done:          return savedAccount != nil
+    private func banner(_ text: String) -> some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.12))
+            )
+    }
+
+    private func masked(_ token: String) -> String {
+        guard token.count > 12 else { return String(repeating: "•", count: max(token.count, 4)) }
+        let head = token.prefix(6)
+        let tail = token.suffix(4)
+        return "\(head)…\(tail)"
+    }
+
+    // MARK: - Actions
+
+    private func generateAgentToken() {
+        let trimmed = agentLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        generatedAgentToken = "tc-a-\(UUID().uuidString.lowercased())"
+        didCopyAgentToken = false
+        connectError = nil
+    }
+
+    private func connectAgent() {
+        connectError = nil
+        let sessionID = agentSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = agentLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sessionID.isEmpty, !name.isEmpty, let token = generatedAgentToken else {
+            connectError = "Generate a token and paste the agent's session ID first."
+            return
         }
-    }
-
-    private func goBack() {
-        if let prev = Step(rawValue: step.rawValue - 1) { step = prev }
-    }
-
-    private func goForward() {
-        switch step {
-        case .gateway, .token, .name:
-            if let next = Step(rawValue: step.rawValue + 1) { step = next }
-        case .test:
-            saveAccount()
-            step = .notifications
-        case .notifications:
-            step = .done
-        case .done:
-            if let a = savedAccount { onComplete(a) }
-        }
-    }
-
-    // MARK: - actions
-
-    private func saveAccount() {
-        let account = Account(
-            name: displayName.trimmingCharacters(in: .whitespaces),
-            wsURL: wsURL.trimmingCharacters(in: .whitespaces),
-            httpURL: httpURL.trimmingCharacters(in: .whitespaces),
-            token: token.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Save the agent into the user's account. The wsURL/httpURL fields are
+        // re-used here to hold the agent session ID — Build 55 doesn't model
+        // a separate "session id" field on AgentConnection yet, and Account-
+        // Store's connection contract still expects URLs in these slots. The
+        // session ID the user pastes is opaque to this view.
+        let connection = AgentConnection(
+            agentName: name,
+            agentEmoji: "⚡",
+            wsURL: sessionID,
+            httpURL: sessionID,
+            kya: nil,
+            isDefault: false
         )
-        AccountStore.shared.add(account, makeCurrent: true)
-        // This onboarding flow takes a paste-in relay token, so there's no
-        // /api/auth/signup response to read expires_at_ms from. Default to 30
-        // days. Once /api/auth/refresh is live the proactive-refresh timer
-        // will roll the token forward well before this lapses; if refresh is
-        // still missing, the user re-onboards rather than silently running on
-        // a 10-year credential the server can never invalidate.
-        let thirtyDaysMs = Int64(Date(timeIntervalSinceNow: 30 * 24 * 3600).timeIntervalSince1970 * 1000)
-        try? AuthManager.shared.setToken(account.token, expiresAtMs: thirtyDaysMs)
-        savedAccount = account
-        // The launch-time APNs token upload short-circuited because no account
-        // existed yet; now that one does, push the device token to the server.
-        APNsManager.shared.retryTokenUploadIfNeeded()
-    }
-
-    private func runConnectTest() {
-        testState = .running
-        let account = Account(
-            name: displayName.isEmpty ? "test" : displayName,
-            wsURL: wsURL.trimmingCharacters(in: .whitespaces),
-            httpURL: httpURL.trimmingCharacters(in: .whitespaces),
-            token: token.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
-        Task.detached { @MainActor in
-            await Self.performConnectTest(account: account) { ok, msg in
-                testState = ok ? .success : .failure(msg ?? "Unknown error")
-            }
-        }
-    }
-
-    @MainActor
-    private static func performConnectTest(
-        account: Account,
-        completion: @escaping (Bool, String?) -> Void
-    ) async {
-        // 1. WS handshake.
-        guard let wsURL = websocketURL(for: account) else {
-            completion(false, "Bad WebSocket URL")
-            return
-        }
-        var wsRequest = URLRequest(url: wsURL)
-        wsRequest.setValue("Bearer \(account.token)", forHTTPHeaderField: "Authorization")
-        let session = URLSession(configuration: .default)
-        let socket = session.webSocketTask(with: wsRequest)
-        socket.resume()
-
-        let wsResult: Bool = await withCheckedContinuation { cont in
-            var resumed = false
-
-            socket.sendPing { error in
-                guard !resumed else { return }
-                resumed = true
-                socket.cancel(with: .goingAway, reason: nil)
-                session.invalidateAndCancel()
-                cont.resume(returning: error == nil)
-            }
-
-            Task {
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-                if !resumed {
-                    resumed = true
-                    socket.cancel(with: .goingAway, reason: nil)
-                    session.invalidateAndCancel()
-                    cont.resume(returning: false)
-                }
-            }
-        }
-        guard wsResult else {
-            completion(false, "WebSocket handshake failed within 8s")
-            return
-        }
-
-        // 2. GET /api/inbox?since=0 → expect 200.
-        guard var comps = URLComponents(string: account.httpURL + "/api/inbox") else {
-            completion(false, "Bad HTTP URL")
-            return
-        }
-        comps.queryItems = [URLQueryItem(name: "since", value: "0")]
-        guard let url = comps.url else {
-            completion(false, "Bad HTTP URL")
-            return
-        }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(account.token)", forHTTPHeaderField: "Authorization")
-        req.timeoutInterval = 8
-        do {
-            let (_, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse else {
-                completion(false, "Inbox check: no HTTP response")
-                return
-            }
-            guard http.statusCode == 200 else {
-                completion(false, "Inbox check returned HTTP \(http.statusCode)")
-                return
-            }
-            completion(true, nil)
-        } catch {
-            completion(false, "Inbox check failed: \(error.localizedDescription)")
-        }
-    }
-
-    private static func websocketURL(for account: Account) -> URL? {
-        var value = account.wsURL
-        if value.hasPrefix("http://") {
-            value = "ws://" + value.dropFirst("http://".count)
-        }
-        if value.hasPrefix("https://") {
-            value = "wss://" + value.dropFirst("https://".count)
-        }
-        if !value.hasSuffix("/ws") {
-            value += "/ws"
-        }
-        return URL(string: value)
-    }
-}
-
-// MARK: - Root gate
-
-public struct OnboardingGate<Content: View>: View {
-    @StateObject private var store = AccountStore.shared
-    @ViewBuilder var content: () -> Content
-
-    public init(@ViewBuilder content: @escaping () -> Content) {
-        self.content = content
-    }
-
-    public var body: some View {
-        if store.hasAnyAccount {
-            content()
-        } else {
-            OnboardingView { _ in
-                // After onboarding, AccountStore is populated and the gate
-                // re-renders into the main app.
-            }
-        }
+        UserStore.shared.addAgent(connection, token: token)
+        step = .done
     }
 }

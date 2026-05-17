@@ -172,6 +172,21 @@ public final class AccountStore: ObservableObject {
         persist()
     }
 
+    // Build 55 final: nuke everything tied to the current session — accounts
+    // list, current pointer, keychain-resident bearer tokens, persisted
+    // UserDefaults blob. Called from sign-out so the next user who lands on
+    // this device starts in a verifiably blank state.
+    public func clearAll() {
+        for account in accounts {
+            _ = deleteTokenKeychain(accountID: account.id)
+        }
+        accounts = []
+        currentID = nil
+        let d = UserDefaults.standard
+        d.removeObject(forKey: Self.accountsKey)
+        d.removeObject(forKey: Self.currentIDKey)
+    }
+
     public func updateDeviceToken(_ token: String, for accountID: String) {
         guard let idx = accounts.firstIndex(where: { $0.id == accountID }) else { return }
         accounts[idx].deviceToken = token

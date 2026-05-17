@@ -165,7 +165,6 @@ public final class UserStore: ObservableObject {
 
     private init() {
         loadFromDisk()
-        seedAdminIfNeeded()
     }
 
     // MARK: Sign-up / Sign-in
@@ -251,10 +250,22 @@ public final class UserStore: ObservableObject {
         return resp.token
     }
 
+    // Build 55 final: sign-out is a full wipe — no bleed between sessions.
+    // Clears the persisted user blob, every agent token in the keychain, the
+    // session bearer in AuthManager, and resets the in-memory flags. The
+    // caller is also responsible for wiping AccountStore and the onboarding
+    // flag (see SettingsView).
     public func signOut() {
+        if let agents = currentUser?.agents {
+            for agent in agents {
+                _ = deleteAgentToken(agentId: agent.id)
+            }
+        }
+        currentUser = nil
         isAuthenticated = false
         lastAuthenticatedAt = nil
         AuthManager.shared.clearToken()
+        UserDefaults.standard.removeObject(forKey: Self.userKey)
     }
 
     /// Bearer token for the signed-in user, if any.
@@ -347,37 +358,6 @@ public final class UserStore: ObservableObject {
         guard let user = currentUser,
               let data = try? JSONEncoder().encode(user) else { return }
         UserDefaults.standard.set(data, forKey: Self.userKey)
-    }
-
-    private func seedAdminIfNeeded() {
-        let alreadySeeded = UserDefaults.standard.bool(forKey: Self.seededFlag)
-        if alreadySeeded || currentUser != nil { return }
-
-        let jonId = UUID()
-        let jon = AgentConnection(
-            id: jonId,
-            agentName: "Jon",
-            agentEmoji: "⚡",
-            wsURL: "wss://thunderai.us",
-            httpURL: "https://thunderai.us",
-            kya: nil,
-            isDefault: true
-        )
-        let admin = UserAccount(
-            email: "thrustnthunder1@gmail.com",
-            displayName: "Michael",
-            role: .admin,
-            biometricsEnabled: true,
-            agents: [jon]
-        )
-        currentUser = admin
-        // Set TC_ADMIN_TOKEN in build scheme environment variables.
-        let adminToken = (Bundle.main.object(forInfoDictionaryKey: "TC_ADMIN_TOKEN") as? String) ?? ""
-        if !adminToken.isEmpty {
-            try? writeAgentToken(adminToken, agentId: jonId)
-        }
-        UserDefaults.standard.set(true, forKey: Self.seededFlag)
-        persist()
     }
 
     // MARK: Validation

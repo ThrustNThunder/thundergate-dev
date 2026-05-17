@@ -1,10 +1,14 @@
 
 import Foundation
 
+// Build 55 final: the federation token and the default channel were both
+// hardcoded here in earlier builds. Both are gone — the relay token now
+// comes from the user's `tc-h-` session (see AuthManager / AccountStore),
+// and a fresh install carries no default channel. Constants that survive
+// are limited to the managed-relay URL (used by Settings → About + the
+// connect path) and the marketing site URL.
 enum ThunderCommConfig {
     static let defaultRelayURL = URL(string: "wss://relay.thunderai.us")!
-    static let defaultChannel = "tnt"
-    static let defaultToken = "jmab-federation-2026"
     static let defaultSender = "Guest"
     static let defaultWebsiteURL = URL(string: "https://thunderai.us")!
 }
@@ -39,7 +43,7 @@ final class ThunderCommWebSocketClient: NSObject {
         print("[ThunderComm] \(message)")
     }
 
-    func connect(endpoint: URL, token: String, peerId: String, channel: String = ThunderCommConfig.defaultChannel) {
+    func connect(endpoint: URL, token: String, peerId: String, channel: String) {
         endpointCandidates = Self.makeEndpointCandidates(from: endpoint)
         debug("connect requested with candidates: \(endpointCandidates.map { $0.absoluteString }.joined(separator: ", "))")
         currentEndpointIndex = 0

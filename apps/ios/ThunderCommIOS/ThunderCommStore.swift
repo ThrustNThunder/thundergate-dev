@@ -110,14 +110,17 @@ import Observation
         }
 
         var routeLabel: String {
+            // Build 55 final: the internal `.tnt` / `.jmab` route IDs survive
+            // as routing identifiers — too much downstream code depends on
+            // them — but the user-facing labels do not. A user on the
+            // default route just sees "Messages"; named channels and direct
+            // chats keep their explicit labels because the user picked them.
             switch currentRoute {
-            case .tnt:
-                return "#tnt"
-            case .jmab:
-                return "#jmab"
+            case .tnt, .jmab:
+                return "Messages"
             case .channel:
                 let channel = selectedChannelName.trimmingCharacters(in: .whitespacesAndNewlines)
-                return channel.isEmpty ? "#channel" : "#\(channel)"
+                return channel.isEmpty ? "Messages" : "#\(channel)"
             case .direct:
                 return "direct: \(ThunderCommParticipantIdentity.displayName(sender: nil, agentId: directAgentId, participantId: directAgentId, senderType: .agent))"
             }
@@ -210,7 +213,10 @@ import Observation
             let trimmedSender = senderName.trimmingCharacters(in: .whitespacesAndNewlines)
 
             self.endpointText = trimmedEndpoint.isEmpty ? ThunderCommConfig.defaultRelayURL.absoluteString : trimmedEndpoint
-            self.token = trimmedToken.isEmpty ? ThunderCommConfig.defaultToken : trimmedToken
+            // Build 55 final: no hardcoded fallback token. Empty stays empty —
+            // the connection layer will refuse to authenticate until the user
+            // supplies a real token (via AccountStore on signup).
+            self.token = trimmedToken
             self.senderName = trimmedSender.isEmpty ? ThunderCommConfig.defaultSender : trimmedSender
 
             UserDefaults.standard.set(self.endpointText, forKey: Self.endpointDefaultsKey)
@@ -1054,7 +1060,9 @@ import Observation
             if let stored = UserDefaults.standard.string(forKey: tokenDefaultsKey), !stored.isEmpty {
                 return stored
             }
-            return ThunderCommConfig.defaultToken
+            // Build 55 final: no hardcoded fallback. A fresh install ships with
+            // no token; the connection layer waits for the user to sign in.
+            return ""
         }
 
         private static func loadSenderName() -> String {

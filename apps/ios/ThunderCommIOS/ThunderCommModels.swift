@@ -157,22 +157,14 @@ enum ThunderCommParticipantIdentity {
     }
 
     private static func mappedDisplayName(for value: String?) -> String? {
+        // Build 55 final: no hardcoded identity table. Title-case the
+        // canonical ID for everyone uniformly. Specific names ("Jon",
+        // "Mack" etc.) used to short-circuit here — they're gone because
+        // the same title-case fallback produces identical output and no
+        // longer pins the app to a specific roster.
         guard let canonical = mappedCanonicalID(for: value) else { return nil }
-        switch canonical {
-        case "jon": return "Jon"
-        case "mack": return "Mack"
-        case "michael": return "Michael"
-        case "alex": return "Alex"
-        case "burt": return "Burt"
-        case "rex": return "Rex"
-        case "sasha": return "Sasha"
-        case "system": return "System"
-        default:
-            // Unknown but stable canonical (e.g. a custom signed-in user).
-            // Title-case it so they show up as a name, not "Human".
-            guard let first = canonical.first else { return nil }
-            return first.uppercased() + canonical.dropFirst()
-        }
+        guard let first = canonical.first else { return nil }
+        return first.uppercased() + canonical.dropFirst()
     }
 
     private static func normalizedToken(_ value: String?) -> String? {

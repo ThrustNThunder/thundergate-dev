@@ -13,6 +13,13 @@ struct ContentView: View {
     @State private var showingAddChannel = false
     @State private var headerCollapsed = true
 
+    // Build 55 final: the post-signup wizard (Your Token → Add Agent) runs as
+    // a fullScreenCover the first time we land here after a fresh signup.
+    // `OnboardingFlag.reset()` is called by SignUpView.advanceFromProfile when
+    // the new tc-h- token is minted, which arms this cover; the wizard's
+    // onFinished sets the flag and dismisses.
+    @State private var showingPostSignupWizard: Bool = !OnboardingFlag.isCompleted
+
     var body: some View {
         ZStack {
             Color(uiColor: .systemGroupedBackground)
@@ -88,6 +95,12 @@ struct ContentView: View {
         .sheet(isPresented: $showingAddChannel) {
             AddChannelView(connectionStore: store)
         }
+        .fullScreenCover(isPresented: $showingPostSignupWizard) {
+            OnboardingView {
+                OnboardingFlag.markCompleted()
+                showingPostSignupWizard = false
+            }
+        }
         .sheet(isPresented: $showingOnlinePeers) {
             NavigationStack {
                 List {
@@ -131,16 +144,10 @@ struct ContentView: View {
     }
 
     private var emptyStateLabel: String {
-        switch store.currentRoute {
-        case .tnt:
-            return "Messages for #tnt and direct chats will appear here."
-        case .jmab:
-            return "JMAB messages will appear here."
-        case .channel:
-            return "Messages for \(store.routeLabel) will appear here."
-        case .direct:
-            return "Direct replies share the main thread and route to \(store.routeLabel)."
-        }
+        // Build 55 final: no hardcoded channel/route copy. Single generic
+        // empty-state string, regardless of route — the chat is intentionally
+        // blank until the user adds channels or agents themselves.
+        "Messages will appear here."
     }
 
     private var header: some View {
@@ -254,23 +261,24 @@ struct ContentView: View {
 
     private var routeMenu: some View {
         Menu {
-            Section("Channels") {
-                Button("#tnt") {
-                    store.setRoute(.tnt)
-                }
-                Button("#jmab") {
-                    store.setRoute(.jmab)
-                }
-                ForEach(store.customChannels, id: \.self) { channel in
-                    Button("#\(channel)") {
-                        store.setRoute(.channel, channelName: channel)
+            // Build 55 final: no hardcoded #tnt / #jmab seed entries. The
+            // user creates channels via the "+" button and direct chats
+            // appear here only when they've added an agent.
+            if !store.customChannels.isEmpty {
+                Section("Channels") {
+                    ForEach(store.customChannels, id: \.self) { channel in
+                        Button("#\(channel)") {
+                            store.setRoute(.channel, channelName: channel)
+                        }
                     }
                 }
             }
-            Section("Direct") {
-                ForEach(store.availableDirectAgents, id: \.self) { agentId in
-                    Button("@\(store.displayName(forParticipantID: agentId))") {
-                        store.setRoute(.direct, agentId: agentId)
+            if !store.availableDirectAgents.isEmpty {
+                Section("Direct") {
+                    ForEach(store.availableDirectAgents, id: \.self) { agentId in
+                        Button("@\(store.displayName(forParticipantID: agentId))") {
+                            store.setRoute(.direct, agentId: agentId)
+                        }
                     }
                 }
             }
