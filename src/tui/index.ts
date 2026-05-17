@@ -198,7 +198,7 @@ function makeChatHost(screen: blessed.Widgets.Screen, _opts: TuiOptions): ChatHo
     tags: true,
     scrollable: true,
     alwaysScroll: true,
-    mouse: true,
+    mouse: false,
     keys: true,
     scrollbar: { ch: '│', style: { bg: 'cyan' } },
     style: { fg: 'white' }
@@ -212,7 +212,7 @@ function makeChatHost(screen: blessed.Widgets.Screen, _opts: TuiOptions): ChatHo
     height: 3,
     inputOnFocus: true,
     keys: true,
-    mouse: true,
+    mouse: false,
     border: { type: 'line' },
     style: {
       border: { fg: 'gray' },
@@ -346,7 +346,7 @@ function installSlashPopup(
     label: ' slash commands ',
     tags: true,
     keys: false,
-    mouse: true,
+    mouse: false,
     interactive: true,
     style: {
       border: { fg: 'yellow' },
@@ -873,7 +873,7 @@ function makeBrowserHost(screen: blessed.Widgets.Screen, _opts: TuiOptions): Bro
     tags: true,
     scrollable: true,
     alwaysScroll: true,
-    mouse: true,
+    mouse: false,
     keys: true,
     scrollbar: { ch: '│', style: { bg: 'magenta' } },
     style: { fg: 'white' }
