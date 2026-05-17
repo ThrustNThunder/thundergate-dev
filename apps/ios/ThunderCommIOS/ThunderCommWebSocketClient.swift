@@ -350,7 +350,7 @@ final class ThunderCommWebSocketClient: NSObject {
             self.scheduleReconnect(because: "auth timeout", for: epoch)
         }
         authTimeoutWorkItem = workItem
-        DispatchQueue.global().asyncAfter(deadline: .now() + 12, execute: workItem)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: workItem)
     }
 
     private func scheduleNextPing(after delay: TimeInterval, for epoch: Int) {

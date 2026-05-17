@@ -32,6 +32,7 @@ public struct AddAgentView: View {
     @State private var isVerifying = false
     @State private var fetchedKYA: KYAIdentity?
     @State private var verifyError: String?
+    @State private var isTokenVisible = false
 
     public var onAdded: ((AgentConnection) -> Void)?
 
@@ -160,8 +161,29 @@ public struct AddAgentView: View {
                     .disableAutocorrection(true)
             }
             Section("Token") {
-                SecureField("Bearer token", text: $token)
+                HStack {
+                    Group {
+                        if isTokenVisible {
+                            TextField("Bearer token", text: $token)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .font(.callout.monospaced())
+                        } else {
+                            SecureField("Bearer token", text: $token)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
+                    }
                     .textContentType(.password)
+                    Button {
+                        isTokenVisible.toggle()
+                    } label: {
+                        Image(systemName: isTokenVisible ? "eye.slash.fill" : "eye.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isTokenVisible ? "Hide token" : "Show token")
+                }
                 Text("Manual entry is the fallback. ThunderCommo still runs KYA verification before it saves this BYOAA connection.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -241,7 +263,7 @@ public struct AddAgentView: View {
 
         var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.timeoutInterval = 12
+        req.timeoutInterval = 30
 
         Task {
             do {

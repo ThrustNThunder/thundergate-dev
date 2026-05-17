@@ -380,7 +380,7 @@ public struct OnboardingView: View {
             }
 
             Task {
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
                 if !resumed {
                     resumed = true
                     socket.cancel(with: .goingAway, reason: nil)
@@ -390,7 +390,7 @@ public struct OnboardingView: View {
             }
         }
         guard wsResult else {
-            completion(false, "WebSocket handshake failed within 8s")
+            completion(false, "WebSocket handshake failed within 30s")
             return
         }
 
@@ -406,7 +406,7 @@ public struct OnboardingView: View {
         }
         var req = URLRequest(url: url)
         req.setValue("Bearer \(account.token)", forHTTPHeaderField: "Authorization")
-        req.timeoutInterval = 8
+        req.timeoutInterval = 30
         do {
             let (_, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse else {
