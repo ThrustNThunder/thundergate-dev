@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS untrain_log (
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, timestamp);
-CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id, session_id);
+-- idx_messages_agent created post-migration in initialize() after addColumnIfMissing
 CREATE INDEX IF NOT EXISTS idx_context_key ON context(key);
 CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
 CREATE INDEX IF NOT EXISTS idx_memory_category ON memory(category);
