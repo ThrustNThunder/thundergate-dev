@@ -47,7 +47,7 @@ export interface TuiOptions {
 export async function launchTui(opts: TuiOptions): Promise<void> {
   const screen = blessed.screen({
     smartCSR: true,
-    title: 'ThunderTUI',
+    title: 'ThunderGate TUI',
     fullUnicode: true,
     autoPadding: true,
     mouse: false,
@@ -320,7 +320,7 @@ function makeChatHost(screen: blessed.Widgets.Screen): ChatHost {
 }
 
 function printCopyBanner(host: ChatHost): void {
-  host.history.add('{gray-fg}─── ThunderTUI ─── Hold Option + drag to select text  │  /help for commands ───{/gray-fg}');
+  host.history.add('{gray-fg}─── ThunderGate ─── Hold Option + drag to select text  │  /help for commands ───{/gray-fg}');
   host.screen.render();
 }
 
