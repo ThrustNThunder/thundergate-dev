@@ -35,7 +35,7 @@ const BROWSER_REFRESH_MS = 3000;
 const STATUS_REFRESH_MS = 3000;
 const SURFACE_ATTACH_PORT = 8772;
 const BRIDGE_URL = 'ws://localhost:8765';
-const SESSION_KEY = 'agent:main:thundercomm:main';
+const SESSION_KEY = 'agent:main:thundergate:main';
 const TOOL_OUTPUT_MAX_CHARS = 4000;
 
 export interface TuiOptions {
