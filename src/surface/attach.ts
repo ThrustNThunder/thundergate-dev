@@ -52,6 +52,8 @@ export interface SurfaceContext {
   getSessionId(): string | null;
   /** Model name to stamp on responses so the TUI status line is honest. */
   getModel(): string;
+  /** Agent id stamped on outbound envelopes (multi-agent routing key). */
+  getAgentId(): string;
   /**
    * Process one inbound through the runtime's full surface pipeline:
    * TTL gating, persistence, compaction, cache hint, inference,
@@ -313,7 +315,7 @@ export class SurfaceAttach {
           };
           safeSend(ws, env);
         },
-        onThinking: () => safeSend(ws, { type: 'thinking', agentId: 'jon' })
+        onThinking: () => safeSend(ws, { type: 'thinking', agentId: this.ctx.getAgentId() })
       });
       if (!result.text) {
         safeSend(ws, {
@@ -328,7 +330,7 @@ export class SurfaceAttach {
         type: 'message',
         id: randomUUID(),
         sender: 'Jon',
-        agentId: 'jon',
+        agentId: this.ctx.getAgentId(),
         channel: SURFACE_CHANNEL_ID,
         text: result.text,
         timestamp: Date.now(),

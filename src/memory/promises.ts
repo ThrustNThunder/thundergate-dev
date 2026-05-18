@@ -205,11 +205,19 @@ export class PromiseTracker {
   private lastInboundAt: number | null = null;
   private gapThresholdMs: number;
   private wal: MemoryWAL | null;
+  // Identity of the agent this tracker is serving. Used both to stamp
+  // outbound rows and to recognize the agent's own sender id when
+  // close-detection sees a self-reference.
+  private agentId: string;
 
-  constructor(db: SessionDB, opts?: { gapThresholdMs?: number; wal?: MemoryWAL }) {
+  constructor(
+    db: SessionDB,
+    opts?: { gapThresholdMs?: number; wal?: MemoryWAL; agentId?: string }
+  ) {
     this.db = db;
     this.gapThresholdMs = opts?.gapThresholdMs ?? 4 * 60 * 60 * 1000;
     this.wal = opts?.wal ?? null;
+    this.agentId = opts?.agentId ?? 'jon';
   }
 
   /**
@@ -265,6 +273,7 @@ export class PromiseTracker {
       this.wal?.append({
         type: 'promise_extracted',
         sessionId: opts.sessionId ?? null,
+        agentId: this.agentId,
         payload: {
           promiseId: id,
           text: phrase,
@@ -275,6 +284,7 @@ export class PromiseTracker {
       this.db.insertPromise({
         id,
         sessionId: opts.sessionId ?? null,
+        agentId: this.agentId,
         channel: opts.channel ?? null,
         text: phrase
       });
@@ -293,18 +303,20 @@ export class PromiseTracker {
    */
   onInbound(opts: {
     text: string;
-    sender: 'jon' | 'michael' | string;
+    sender: string;
     now?: number;
   }): { surface: PromiseRow[]; closed: PromiseRow[] } {
     const now = opts.now ?? Date.now();
     const gapMs = this.lastInboundAt === null ? 0 : now - this.lastInboundAt;
     this.lastInboundAt = now;
 
-    // Close-detection. Only run for jon/michael — the brief is explicit
-    // that a *user* must reference the promise as done.
+    // Close-detection. Only run for the configured agent or the human user
+    // ('michael') — the brief is explicit that a *user* must reference the
+    // promise as done. Other senders (other agents on the same bus, system
+    // messages) are skipped.
     let closed: PromiseRow[] = [];
     const senderLower = (opts.sender || '').toLowerCase();
-    if (senderLower === 'jon' || senderLower === 'michael') {
+    if (senderLower === this.agentId.toLowerCase() || senderLower === 'michael') {
       closed = this.closeMatchingPromises(opts.text, senderLower);
     }
 
@@ -317,7 +329,7 @@ export class PromiseTracker {
 
   /** Always returns the open promise list. CLI + heartbeat call this. */
   surfaceOpen(limit: number = 20): PromiseRow[] {
-    return this.db.getOpenPromises(limit);
+    return this.db.getOpenPromises(limit, this.agentId);
   }
 
   /** Render the surface list as a single line for prepending to a response. */
@@ -347,7 +359,7 @@ export class PromiseTracker {
     const inboundTokens = tokenize(inbound);
     if (inboundTokens.size === 0) return [];
 
-    const open = this.db.getOpenPromises(50);
+    const open = this.db.getOpenPromises(50, this.agentId);
     const closed: PromiseRow[] = [];
     for (const p of open) {
       const pTokens = tokenize(p.text);
@@ -364,7 +376,7 @@ export class PromiseTracker {
 
   /** Doctor uses this for the count line. */
   countOpen(): number {
-    return this.db.getOpenPromises(1000).length;
+    return this.db.getOpenPromises(1000, this.agentId).length;
   }
 }
 

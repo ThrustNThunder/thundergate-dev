@@ -35,7 +35,10 @@ const BROWSER_REFRESH_MS = 3000;
 const STATUS_REFRESH_MS = 3000;
 const SURFACE_ATTACH_PORT = 8772;
 const BRIDGE_URL = 'ws://localhost:8765';
-const SESSION_KEY = 'agent:main:thundergate:main';
+// Display label for the TUI status bar. Multi-agent installs override the
+// trailing namespace via THUNDERGATE_AGENT_ID; defaults to the historical
+// single-agent value for backward compatibility.
+const SESSION_KEY = `agent:main:thundergate:${process.env.THUNDERGATE_AGENT_ID || 'main'}`;
 const TOOL_OUTPUT_MAX_CHARS = 4000;
 
 export interface TuiOptions {

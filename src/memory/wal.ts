@@ -42,6 +42,7 @@ export interface WALRow {
   created_at: number;
   type: WALEventType;
   session_id: string | null;
+  agent_id: string;
   payload: string;
   replayed: number;
   checksum: string;
@@ -50,6 +51,7 @@ export interface WALRow {
 export interface WALAppendInput {
   type: WALEventType;
   sessionId?: string | null;
+  agentId?: string;
   payload: Record<string, unknown>;
 }
 
@@ -108,9 +110,16 @@ export class MemoryWAL {
     const createdAt = Date.now();
     try {
       const info = this.db.raw().prepare(`
-        INSERT INTO memory_wal (created_at, type, session_id, payload, replayed, checksum)
-        VALUES (?, ?, ?, ?, 0, ?)
-      `).run(createdAt, input.type, input.sessionId ?? null, payloadStr, checksum);
+        INSERT INTO memory_wal (created_at, type, session_id, agent_id, payload, replayed, checksum)
+        VALUES (?, ?, ?, ?, ?, 0, ?)
+      `).run(
+        createdAt,
+        input.type,
+        input.sessionId ?? null,
+        input.agentId ?? 'jon',
+        payloadStr,
+        checksum
+      );
       return info.lastInsertRowid as number;
     } catch (err) {
       console.warn(`  ⚠ WAL append (${input.type}) failed:`, (err as Error).message);

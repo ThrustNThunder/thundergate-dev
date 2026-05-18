@@ -167,7 +167,9 @@ export class VaultProtocol {
   async requestAccess(opts: RequestAccessOptions): Promise<RequestAccessResult> {
     const channel = opts.channel.trim();
     if (!channel) throw new Error('channel required for vault.requestAccess');
-    const agent_id = opts.agent_id ?? `jon:${channel}`;
+    const agent_id =
+      opts.agent_id ??
+      `${process.env.THUNDERGATE_AGENT_ID || 'jon'}:${channel}`;
     const user = opts.user ?? process.env.USER ?? 'jon';
     const disclosure_mode: DisclosureMode = opts.disclosure_mode ?? 'raw';
     const grant_ttl_ms = opts.grant_ttl_ms ?? 60_000;

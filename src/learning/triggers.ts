@@ -49,11 +49,13 @@ export class TriggerEngine {
   // burn in immediately, not be coalesced).
   private monotonicSeq: number = 0;
   private wal: MemoryWAL | null;
+  private agentId: string;
 
-  constructor(db: SessionDB, backstopInterval: number = 20, wal?: MemoryWAL) {
+  constructor(db: SessionDB, backstopInterval: number = 20, wal?: MemoryWAL, agentId: string = 'jon') {
     this.db = db;
     this.backstopInterval = backstopInterval;
     this.wal = wal ?? null;
+    this.agentId = agentId;
     // Seed the 'current' sessions row up-front. storeMessage() writes
     // every turn with session_id='current', and messages.session_id FKs
     // to sessions(id) — without this, every turn throws FOREIGN KEY
@@ -74,6 +76,7 @@ export class TriggerEngine {
     // Store messages
     this.db.storeMessage({
       sessionId: 'current',
+      agentId: this.agentId,
       channel: 'internal',
       role: 'user',
       content: userMessage
@@ -81,6 +84,7 @@ export class TriggerEngine {
 
     this.db.storeMessage({
       sessionId: 'current',
+      agentId: this.agentId,
       channel: 'internal',
       role: 'assistant',
       content: assistantResponse
@@ -186,10 +190,12 @@ export class TriggerEngine {
     const key = this.uniqueKey('correction');
     this.wal?.append({
       type: 'correction',
+      agentId: this.agentId,
       payload: { key, correction, importance: 'critical', source: 'michael' }
     });
     this.db.storeMemory({
       key,
+      agentId: this.agentId,
       value: correction,
       category: 'corrections',
       importance: 'critical',
@@ -210,6 +216,7 @@ export class TriggerEngine {
   private async handleFailure(error: string, context?: string): Promise<void> {
     this.db.storeMemory({
       key: this.uniqueKey('failure'),
+      agentId: this.agentId,
       value: `Error: ${error}${context ? `\nContext: ${context}` : ''}`,
       category: 'failures',
       importance: 'high',
@@ -230,7 +237,7 @@ export class TriggerEngine {
    * recent match shares ≥ 2 keywords, we update it; otherwise we create.
    */
   private async handleTaskComplete(context?: string): Promise<{ created: number; updated: number }> {
-    const messages = this.db.getRecentMessages(30);
+    const messages = this.db.getRecentMessages(30, this.agentId);
     if (messages.length < 5) return { created: 0, updated: 0 };
 
     const assistantMessages = messages.filter((m) => m.role === 'assistant');
@@ -256,13 +263,14 @@ export class TriggerEngine {
     if (best) {
       // Update path: append the new pattern under a separator so the
       // skill's prior content is preserved and the history is readable.
-      const existing = this.db.getSkill(best.name);
+      const existing = this.db.getSkill(best.name, this.agentId);
       const stamp = new Date().toISOString();
       const appended =
         (existing?.content ?? '') +
         `\n\n---\nUpdate ${stamp}:\n${context}`;
       this.db.storeSkill({
         name: best.name,
+        agentId: this.agentId,
         content: appended,
         category: existing?.category ?? 'task_patterns',
         source: 'agent'
@@ -275,6 +283,7 @@ export class TriggerEngine {
     const skillName = this.uniqueKey('task');
     this.db.storeSkill({
       name: skillName,
+      agentId: this.agentId,
       content: `Task pattern learned:\n${context}`,
       category: 'task_patterns',
       source: 'agent'
@@ -298,7 +307,7 @@ export class TriggerEngine {
     void MEMORY_REVIEW_PROMPT;
     void SKILL_REVIEW_PROMPT;
 
-    const messages = this.db.getRecentMessages(100);
+    const messages = this.db.getRecentMessages(100, this.agentId);
     let memories = 0;
     const skills = 0;
 
@@ -331,10 +340,12 @@ export class TriggerEngine {
           const key = `preference_${this.uniqueKey('pref')}_${memories}`;
           this.wal?.append({
             type: 'learning_extracted',
+            agentId: this.agentId,
             payload: { kind: 'memory', key, category: 'preferences', value: msg.content, status: 'provisional' }
           });
           this.db.storeMemory({
             key,
+            agentId: this.agentId,
             value: msg.content,
             category: 'preferences',
             importance: 'normal',
@@ -354,10 +365,12 @@ export class TriggerEngine {
           const key = `fact_${this.uniqueKey('fact')}_${memories}`;
           this.wal?.append({
             type: 'learning_extracted',
+            agentId: this.agentId,
             payload: { kind: 'memory', key, category: 'facts', value: msg.content, status: 'provisional' }
           });
           this.db.storeMemory({
             key,
+            agentId: this.agentId,
             value: msg.content,
             category: 'facts',
             importance: 'normal',
@@ -391,7 +404,7 @@ export class TriggerEngine {
    */
   private async handleBackstop(): Promise<{ memories: number }> {
     // Just a light pass — look for anything obvious
-    const recentMessages = this.db.getRecentMessages(20);
+    const recentMessages = this.db.getRecentMessages(20, this.agentId);
     let memories = 0;
 
     // Look for corrections in recent messages
@@ -402,6 +415,7 @@ export class TriggerEngine {
         if (pattern.test(msg.content)) {
           this.db.storeMemory({
             key: `correction_pattern_${Date.now()}`,
+            agentId: this.agentId,
             value: msg.content,
             category: 'corrections',
             importance: 'high',

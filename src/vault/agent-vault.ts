@@ -27,6 +27,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
   chmodSync
 } from 'fs';
@@ -82,6 +83,25 @@ interface UnlockedSession {
   ttlMs: number;
 }
 
+/**
+ * One-shot rename of the pre-multi-agent agent-vault files into their
+ * agent-suffixed counterparts. Idempotent; runs only for agentId='jon'.
+ */
+function migrateLegacyAgentVaultPaths(home: string, suffixedDb: string, suffixedSalt: string): void {
+  const legacyDb = join(home, '.thundergate', 'agent-vault.db');
+  const legacySalt = join(home, '.thundergate', 'agent-vault.salt');
+  try {
+    if (existsSync(legacyDb) && !existsSync(suffixedDb)) {
+      renameSync(legacyDb, suffixedDb);
+    }
+    if (existsSync(legacySalt) && !existsSync(suffixedSalt)) {
+      renameSync(legacySalt, suffixedSalt);
+    }
+  } catch {
+    /* best-effort migration; failure leaves both files in place */
+  }
+}
+
 export class AgentVault {
   private db!: Db;
   private salt!: Buffer;
@@ -89,10 +109,17 @@ export class AgentVault {
   private readonly dbPath: string;
   private readonly saltPath: string;
 
-  constructor(options: { dbPath?: string; saltPath?: string } = {}) {
+  constructor(options: { dbPath?: string; saltPath?: string; agentId?: string } = {}) {
     const home = os.homedir();
-    this.dbPath = options.dbPath ?? join(home, '.thundergate', 'agent-vault.db');
-    this.saltPath = options.saltPath ?? join(home, '.thundergate', 'agent-vault.salt');
+    const agentId = options.agentId ?? 'jon';
+    this.dbPath = options.dbPath ?? join(home, '.thundergate', `agent-vault-${agentId}.db`);
+    this.saltPath = options.saltPath ?? join(home, '.thundergate', `agent-vault-${agentId}.salt`);
+    // Backward-compatible migration: rename the legacy single-agent files
+    // (~/.thundergate/agent-vault.{db,salt}) into the agent-suffixed slots
+    // on first boot, but only for agentId='jon'. Idempotent.
+    if (agentId === 'jon' && !options.dbPath && !options.saltPath) {
+      migrateLegacyAgentVaultPaths(home, this.dbPath, this.saltPath);
+    }
   }
 
   initialize(): void {

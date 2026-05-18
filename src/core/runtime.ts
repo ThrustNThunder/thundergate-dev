@@ -76,6 +76,12 @@ interface RuntimeState {
 
 export class ThunderGateRuntime {
   private config: Config;
+  // Identity of the agent running on this runtime instance. Threaded into
+  // every DB query, vault path, identity load, and outbound metadata so
+  // multiple agents can coexist on the same ThunderGate install without
+  // cross-agent leakage. Resolution order: THUNDERGATE_AGENT_ID env var,
+  // then config.runtime.agentId, then 'jon' (backward compatible).
+  private agentId: string;
   private db!: SessionDB;
   private checkpoint!: CheckpointData;
   private learning!: TriggerEngine;
@@ -138,6 +144,7 @@ export class ThunderGateRuntime {
     // Phase 3: ensureConfig writes the default config.json on first run
     // and then loads it. configPath override still honored for tests.
     this.config = configPath ? loadConfig(configPath) : ensureConfig();
+    this.agentId = resolveAgentId(this.config);
     this.channels = new ChannelRegistry();
     this.world = new WorldState();
     this.state = {
@@ -154,6 +161,11 @@ export class ThunderGateRuntime {
   /** Awareness substrate — read by Doctor + the message path. */
   getWorldState(): WorldState {
     return this.world;
+  }
+
+  /** Identity of the agent running on this runtime instance. */
+  getAgentId(): string {
+    return this.agentId;
   }
 
   getLocalInference(): LocalInferenceProvider | undefined {
@@ -237,7 +249,7 @@ export class ThunderGateRuntime {
     try {
       const grant = await this.vault.issueGrant({
         user: 'system',
-        agent_id: 'jon',
+        agent_id: this.agentId,
         channel: 'emergency-protocol',
         purpose: `emergency_protocol_read(${label})`,
         field_label: label,
@@ -292,7 +304,7 @@ export class ThunderGateRuntime {
    * 4. Begin message loop
    */
   async start(): Promise<void> {
-    console.log('⚡ ThunderGate starting...');
+    console.log(`⚡ ThunderGate starting... (agent=${this.agentId})`);
 
     // Initialize session database
     this.db = new SessionDB(this.config.database.path);
@@ -321,7 +333,7 @@ export class ThunderGateRuntime {
     // initialize is non-fatal — vault features just won't be available
     // until the next restart.
     try {
-      this.vault = new VaultService(this.provenance);
+      this.vault = new VaultService(this.provenance, { agentId: this.agentId });
       this.vault.initialize();
       this.vaultProtocol = new VaultProtocol(this.vault, this.world, this.provenance);
       console.log('  ✓ Vault initialized (locked)');
@@ -336,7 +348,7 @@ export class ThunderGateRuntime {
     // below) can reach the unlocked handle without threading the
     // runtime through every adapter.
     try {
-      this.agentVault = new AgentVault();
+      this.agentVault = new AgentVault({ agentId: this.agentId });
       this.agentVault.initialize();
       setSharedAgentVault(this.agentVault);
       console.log('  ✓ Vault A (agent credentials) initialized (locked)');
@@ -390,6 +402,7 @@ export class ThunderGateRuntime {
         provenance: this.provenance,
         getSessionId: () => this.state.sessionId ?? null,
         getModel: () => this.config.runtime.model,
+        getAgentId: () => this.agentId,
         processSurfaceMessage: (text, hooks) => this.processSurfaceMessage(text, hooks),
         resetSessionNow: () => this.resetSessionNow(),
         getContextSnapshot: () => this.getContextStatus()
@@ -449,14 +462,14 @@ export class ThunderGateRuntime {
     // already exist (constructed above) so UntrainService can append.
     // WAL is passed in so each subsystem can write its intent row
     // BEFORE the canonical table mutation it performs.
-    this.promises = new PromiseTracker(this.db, { wal: this.wal });
-    this.frames = new FrameManager(this.db, { wal: this.wal });
-    this.untrain = new UntrainService(this.db, this.provenance, { wal: this.wal });
-    this.provisional = new ProvisionalMemoryService(this.db);
+    this.promises = new PromiseTracker(this.db, { wal: this.wal, agentId: this.agentId });
+    this.frames = new FrameManager(this.db, { wal: this.wal, agentId: this.agentId });
+    this.untrain = new UntrainService(this.db, this.provenance, { wal: this.wal, agentId: this.agentId });
+    this.provisional = new ProvisionalMemoryService(this.db, this.agentId);
 
     // Learning trigger engine. Constructed after WAL so correction +
     // learning_extracted events get durably logged on capture.
-    this.learning = new TriggerEngine(this.db, this.config.learning.backstopTurns, this.wal);
+    this.learning = new TriggerEngine(this.db, this.config.learning.backstopTurns, this.wal, this.agentId);
     console.log('  ✓ Learning loop ready');
 
     // Hydrate the most recent ACTIVE/PAUSED frame so the conversation
@@ -475,6 +488,7 @@ export class ThunderGateRuntime {
         config: this.config,
         db: this.db,
         contextFile: this.config.runtime.context_file,
+        agentId: this.agentId,
         onInbound: (entry) => this.handleChannelInbound(entry)
       }));
     }
@@ -495,6 +509,7 @@ export class ThunderGateRuntime {
           config: this.config,
           db: this.db,
           contextFile: this.config.runtime.context_file,
+          agentId: this.agentId,
           onInbound: (entry) => this.handleChannelInbound(entry)
         },
         opts
@@ -538,7 +553,7 @@ export class ThunderGateRuntime {
     // restarting after editing the source files. Failure is non-fatal —
     // missing files just mean a shorter prompt.
     try {
-      const id = loadIdentity();
+      const id = loadIdentity(new Date(), this.agentId);
       this.state.systemPrompt = id.systemPrompt;
       console.log(`  ✓ Identity loaded (${summarizeIdentity(id)})`);
       this.provenance.append({
@@ -582,6 +597,7 @@ export class ThunderGateRuntime {
     this.wal.append({
       type: 'inbound_message',
       sessionId: this.state.sessionId || null,
+      agentId: this.agentId,
       payload: {
         messageId: entry.id,
         channel: channelId,
@@ -601,7 +617,8 @@ export class ThunderGateRuntime {
       this.state.sessionId,
       channelId,
       'user',
-      entry.text
+      entry.text,
+      this.agentId
     );
 
     // ── Emergency Protocol short-circuit ────────────────────────────────
@@ -614,7 +631,7 @@ export class ThunderGateRuntime {
         const replyText = redactSecrets(ev.reply);
         const delivery: OutboundDelivery = {
           id: newMessageId(),
-          agentId: 'jon',
+          agentId: this.agentId,
           sender: 'Jon',
           channel: channelId,
           text: replyText,
@@ -624,6 +641,7 @@ export class ThunderGateRuntime {
         this.wal.append({
           type: 'outbound_message',
           sessionId: this.state.sessionId || null,
+          agentId: this.agentId,
           payload: {
             messageId: delivery.id,
             inboundMessageId: entry.id,
@@ -641,7 +659,8 @@ export class ThunderGateRuntime {
           this.state.sessionId,
           channelId,
           'assistant',
-          replyText
+          replyText,
+          this.agentId
         );
         this.channels.broadcast(delivery);
         // For activate/challenge/deactivate we short-circuit. Failed
@@ -667,7 +686,7 @@ export class ThunderGateRuntime {
         const replyText = this.vaultProtocol.formatOutcome(result);
         const delivery: OutboundDelivery = {
           id: newMessageId(),
-          agentId: 'jon',
+          agentId: this.agentId,
           sender: 'Jon',
           channel: channelId,
           text: replyText,
@@ -680,6 +699,7 @@ export class ThunderGateRuntime {
         this.wal.append({
           type: 'outbound_message',
           sessionId: this.state.sessionId || null,
+          agentId: this.agentId,
           payload: {
             messageId: delivery.id,
             inboundMessageId: entry.id,
@@ -697,7 +717,8 @@ export class ThunderGateRuntime {
           this.state.sessionId,
           channelId,
           'assistant',
-          replyText
+          replyText,
+          this.agentId
         );
         this.channels.broadcast(delivery);
         return;
@@ -745,8 +766,8 @@ export class ThunderGateRuntime {
     let untrainLine = '';
     try {
       if (detectUntrainTrigger(entry.text)) {
-        const actor: 'jon' | 'michael' =
-          (entry.sender || '').toLowerCase() === 'michael' ? 'michael' : 'jon';
+        const actor: string =
+          (entry.sender || '').toLowerCase() === 'michael' ? 'michael' : this.agentId;
         const confirm = this.untrain.conversationalUntrain({ actor });
         if (confirm) {
           untrainLine = confirm;
@@ -797,7 +818,7 @@ export class ThunderGateRuntime {
 
     const delivery: OutboundDelivery = {
       id: newMessageId(),
-      agentId: 'jon',
+      agentId: this.agentId,
       sender: 'Jon',
       channel: channelId,
       text: composedText,
@@ -812,6 +833,7 @@ export class ThunderGateRuntime {
     this.wal.append({
       type: 'outbound_message',
       sessionId: this.state.sessionId || null,
+      agentId: this.agentId,
       payload: {
         messageId: delivery.id,
         inboundMessageId: entry.id,
@@ -829,7 +851,8 @@ export class ThunderGateRuntime {
       this.state.sessionId,
       channelId,
       'assistant',
-      composedText
+      composedText,
+      this.agentId
     );
 
     this.channels.broadcast(delivery);
@@ -1367,9 +1390,9 @@ export class ThunderGateRuntime {
     messages: Array<{ role: string; content: string }>,
     opts?: { cacheHint?: import('../context/manager.js').CacheControlHint }
   ): Promise<string> {
-    const model = this.config.ghost.model;
-    const maxTokens = this.config.ghost.maxTokens;
-    const temperature = this.config.ghost.temperature;
+    const model = this.config.runtime.model;
+    const maxTokens = this.config.runtime.maxTokens ?? 512;
+    const temperature = this.config.runtime.temperature ?? 0.3;
 
     try {
       if (model.startsWith('openai/') || model.startsWith('gpt-')) {
@@ -1542,6 +1565,7 @@ export class ThunderGateRuntime {
       this.db.ensureSession(sessionId);
       this.db.storeMessage({
         sessionId,
+        agentId: this.agentId,
         channel: 'surface:tui',
         role: 'user',
         content: text
@@ -1556,7 +1580,7 @@ export class ThunderGateRuntime {
     // Build the inference history from SessionDB, scoped to *this* session.
     // After a reset that's just the one inbound we just wrote, which is
     // exactly what we want — fresh slate.
-    const rows = this.db.getRecentMessagesForSession(sessionId, 80).slice().reverse();
+    const rows = this.db.getRecentMessagesForSession(sessionId, 80, this.agentId).slice().reverse();
     const turns: Turn[] = rows.map((r) => tagTurn({
       role: r.role === 'user' ? 'user' : 'assistant',
       content: r.content
@@ -1596,6 +1620,7 @@ export class ThunderGateRuntime {
       try {
         this.db.storeMessage({
           sessionId,
+          agentId: this.agentId,
           channel: 'surface:tui',
           role: 'assistant',
           content: replyText
@@ -1652,7 +1677,7 @@ export class ThunderGateRuntime {
     let turns: Turn[] = [];
     if (sessionId) {
       try {
-        const rows = this.db.getRecentMessagesForSession(sessionId, 500);
+        const rows = this.db.getRecentMessagesForSession(sessionId, 500, this.agentId);
         turns = rows.map((r) => ({
           role: r.role === 'user' ? 'user' : 'assistant',
           content: r.content
@@ -1674,7 +1699,7 @@ export class ThunderGateRuntime {
     const oldId = this.state.sessionId;
     if (oldId && pruneOnReset) {
       try {
-        const rows = this.db.getRecentMessagesForSession(oldId, 60).slice().reverse();
+        const rows = this.db.getRecentMessagesForSession(oldId, 60, this.agentId).slice().reverse();
         const turns: Turn[] = rows.map((r) => ({
           role: r.role === 'user' ? 'user' : 'assistant',
           content: r.content
@@ -1837,15 +1862,34 @@ function persistChannelMessage(
   sessionId: string | null,
   channel: string,
   role: 'user' | 'assistant',
-  content: string
+  content: string,
+  agentId: string = 'jon'
 ): void {
   try {
     if (!sessionId) return;
     db.ensureSession(sessionId);
-    db.storeMessage({ sessionId, channel, role, content });
+    db.storeMessage({ sessionId, agentId, channel, role, content });
   } catch (err) {
     console.warn('  ⚠ persistChannelMessage skipped:', (err as Error).message);
   }
+}
+
+/**
+ * Resolve the active agent id for this runtime instance. Resolution order:
+ *   1. THUNDERGATE_AGENT_ID env var (operator override / per-process pinning)
+ *   2. config.runtime.agentId
+ *   3. 'jon' (backward compatible — the pre-multi-agent default)
+ *
+ * The id is treated as a stable identifier: it namespaces DB rows, vault
+ * file paths, identity load paths, and outbound `agentId` metadata. It must
+ * be safe to use in filenames — keep it lowercase ASCII.
+ */
+function resolveAgentId(config: Config): string {
+  const fromEnv = process.env.THUNDERGATE_AGENT_ID?.trim();
+  if (fromEnv) return fromEnv;
+  const fromConfig = config.runtime.agentId?.trim();
+  if (fromConfig) return fromConfig;
+  return 'jon';
 }
 
 function sanitizeHistory(history: GhostTurn[]): Array<{ role: string; content: string }> {

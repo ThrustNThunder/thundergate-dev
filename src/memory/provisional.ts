@@ -19,9 +19,11 @@ export const PROVISIONAL_MARKER = '[provisional — verify before relying on]';
 
 export class ProvisionalMemoryService {
   private db: SessionDB;
+  private agentId: string;
 
-  constructor(db: SessionDB) {
+  constructor(db: SessionDB, agentId: string = 'jon') {
     this.db = db;
+    this.agentId = agentId;
   }
 
   /**
@@ -58,7 +60,7 @@ export class ProvisionalMemoryService {
    * (learning loop) burns in the new correction separately.
    */
   onCorrection(key: string): { deleted: boolean; wasProvisional: boolean } {
-    const existing = this.db.getMemory(key);
+    const existing = this.db.getMemory(key, this.agentId);
     if (!existing) return { deleted: false, wasProvisional: false };
     if (existing.status === 'provisional') {
       const deleted = this.db.deleteMemory(key);
@@ -69,7 +71,7 @@ export class ProvisionalMemoryService {
 
   /** Returns counts of provisional vs confirmed memories. */
   counts(): { provisional: number; confirmed: number; total: number } {
-    const rows = this.db.listMemories(10000);
+    const rows = this.db.listMemories(10000, this.agentId);
     let provisional = 0;
     let confirmed = 0;
     for (const r of rows) {

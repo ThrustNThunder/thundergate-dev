@@ -36,6 +36,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
   chmodSync
 } from 'fs';
@@ -303,6 +304,27 @@ export class VaultGrantError extends Error {
   }
 }
 
+/**
+ * One-shot rename of the pre-multi-agent vault files into their agent-suffixed
+ * counterparts. Idempotent: if the suffixed file already exists or the legacy
+ * file is absent, this is a no-op. Caller restricts to agentId='jon' so we
+ * never accidentally adopt Jon's vault under a different agent.
+ */
+function migrateLegacyVaultPaths(home: string, suffixedDb: string, suffixedSalt: string): void {
+  const legacyDb = join(home, '.thundergate', 'vault.db');
+  const legacySalt = join(home, '.thundergate', 'vault.salt');
+  try {
+    if (existsSync(legacyDb) && !existsSync(suffixedDb)) {
+      renameSync(legacyDb, suffixedDb);
+    }
+    if (existsSync(legacySalt) && !existsSync(suffixedSalt)) {
+      renameSync(legacySalt, suffixedSalt);
+    }
+  } catch {
+    /* best-effort migration; failure leaves both files in place */
+  }
+}
+
 export class VaultService {
   private db!: Db;
   private salt!: Buffer;
@@ -316,12 +338,21 @@ export class VaultService {
     options: {
       dbPath?: string;
       saltPath?: string;
+      agentId?: string;
       registry?: VaultProviderRegistry;
     } = {}
   ) {
     const home = os.homedir();
-    this.dbPath = options.dbPath ?? join(home, '.thundergate', 'vault.db');
-    this.saltPath = options.saltPath ?? join(home, '.thundergate', 'vault.salt');
+    const agentId = options.agentId ?? 'jon';
+    this.dbPath = options.dbPath ?? join(home, '.thundergate', `vault-${agentId}.db`);
+    this.saltPath = options.saltPath ?? join(home, '.thundergate', `vault-${agentId}.salt`);
+    // Backward-compatible migration: legacy single-agent installs put the
+    // vault at ~/.thundergate/vault.db (no agent suffix). For agentId='jon'
+    // we rename it into place on first boot so the existing data carries
+    // forward without manual intervention.
+    if (agentId === 'jon' && !options.dbPath && !options.saltPath) {
+      migrateLegacyVaultPaths(home, this.dbPath, this.saltPath);
+    }
     this.registry = options.registry ?? null;
   }
 

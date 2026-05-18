@@ -681,9 +681,10 @@ untrainCmd
     await withDB(async (db) => {
       const cfg = ensureConfig();
       const ledger = new ProvenanceLedger(cfg.localInference.provenanceFile);
-      const svc = new UntrainService(db, ledger);
-      const actor = (opts.actor === 'jon' ? 'jon' : 'michael') as 'jon' | 'michael';
-      const existing = db.getMemory(key);
+      const agentId = process.env.THUNDERGATE_AGENT_ID || cfg.runtime.agentId || 'jon';
+      const svc = new UntrainService(db, ledger, { agentId });
+      const actor = (opts.actor === 'jon' ? agentId : 'michael');
+      const existing = db.getMemory(key, agentId);
       if (!existing) {
         console.log(`No memory with key: ${key}`);
         return;
@@ -1554,12 +1555,13 @@ vaultCmd
       // Step 1 — issue the access request. Vault is locked on every CLI
       // invocation (withVault opens a fresh handle and never unlocks),
       // so this will always come back as pending_unlock.
+      const agentId = process.env.THUNDERGATE_AGENT_ID || cfg.runtime.agentId || 'jon';
       const result = await protocol.requestAccess({
         field_label: opts.field,
         purpose: opts.purpose,
         channel,
-        agent_id: `cli-test:${process.env.USER ?? 'jon'}`,
-        user: process.env.USER ?? 'jon',
+        agent_id: `cli-test:${process.env.USER ?? agentId}`,
+        user: process.env.USER ?? agentId,
         disclosure_mode: 'raw',
         raw_policy_reason: 'vault protocol test-request CLI'
       });

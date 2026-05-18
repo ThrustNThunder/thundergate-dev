@@ -71,12 +71,17 @@ export class FrameManager {
   private gapMs: number;
   private confidenceFloor: number;
   private wal: MemoryWAL | null;
+  private agentId: string;
 
-  constructor(db: SessionDB, opts?: { gapMs?: number; confidenceFloor?: number; wal?: MemoryWAL }) {
+  constructor(
+    db: SessionDB,
+    opts?: { gapMs?: number; confidenceFloor?: number; wal?: MemoryWAL; agentId?: string }
+  ) {
     this.db = db;
     this.gapMs = opts?.gapMs ?? DEFAULT_GAP_MS;
     this.confidenceFloor = opts?.confidenceFloor ?? DEFAULT_CONFIDENCE_FLOOR;
     this.wal = opts?.wal ?? null;
+    this.agentId = opts?.agentId ?? 'jon';
   }
 
   /**
@@ -85,7 +90,7 @@ export class FrameManager {
    * stopped. Returns the frame if any was found.
    */
   hydrate(): FrameRow | null {
-    this.current = this.db.getActiveOrPausedFrame();
+    this.current = this.db.getActiveOrPausedFrame(this.agentId);
     return this.current;
   }
 
@@ -112,7 +117,7 @@ export class FrameManager {
     if (gap <= this.gapMs) {
       // Inside the gap → same frame, just touch it.
       this.db.touchFrame(this.current.id);
-      this.current = this.db.getFrame(this.current.id) ?? this.current;
+      this.current = this.db.getFrame(this.current.id, this.agentId) ?? this.current;
       return {
         frame: this.current,
         transition: 'opened',
@@ -131,6 +136,7 @@ export class FrameManager {
     this.wal?.append({
       type: 'frame_closed',
       sessionId: ctx.sessionId ?? null,
+      agentId: this.agentId,
       payload: {
         frameId: this.current.id,
         fromStatus: this.current.status,
@@ -154,6 +160,7 @@ export class FrameManager {
       this.wal?.append({
         type: 'frame_opened',
         sessionId: ctx.sessionId ?? null,
+        agentId: this.agentId,
         payload: {
           frameId: pausedFrame.id,
           transition: 'rejoined',
@@ -161,7 +168,7 @@ export class FrameManager {
           topicAnchor: pausedFrame.topic_anchor
         }
       });
-      this.current = this.db.getFrame(pausedFrame.id) ?? pausedFrame;
+      this.current = this.db.getFrame(pausedFrame.id, this.agentId) ?? pausedFrame;
       return {
         frame: this.current,
         transition: 'rejoined',
@@ -208,6 +215,7 @@ export class FrameManager {
     this.wal?.append({
       type: 'frame_closed',
       sessionId: this.current.session_id ?? null,
+      agentId: this.agentId,
       payload: {
         frameId: this.current.id,
         fromStatus: prev,
@@ -215,7 +223,7 @@ export class FrameManager {
         reason
       }
     });
-    const closed = this.db.getFrame(this.current.id);
+    const closed = this.db.getFrame(this.current.id, this.agentId);
     this.current = null;
     return closed;
   }
@@ -230,6 +238,7 @@ export class FrameManager {
     const anchor = extractTopicAnchor(ctx.text);
     this.db.insertFrame({
       id,
+      agentId: this.agentId,
       topicAnchor: anchor,
       deviceHint: ctx.deviceHint ?? null,
       modelInUse: ctx.modelInUse ?? null,
@@ -246,6 +255,7 @@ export class FrameManager {
     this.wal?.append({
       type: 'frame_opened',
       sessionId: ctx.sessionId ?? null,
+      agentId: this.agentId,
       payload: {
         frameId: id,
         transition: 'opened',
@@ -256,7 +266,7 @@ export class FrameManager {
         reason
       }
     });
-    this.current = this.db.getFrame(id);
+    this.current = this.db.getFrame(id, this.agentId);
     return {
       frame: this.current!,
       transition: 'opened',

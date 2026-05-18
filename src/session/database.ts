@@ -11,7 +11,7 @@ import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { mkdirSync } from 'fs';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const SCHEMA_SQL = `
 -- Schema version tracking
@@ -33,10 +33,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   title TEXT
 );
 
--- Messages table (all channels write here)
+-- Messages table (all channels write here).
+-- agent_id (schema v4) namespaces every row so multiple agents can share
+-- this database without cross-agent leakage. Default 'jon' preserves the
+-- pre-multi-agent baseline.
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL REFERENCES sessions(id),
+  agent_id TEXT NOT NULL DEFAULT 'jon',
   channel TEXT NOT NULL,
   role TEXT NOT NULL,
   content TEXT,
@@ -60,6 +64,7 @@ CREATE TABLE IF NOT EXISTS context (
 CREATE TABLE IF NOT EXISTS skills (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT UNIQUE NOT NULL,
+  agent_id TEXT NOT NULL DEFAULT 'jon',
   content TEXT NOT NULL,
   category TEXT,
   created_at REAL NOT NULL,
@@ -73,6 +78,7 @@ CREATE TABLE IF NOT EXISTS skills (
 CREATE TABLE IF NOT EXISTS memory (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key TEXT UNIQUE NOT NULL,
+  agent_id TEXT NOT NULL DEFAULT 'jon',
   value TEXT NOT NULL,
   category TEXT,
   created_at REAL NOT NULL,
@@ -99,6 +105,7 @@ CREATE TABLE IF NOT EXISTS health_log (
 CREATE TABLE IF NOT EXISTS promises (
   id TEXT PRIMARY KEY,
   session_id TEXT,
+  agent_id TEXT NOT NULL DEFAULT 'jon',
   channel TEXT,
   text TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'OPEN',
@@ -112,6 +119,7 @@ CREATE TABLE IF NOT EXISTS promises (
 -- rejoin we reopen the paused frame in place and write a transition row.
 CREATE TABLE IF NOT EXISTS frames (
   id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL DEFAULT 'jon',
   opened_at REAL NOT NULL,
   closed_at REAL,
   topic_anchor TEXT NOT NULL,
@@ -147,6 +155,7 @@ CREATE TABLE IF NOT EXISTS memory_wal (
   created_at INTEGER NOT NULL,
   type TEXT NOT NULL,
   session_id TEXT,
+  agent_id TEXT NOT NULL DEFAULT 'jon',
   payload TEXT NOT NULL,
   replayed INTEGER NOT NULL DEFAULT 0,
   checksum TEXT NOT NULL
@@ -182,6 +191,7 @@ CREATE TABLE IF NOT EXISTS untrain_log (
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_context_key ON context(key);
 CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
 CREATE INDEX IF NOT EXISTS idx_memory_category ON memory(category);
@@ -254,6 +264,23 @@ export class SessionDB {
     this.addColumnIfMissing('memory', 'status', "TEXT NOT NULL DEFAULT 'confirmed'");
     this.addColumnIfMissing('memory', 'uses_remaining', 'INTEGER NOT NULL DEFAULT 0');
 
+    // Schema v4 multi-agent dimension. Existing rows are stamped 'jon'
+    // via the column DEFAULT so the live Jon instance keeps working
+    // without a backfill step.
+    this.addColumnIfMissing('messages', 'agent_id', "TEXT NOT NULL DEFAULT 'jon'");
+    this.addColumnIfMissing('memory', 'agent_id', "TEXT NOT NULL DEFAULT 'jon'");
+    this.addColumnIfMissing('skills', 'agent_id', "TEXT NOT NULL DEFAULT 'jon'");
+    this.addColumnIfMissing('promises', 'agent_id', "TEXT NOT NULL DEFAULT 'jon'");
+    this.addColumnIfMissing('frames', 'agent_id', "TEXT NOT NULL DEFAULT 'jon'");
+    this.addColumnIfMissing('memory_wal', 'agent_id', "TEXT NOT NULL DEFAULT 'jon'");
+    try {
+      this.db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id, session_id)'
+      );
+    } catch {
+      /* index already present */
+    }
+
     // Check/update schema version
     const version = this.db.prepare('SELECT version FROM schema_version').get() as { version: number } | undefined;
     if (!version) {
@@ -299,10 +326,12 @@ export class SessionDB {
   }
 
   /**
-   * Store a message (from any channel)
+   * Store a message (from any channel). agentId defaults to 'jon' for
+   * backward compatibility with the pre-multi-agent runtime.
    */
   storeMessage(message: {
     sessionId: string;
+    agentId?: string;
     channel: string;
     role: string;
     content: string;
@@ -312,12 +341,13 @@ export class SessionDB {
     importance?: string;
   }): number {
     const stmt = this.db.prepare(`
-      INSERT INTO messages (session_id, channel, role, content, tool_calls, tool_name, timestamp, token_count, importance)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO messages (session_id, agent_id, channel, role, content, tool_calls, tool_name, timestamp, token_count, importance)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    
+
     const result = stmt.run(
       message.sessionId,
+      message.agentId ?? 'jon',
       message.channel,
       message.role,
       message.content,
@@ -348,16 +378,17 @@ export class SessionDB {
   }
 
   /**
-   * Get recent messages (across all channels)
+   * Get recent messages (across all channels), scoped to one agent.
    */
-  getRecentMessages(limit: number = 50): Message[] {
+  getRecentMessages(limit: number = 50, agentId: string = 'jon'): Message[] {
     const stmt = this.db.prepare(`
       SELECT * FROM messages
+      WHERE agent_id = ?
       ORDER BY timestamp DESC
       LIMIT ?
     `);
 
-    return stmt.all(limit) as Message[];
+    return stmt.all(agentId, limit) as Message[];
   }
 
   /**
@@ -367,28 +398,28 @@ export class SessionDB {
    * (so a TTL reset cleanly starts a new history without dragging old
    * conversation through the LLM call).
    */
-  getRecentMessagesForSession(sessionId: string, limit: number = 50): Message[] {
+  getRecentMessagesForSession(sessionId: string, limit: number = 50, agentId: string = 'jon'): Message[] {
     const stmt = this.db.prepare(`
       SELECT * FROM messages
-      WHERE session_id = ?
+      WHERE session_id = ? AND agent_id = ?
       ORDER BY timestamp DESC
       LIMIT ?
     `);
-    return stmt.all(sessionId, limit) as Message[];
+    return stmt.all(sessionId, agentId, limit) as Message[];
   }
 
   /**
-   * Get messages by channel
+   * Get messages by channel, scoped to one agent.
    */
-  getMessagesByChannel(channel: string, limit: number = 50): Message[] {
+  getMessagesByChannel(channel: string, limit: number = 50, agentId: string = 'jon'): Message[] {
     const stmt = this.db.prepare(`
       SELECT * FROM messages
-      WHERE channel = ?
+      WHERE channel = ? AND agent_id = ?
       ORDER BY timestamp DESC
       LIMIT ?
     `);
 
-    return stmt.all(channel, limit) as Message[];
+    return stmt.all(channel, agentId, limit) as Message[];
   }
 
   /**
@@ -425,48 +456,57 @@ export class SessionDB {
   }
 
   /**
-   * Store skill
+   * Store skill. agentId defaults to 'jon'.
    */
   storeSkill(skill: {
     name: string;
+    agentId?: string;
     content: string;
     category?: string;
     source?: string;
   }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO skills (name, content, category, created_at, updated_at, source)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO skills (name, agent_id, content, category, created_at, updated_at, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(name) DO UPDATE SET
         content = excluded.content,
         updated_at = excluded.updated_at
     `);
 
     const now = Date.now() / 1000;
-    stmt.run(skill.name, skill.content, skill.category || null, now, now, skill.source || 'agent');
+    stmt.run(
+      skill.name,
+      skill.agentId ?? 'jon',
+      skill.content,
+      skill.category || null,
+      now,
+      now,
+      skill.source || 'agent'
+    );
   }
 
   /**
-   * Get skill by name
+   * Get skill by name, scoped to one agent.
    */
-  getSkill(name: string): Skill | null {
-    const stmt = this.db.prepare('SELECT * FROM skills WHERE name = ?');
-    const skill = stmt.get(name) as Skill | undefined;
-    
+  getSkill(name: string, agentId: string = 'jon'): Skill | null {
+    const stmt = this.db.prepare('SELECT * FROM skills WHERE name = ? AND agent_id = ?');
+    const skill = stmt.get(name, agentId) as Skill | undefined;
+
     if (skill) {
       // Update use count
-      this.db.prepare('UPDATE skills SET use_count = use_count + 1, last_used = ? WHERE name = ?')
-        .run(Date.now() / 1000, name);
+      this.db.prepare('UPDATE skills SET use_count = use_count + 1, last_used = ? WHERE name = ? AND agent_id = ?')
+        .run(Date.now() / 1000, name, agentId);
     }
 
     return skill || null;
   }
 
   /**
-   * List all skills
+   * List all skills for one agent.
    */
-  listSkills(): Skill[] {
-    const stmt = this.db.prepare('SELECT * FROM skills ORDER BY use_count DESC, updated_at DESC');
-    return stmt.all() as Skill[];
+  listSkills(agentId: string = 'jon'): Skill[] {
+    const stmt = this.db.prepare('SELECT * FROM skills WHERE agent_id = ? ORDER BY use_count DESC, updated_at DESC');
+    return stmt.all(agentId) as Skill[];
   }
 
   /**
@@ -477,6 +517,7 @@ export class SessionDB {
    */
   storeMemory(entry: {
     key: string;
+    agentId?: string;
     value: string;
     category?: string;
     importance?: string;
@@ -485,8 +526,8 @@ export class SessionDB {
     usesRemaining?: number;
   }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO memory (key, value, category, created_at, updated_at, importance, source, status, uses_remaining)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memory (key, agent_id, value, category, created_at, updated_at, importance, source, status, uses_remaining)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET
         value = excluded.value,
         updated_at = excluded.updated_at,
@@ -500,6 +541,7 @@ export class SessionDB {
     const uses = entry.usesRemaining ?? 0;
     stmt.run(
       entry.key,
+      entry.agentId ?? 'jon',
       entry.value,
       entry.category || null,
       now,
@@ -512,20 +554,21 @@ export class SessionDB {
   }
 
   /**
-   * Get memory by key
+   * Get memory by key, scoped to one agent.
    */
-  getMemory(key: string): MemoryEntry | null {
-    const stmt = this.db.prepare('SELECT * FROM memory WHERE key = ?');
-    return stmt.get(key) as MemoryEntry | undefined || null;
+  getMemory(key: string, agentId: string = 'jon'): MemoryEntry | null {
+    const stmt = this.db.prepare('SELECT * FROM memory WHERE key = ? AND agent_id = ?');
+    return stmt.get(key, agentId) as MemoryEntry | undefined || null;
   }
 
   /**
-   * List all memories with status. The CLI 'memory list' command uses this
-   * to surface provisional vs. confirmed counts.
+   * List all memories with status, scoped to one agent. The CLI 'memory list'
+   * command uses this to surface provisional vs. confirmed counts.
    */
-  listMemories(limit: number = 100): MemoryEntry[] {
+  listMemories(limit: number = 100, agentId: string = 'jon'): MemoryEntry[] {
     const stmt = this.db.prepare(`
       SELECT * FROM memory
+      WHERE agent_id = ?
       ORDER BY
         CASE importance
           WHEN 'critical' THEN 0
@@ -536,7 +579,7 @@ export class SessionDB {
         updated_at DESC
       LIMIT ?
     `);
-    return stmt.all(limit) as MemoryEntry[];
+    return stmt.all(agentId, limit) as MemoryEntry[];
   }
 
   /**
@@ -577,13 +620,21 @@ export class SessionDB {
   insertPromise(p: {
     id: string;
     sessionId?: string | null;
+    agentId?: string;
     channel?: string | null;
     text: string;
   }): void {
     this.db.prepare(`
-      INSERT INTO promises (id, session_id, channel, text, status, created_at)
-      VALUES (?, ?, ?, ?, 'OPEN', ?)
-    `).run(p.id, p.sessionId ?? null, p.channel ?? null, p.text, Date.now() / 1000);
+      INSERT INTO promises (id, session_id, agent_id, channel, text, status, created_at)
+      VALUES (?, ?, ?, ?, ?, 'OPEN', ?)
+    `).run(
+      p.id,
+      p.sessionId ?? null,
+      p.agentId ?? 'jon',
+      p.channel ?? null,
+      p.text,
+      Date.now() / 1000
+    );
   }
 
   closePromise(id: string, status: 'FULFILLED' | 'DISMISSED', resolvedBy: string): boolean {
@@ -595,26 +646,28 @@ export class SessionDB {
     return info.changes > 0;
   }
 
-  getOpenPromises(limit: number = 50): PromiseRow[] {
+  getOpenPromises(limit: number = 50, agentId: string = 'jon'): PromiseRow[] {
     return this.db.prepare(`
-      SELECT * FROM promises WHERE status = 'OPEN'
+      SELECT * FROM promises WHERE status = 'OPEN' AND agent_id = ?
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(limit) as PromiseRow[];
+    `).all(agentId, limit) as PromiseRow[];
   }
 
-  getAllPromises(limit: number = 100): PromiseRow[] {
+  getAllPromises(limit: number = 100, agentId: string = 'jon'): PromiseRow[] {
     return this.db.prepare(`
       SELECT * FROM promises
+      WHERE agent_id = ?
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(limit) as PromiseRow[];
+    `).all(agentId, limit) as PromiseRow[];
   }
 
   // ─── Frames ───────────────────────────────────────────────────────────
 
   insertFrame(f: {
     id: string;
+    agentId?: string;
     topicAnchor: string;
     deviceHint?: string | null;
     modelInUse?: string | null;
@@ -625,11 +678,12 @@ export class SessionDB {
     const now = Date.now() / 1000;
     this.db.prepare(`
       INSERT INTO frames (
-        id, opened_at, topic_anchor, device_hint, model_in_use,
+        id, agent_id, opened_at, topic_anchor, device_hint, model_in_use,
         session_id, status, parent_frame_id, confidence_floor, last_activity_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
     `).run(
       f.id,
+      f.agentId ?? 'jon',
       now,
       f.topicAnchor,
       f.deviceHint ?? null,
@@ -659,25 +713,26 @@ export class SessionDB {
       .run(Date.now() / 1000, id);
   }
 
-  getFrame(id: string): FrameRow | null {
-    return (this.db.prepare('SELECT * FROM frames WHERE id = ?').get(id) as FrameRow | undefined) ?? null;
+  getFrame(id: string, agentId: string = 'jon'): FrameRow | null {
+    return (this.db.prepare('SELECT * FROM frames WHERE id = ? AND agent_id = ?').get(id, agentId) as FrameRow | undefined) ?? null;
   }
 
-  getActiveOrPausedFrame(): FrameRow | null {
+  getActiveOrPausedFrame(agentId: string = 'jon'): FrameRow | null {
     return (this.db.prepare(`
       SELECT * FROM frames
-      WHERE status IN ('ACTIVE', 'PAUSED')
+      WHERE status IN ('ACTIVE', 'PAUSED') AND agent_id = ?
       ORDER BY last_activity_at DESC
       LIMIT 1
-    `).get() as FrameRow | undefined) ?? null;
+    `).get(agentId) as FrameRow | undefined) ?? null;
   }
 
-  getRecentFrames(limit: number = 20): FrameRow[] {
+  getRecentFrames(limit: number = 20, agentId: string = 'jon'): FrameRow[] {
     return this.db.prepare(`
       SELECT * FROM frames
+      WHERE agent_id = ?
       ORDER BY opened_at DESC
       LIMIT ?
-    `).all(limit) as FrameRow[];
+    `).all(agentId, limit) as FrameRow[];
   }
 
   logFrameTransition(t: {
@@ -740,9 +795,10 @@ export class SessionDB {
    * actually influences the next shadow turn — without this, the learning
    * loop is write-only and behavior cannot change.
    */
-  getRecentMemories(limit: number = 10): MemoryEntry[] {
+  getRecentMemories(limit: number = 10, agentId: string = 'jon'): MemoryEntry[] {
     const stmt = this.db.prepare(`
       SELECT * FROM memory
+      WHERE agent_id = ?
       ORDER BY
         CASE importance
           WHEN 'critical' THEN 0
@@ -753,7 +809,7 @@ export class SessionDB {
         updated_at DESC
       LIMIT ?
     `);
-    return stmt.all(limit) as MemoryEntry[];
+    return stmt.all(agentId, limit) as MemoryEntry[];
   }
 
   /**
@@ -823,6 +879,7 @@ export class SessionDB {
 interface Message {
   id: number;
   session_id: string;
+  agent_id: string;
   channel: string;
   role: string;
   content: string;
@@ -848,6 +905,7 @@ interface ContextEntry {
 interface Skill {
   id: number;
   name: string;
+  agent_id: string;
   content: string;
   category: string | null;
   created_at: number;
@@ -860,6 +918,7 @@ interface Skill {
 export interface MemoryEntry {
   id: number;
   key: string;
+  agent_id: string;
   value: string;
   category: string | null;
   created_at: number;
@@ -877,6 +936,7 @@ export interface MemoryEntry {
 export interface PromiseRow {
   id: string;
   session_id: string | null;
+  agent_id: string;
   channel: string | null;
   text: string;
   status: 'OPEN' | 'FULFILLED' | 'DISMISSED' | string;
@@ -887,6 +947,7 @@ export interface PromiseRow {
 
 export interface FrameRow {
   id: string;
+  agent_id: string;
   opened_at: number;
   closed_at: number | null;
   topic_anchor: string;

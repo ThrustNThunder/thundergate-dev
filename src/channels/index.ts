@@ -72,6 +72,9 @@ export interface ChannelContext {
   db: SessionDB;
   contextFile: string;       // unified context.jsonl path
   onInbound: InboundHandler;
+  /** Identity of the agent this channel is serving. Stamped on rows
+   *  the channel writes to SessionDB so multi-agent installs stay isolated. */
+  agentId?: string;
 }
 
 /**

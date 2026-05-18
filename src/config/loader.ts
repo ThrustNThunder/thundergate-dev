@@ -17,9 +17,15 @@ export interface Config {
 
   // Phase 3: Runtime — points at OpenClaw session + unified context file
   runtime: {
+    // Identity of the agent running on this runtime instance. Used to
+    // namespace DB rows, vault files, identity paths, and channel routing.
+    // Override via THUNDERGATE_AGENT_ID env var (highest priority).
+    agentId: string;
     openclaw_session_file: string;
     context_file: string;
     model: string;
+    maxTokens: number;
+    temperature: number;
   };
 
   // Phase 3: Ghost Jon shadow mode
@@ -46,20 +52,6 @@ export interface Config {
   // tier-3 semantic comparator. If absent, the comparator falls back to
   // its tier-1/tier-2 scores and logs the skip — it never blocks pairing.
   voyageApiKey?: string;
-
-  // Model routing
-  model: {
-    mode: 'auto' | 'manual' | 'supersaver';
-    primary: string;
-    reasoning: string;
-    surface: string;
-    fallback: string[];
-    supersaver: {
-      model: string;
-      cache: string;
-      reasoning: boolean;
-    };
-  };
 
   // Cache settings
   cache: {
@@ -123,7 +115,6 @@ export interface Config {
 
   // Deep mode / Surface layer
   parallel: {
-    surfaceModel: string;
     surfaceMaxTokens: number;
     deepModeThreshold: number;  // Tool calls before deep mode activates
   };
@@ -170,9 +161,6 @@ export interface Config {
     // OpenAI-compatible base URL. Default: http://localhost:11434 (Ollama).
     endpoint: string;
     healthCheckIntervalMs: number;
-    // Model name to advertise/use when LOCAL_INFERENCE mode is active.
-    // ThunderMind isn't built yet so this is a placeholder default.
-    model: string;
     // Append-only JSONL of provider liveness transitions and other
     // provenance events. Stub for the larger provenance ledger.
     provenanceFile: string;
@@ -192,9 +180,12 @@ const DEFAULT_CONFIG: Config = {
   },
 
   runtime: {
+    agentId: 'jon',
     openclaw_session_file: '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
     context_file: join(process.env.HOME || '', '.thundergate', 'context.jsonl'),
-    model: 'anthropic/claude-sonnet-4-6'
+    model: 'anthropic/claude-haiku-4-5-20251001',
+    maxTokens: 512,
+    temperature: 0.3
   },
 
   ghost: {
@@ -211,19 +202,6 @@ const DEFAULT_CONFIG: Config = {
   openaiApiKey: process.env.OPENAI_API_KEY ?? '',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
   voyageApiKey: process.env.VOYAGE_API_KEY ?? '',
-
-  model: {
-    mode: 'auto',
-    primary: 'anthropic/claude-sonnet-4-6',
-    reasoning: 'anthropic/claude-opus-4-5',
-    surface: 'anthropic/claude-sonnet-4-6',
-    fallback: ['anthropic/claude-sonnet-4-5'],
-    supersaver: {
-      model: 'anthropic/claude-sonnet-4-5',
-      cache: 'long',
-      reasoning: false
-    }
-  },
 
   cache: {
     hot: '1h',
@@ -281,7 +259,6 @@ const DEFAULT_CONFIG: Config = {
   },
 
   parallel: {
-    surfaceModel: 'anthropic/claude-sonnet-4-6',
     surfaceMaxTokens: 5000,
     deepModeThreshold: 5         // 5+ tool calls = deep mode
   },
@@ -298,7 +275,6 @@ const DEFAULT_CONFIG: Config = {
     enabled: true,
     endpoint: 'http://localhost:11434',
     healthCheckIntervalMs: 30000,
-    model: 'thundermind:70b',
     provenanceFile: join(process.env.HOME || '', '.thundergate', 'provenance.jsonl'),
     contextWindowTarget: 200000,
     ragResultsLimit: 24,

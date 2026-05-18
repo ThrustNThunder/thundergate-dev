@@ -22,10 +22,13 @@ const CONFIG_FILE = join(THUNDERGATE_DIR, 'config.json');
 const PHASE3_DEFAULT = {
   version: '0.1.0',
   runtime: {
+    agentId: 'jon',
     openclaw_session_file:
       '/home/ubuntu/.openclaw/agents/main/sessions/agent:main:main.jsonl',
     context_file: join(THUNDERGATE_DIR, 'context.jsonl'),
-    model: 'anthropic/claude-sonnet-4-6'
+    model: 'anthropic/claude-haiku-4-5-20251001',
+    maxTokens: 512,
+    temperature: 0.3
   },
   channels: {
     thundercommo: {

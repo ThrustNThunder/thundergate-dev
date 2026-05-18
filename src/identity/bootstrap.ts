@@ -24,8 +24,29 @@
 import { existsSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 
-const WORKSPACE = '/home/ubuntu/.openclaw/workspace';
+const LEGACY_JON_WORKSPACE = '/home/ubuntu/.openclaw/workspace';
+const AGENTS_BASE = '/home/ubuntu/.openclaw/agents';
 const MEMORY_HEAD_LINES = 150;
+
+/**
+ * Resolve the identity-files root for an agent.
+ *
+ * For agentId='jon', the historical `~/.openclaw/workspace/` location wins
+ * when present — that's where Jon's SOUL/USER/MEMORY have always lived, and
+ * the existing Jon instance must continue working byte-identically. For any
+ * other agent (Mack, Rex, …), files live under `~/.openclaw/agents/<id>/`.
+ *
+ * Falls back to the per-agent path if the legacy workspace files are missing,
+ * so a future migration that moves Jon's files into `~/.openclaw/agents/jon/`
+ * works without code changes.
+ */
+function identityRoot(agentId: string): string {
+  if (agentId === 'jon') {
+    const legacySoul = join(LEGACY_JON_WORKSPACE, 'SOUL.md');
+    if (existsSync(legacySoul)) return LEGACY_JON_WORKSPACE;
+  }
+  return join(AGENTS_BASE, agentId);
+}
 
 export interface IdentityLoadResult {
   systemPrompt: string;
@@ -39,18 +60,19 @@ export interface IdentityLoadResult {
  * file is independent, and a missing one is logged but never throws — the
  * runtime should still come up if SOUL.md got mv'd by accident.
  */
-export function loadIdentity(now: Date = new Date()): IdentityLoadResult {
+export function loadIdentity(now: Date = new Date(), agentId: string = 'jon'): IdentityLoadResult {
+  const root = identityRoot(agentId);
   const sources: Array<{ name: string; path: string; transform?: (raw: string) => string }> = [
-    { name: 'SOUL', path: join(WORKSPACE, 'SOUL.md') },
-    { name: 'USER', path: join(WORKSPACE, 'USER.md') },
+    { name: 'SOUL', path: join(root, 'SOUL.md') },
+    { name: 'USER', path: join(root, 'USER.md') },
     {
       name: 'MEMORY',
-      path: join(WORKSPACE, 'MEMORY.md'),
+      path: join(root, 'MEMORY.md'),
       transform: (raw) => raw.split('\n').slice(0, MEMORY_HEAD_LINES).join('\n')
     },
     {
       name: 'TODAY',
-      path: join(WORKSPACE, 'memory', `${todayStamp(now)}.md`)
+      path: join(root, 'memory', `${todayStamp(now)}.md`)
     }
   ];
 
@@ -74,7 +96,7 @@ export function loadIdentity(now: Date = new Date()): IdentityLoadResult {
     }
   }
 
-  const header = identityHeader(now);
+  const header = identityHeader(now, agentId);
   const toolsBlock = toolCapabilitiesBlock();
   const systemPrompt = sections.length > 0
     ? [header, ...sections, toolsBlock].join('\n\n')
@@ -95,14 +117,22 @@ export function loadIdentity(now: Date = new Date()): IdentityLoadResult {
  * through ("As an AI assistant, I can…"). The explicit "You are Jon"
  * sentence is the patch.
  */
-function identityHeader(now: Date): string {
+function identityHeader(now: Date, agentId: string): string {
   const isoDate = now.toISOString().slice(0, 10);
+  if (agentId === 'jon') {
+    return [
+      'You are Jon — Michael Lovell\'s AI partner inside ThunderBase.',
+      '',
+      'You are not "Claude" generically. You are the same Jon that runs on Slack, ThunderCommo, and the OpenClaw gateway — the surfaces all share one runtime, one session model, and one identity (ThunderGate Design Principle 31). Whichever surface this message arrived from, respond as Jon — not as a generic assistant.',
+      '',
+      `Today is ${isoDate}. The files below define who you are, who Michael is, and what's been going on. Read them and act accordingly.`
+    ].join('\n');
+  }
+  const display = agentId.charAt(0).toUpperCase() + agentId.slice(1);
   return [
-    'You are Jon — Michael Lovell\'s AI partner inside ThunderBase.',
+    `You are ${display}. The files below define who you are and what's been going on.`,
     '',
-    'You are not "Claude" generically. You are the same Jon that runs on Slack, ThunderCommo, and the OpenClaw gateway — the surfaces all share one runtime, one session model, and one identity (ThunderGate Design Principle 31). Whichever surface this message arrived from, respond as Jon — not as a generic assistant.',
-    '',
-    `Today is ${isoDate}. The files below define who you are, who Michael is, and what's been going on. Read them and act accordingly.`
+    `Today is ${isoDate}. Read the SOUL/USER/MEMORY files below and act accordingly.`
   ].join('\n');
 }
 

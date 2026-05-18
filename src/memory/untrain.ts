@@ -43,11 +43,20 @@ export class UntrainService {
   private ledger?: ProvenanceLedger;
   private recentUsage: string[] = [];
   private wal: MemoryWAL | null;
+  // Identity of the agent this service is serving. Threaded through to
+  // SessionDB so memory rows for other agents aren't accidentally read or
+  // deleted from this instance.
+  private agentId: string;
 
-  constructor(db: SessionDB, ledger?: ProvenanceLedger, opts?: { wal?: MemoryWAL }) {
+  constructor(
+    db: SessionDB,
+    ledger?: ProvenanceLedger,
+    opts?: { wal?: MemoryWAL; agentId?: string }
+  ) {
     this.db = db;
     this.ledger = ledger;
     this.wal = opts?.wal ?? null;
+    this.agentId = opts?.agentId ?? 'jon';
   }
 
   /** Called by anything that surfaces a memory into a prompt. */
@@ -76,17 +85,18 @@ export class UntrainService {
    */
   untrainByKey(opts: {
     key: string;
-    actor: 'michael' | 'jon';
+    actor: string;
     reason?: string;
     triggerType?: 'cli' | 'conversational';
   }): { deleted: boolean; value: string | null } {
-    const existing = this.db.getMemory(opts.key);
+    const existing = this.db.getMemory(opts.key, this.agentId);
     const value = existing?.value ?? null;
     // WAL the intent BEFORE deletion — a crash between this row and the
     // deleteMemory() call leaves audit-trail evidence that we wanted
     // this memory gone, even if the row is still physically present.
     this.wal?.append({
       type: 'untrain',
+      agentId: this.agentId,
       payload: {
         key: opts.key,
         value,
@@ -130,10 +140,10 @@ export class UntrainService {
    */
   resolveTarget(): MemoryEntry | null {
     for (const k of this.recentUsage) {
-      const row = this.db.getMemory(k);
+      const row = this.db.getMemory(k, this.agentId);
       if (row) return row;
     }
-    const recent = this.db.listMemories(1);
+    const recent = this.db.listMemories(1, this.agentId);
     return recent.length > 0 ? recent[0] : null;
   }
 
@@ -141,7 +151,7 @@ export class UntrainService {
    * One-shot conversational untrain: resolve + delete + audit. Returns
    * the confirmation string for the runtime to splice.
    */
-  conversationalUntrain(opts: { actor: 'michael' | 'jon'; reason?: string }): string | null {
+  conversationalUntrain(opts: { actor: string; reason?: string }): string | null {
     const target = this.resolveTarget();
     if (!target) return null;
     const description = describeMemory(target);

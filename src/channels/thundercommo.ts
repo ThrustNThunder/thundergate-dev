@@ -46,6 +46,11 @@ interface AuthMessage {
   token: string;
   peerId: string;
   channels?: string[];
+  // Optional multi-agent filter. When the client pins itself to a specific
+  // agent at auth, broadcasts whose outbound `agentId` does not match are
+  // suppressed. Omitted = legacy behavior (receive everything on the
+  // subscribed channels).
+  agentId?: string;
 }
 
 interface OutboundMessage {
@@ -81,6 +86,9 @@ interface ClientState {
   peerId: string;
   channels: Set<string>;
   authedAt: number;
+  // When set, only outbound messages whose `agentId` matches are delivered
+  // to this client. null/undefined preserves legacy fan-out.
+  agentFilter: string | null;
 }
 
 export class ThunderCommoChannel implements Channel {
@@ -216,7 +224,8 @@ export class ThunderCommoChannel implements Channel {
       ws,
       peerId: '',
       channels: new Set(),
-      authedAt: 0
+      authedAt: 0,
+      agentFilter: null
     };
     this.clients.set(ws, state);
     console.log(`  ↔ ThunderCommo client connected from ${remote ?? 'unknown'}`);
@@ -279,6 +288,9 @@ export class ThunderCommoChannel implements Channel {
 
     state.peerId = msg.peerId;
     state.authedAt = Date.now();
+    state.agentFilter = typeof msg.agentId === 'string' && msg.agentId.length > 0
+      ? msg.agentId
+      : null;
     if (Array.isArray(msg.channels)) {
       for (const c of msg.channels) state.channels.add(c);
     } else {
@@ -332,10 +344,16 @@ export class ThunderCommoChannel implements Channel {
 
   private broadcastToChannel(msg: ServerMessage): void {
     const payload = JSON.stringify(msg);
+    // Outbound messages carrying an `agentId` are agent-scoped: clients that
+    // pinned themselves to a different agent at auth time get filtered out.
+    // Clients with no agentFilter (legacy) receive the broadcast either way,
+    // preserving backward compatibility.
+    const msgAgentId = (msg as OutboundMessage).agentId ?? null;
     for (const state of this.clients.values()) {
       if (!state.authedAt) continue;
       if (!state.channels.has(msg.channel)) continue;
       if (state.ws.readyState !== WebSocket.OPEN) continue;
+      if (msgAgentId && state.agentFilter && state.agentFilter !== msgAgentId) continue;
       try {
         state.ws.send(payload);
       } catch (err) {
@@ -379,7 +397,13 @@ export class ThunderCommoChannel implements Channel {
           const msg = JSON.parse(raw.toString());
           if (msg.type === 'federation_message') {
             this.handleInbound(
-              { ws: sock, peerId: 'relay', channels: new Set(['tnt', 'jmab']), authedAt: Date.now() },
+              {
+                ws: sock,
+                peerId: 'relay',
+                channels: new Set(['tnt', 'jmab']),
+                authedAt: Date.now(),
+                agentFilter: null
+              },
               msg
             );
           }
@@ -422,6 +446,7 @@ export class ThunderCommoChannel implements Channel {
     try {
       this.ctx.db.storeMessage({
         sessionId: 'current',
+        agentId: this.ctx.agentId,
         channel: entry.channel,
         role: entry.direction === 'inbound' ? 'user' : 'assistant',
         content: entry.text,
