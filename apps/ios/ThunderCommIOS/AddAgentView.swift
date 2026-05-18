@@ -1,12 +1,11 @@
 // AddAgentView.swift
 //
-// Build 55 final: minimal "add an existing agent" form, reached from
-// Settings → Agents → "Add agent". The user enters the agent's name, the
-// token they want to use to connect, and the session ID their agent gave
-// them back. No QR scanner. No relay URL fields. No KYA verification fetch
-// — Build 55 final treats the BYOAA verification flow as out of scope and
-// stores the connection as-entered. Future builds can re-introduce a
-// verification step if needed.
+// Build 58: "add an agent" form reached from Settings → Agents → "Add
+// agent". The user picks a name, pastes (or generates upstream) the
+// `tc-a-` token they want to give the agent, and saves. The relay URL is
+// shown read-only with a copy button — the user gives the token + the
+// relay URL to their agent, and the agent connects to ThunderCommo's
+// relay. No session ID, no QR scanner, no KYA verification.
 
 import SwiftUI
 
@@ -18,7 +17,6 @@ public struct AddAgentView: View {
     @State private var agentName: String = ""
     @State private var agentEmoji: String = "⚡"
     @State private var token: String = ""
-    @State private var sessionID: String = ""
     @State private var isTokenVisible: Bool = false
     @State private var saveError: String?
     @State private var didSave: Bool = false
@@ -65,12 +63,12 @@ public struct AddAgentView: View {
 
                 Section {
                     HStack {
-                        Text("wss://relay.thunderai.us")
+                        Text(Account.defaultRelayWSURL)
                             .font(.callout.monospaced())
                             .foregroundColor(.secondary)
                         Spacer()
                         Button {
-                            UIPasteboard.general.string = "wss://relay.thunderai.us"
+                            UIPasteboard.general.string = Account.defaultRelayWSURL
                         } label: {
                             Image(systemName: "doc.on.doc")
                         }
@@ -78,18 +76,7 @@ public struct AddAgentView: View {
                 } header: {
                     Text("Relay URL")
                 } footer: {
-                    Text("Share this token AND relay URL with your agent. They will need both to connect.")
-                }
-
-                Section {
-                    TextField("Session ID (optional)", text: $sessionID)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                } header: {
-                    Text("Session")
-                } footer: {
-                    Text("The session identifier your agent gives you after they connect.")
+                    Text("Give this token and relay URL to your agent.")
                 }
 
                 if let saveError {
@@ -123,31 +110,26 @@ public struct AddAgentView: View {
     private var isFormValid: Bool {
         !agentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func save() {
-        let trimmedName    = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedEmoji   = agentEmoji.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedToken   = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedSession = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName  = agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEmoji = agentEmoji.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard !trimmedName.isEmpty,
-              !trimmedToken.isEmpty,
-              !trimmedSession.isEmpty else {
-            saveError = "All fields are required."
+        guard !trimmedName.isEmpty, !trimmedToken.isEmpty else {
+            saveError = "Name and token are required."
             return
         }
 
-        // wsURL / httpURL slots are repurposed to carry the agent's session
-        // identifier — Build 55 final does not yet model a dedicated
-        // sessionID field on AgentConnection, and the existing fields are
-        // opaque strings from the storage layer's perspective.
+        // Build 58 (brief change #4): the session-ID field is gone. The
+        // agent connects to the user's relay using its token + the hardcoded
+        // relay URLs, so AgentConnection just records the relay endpoints.
         let connection = AgentConnection(
             agentName: trimmedName,
             agentEmoji: trimmedEmoji.isEmpty ? "⚡" : trimmedEmoji,
-            wsURL: trimmedSession,
-            httpURL: trimmedSession,
+            wsURL: Account.defaultRelayWSURL,
+            httpURL: Account.defaultRelayHTTPURL,
             kya: nil,
             isDefault: false
         )

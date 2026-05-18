@@ -90,6 +90,7 @@ public struct SignInView: View {
         Task {
             do {
                 try await store.signIn(email: email, password: password)
+                seedRelayAccountAfterAuth()
                 onSignedIn?()
             } catch {
                 self.error = error.localizedDescription
@@ -108,5 +109,30 @@ public struct SignInView: View {
                 self.error = error.localizedDescription
             }
         }
+    }
+
+    // Build 58 (brief Gap B): mirror SignUpView's seeding so a sign-out →
+    // sign-in cycle restores a working AccountStore + reconnects DeliveryCore.
+    // SignOut wipes AccountStore via SettingsView, so by the time this runs
+    // there's nothing left to dedup against — but we still guard against an
+    // already-present Account in case the signin path is hit without a prior
+    // signout (e.g. token-refresh re-prompt).
+    private func seedRelayAccountAfterAuth() {
+        guard let token = AuthManager.shared.peekToken(), !token.isEmpty else { return }
+        let display = store.currentUser?.displayName ?? ""
+        if let existing = AccountStore.shared.current {
+            AccountStore.shared.updateToken(token, for: existing.id)
+        } else {
+            let account = Account(
+                name: display,
+                wsURL: Account.defaultRelayWSURL,
+                httpURL: Account.defaultRelayHTTPURL,
+                token: token
+            )
+            AccountStore.shared.add(account, makeCurrent: true)
+        }
+        DeliveryCore.shared.handleScenePhase(.active)
+        APNsManager.shared.retryTokenUploadIfNeeded()
+        APNsManager.shared.bootstrap()
     }
 }

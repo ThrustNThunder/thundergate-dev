@@ -1,23 +1,24 @@
 // OnboardingView.swift
 //
-// Build 55 final: post-signup wizard that runs AFTER SignUpView completes.
+// Build 58: post-signup wizard that runs AFTER SignUpView completes.
 // Three screens, in order:
 //
 //   1. Your Token   — show the user's `tc-h-` session token + copy button +
 //                     banner explaining what to do with it
-//   2. Add Agent    — optional. Generate a `tc-a-` agent token + paste an
-//                     agent session ID. "Skip for now" bails to chat.
+//   2. Add Agent    — optional. Generate a `tc-a-` agent token, see the
+//                     relay URL with a copy button, then Save to register
+//                     the agent locally. "Skip for now" bails to chat.
 //   3. Done         — momentary "you're all set" pulse before handing back
 //                     to ContentView
 //
 // What this file does NOT do:
-//   - No URL fields, no relay-URL display (the relay is shown in Settings →
-//     About only).
+//   - No session ID field. The user gives their agent the tc-a- token + the
+//     relay URL and that's enough — the agent connects directly to the
+//     relay.
 //   - No hardcoded Jon agent token, no hardcoded agent seeding into
-//     AccountStore. The user explicitly opts in by entering a session ID
-//     they got from their own agent.
-//   - No auto-add of a default agent. If the user skips, AccountStore stays
-//     empty until they add one through Settings later.
+//     AccountStore beyond the user's own tc-h- account.
+//   - No auto-add of a default agent. If the user skips, only the tc-h-
+//     account seeded at signup lives in AccountStore.
 
 import SwiftUI
 import UIKit
@@ -36,11 +37,11 @@ public struct OnboardingView: View {
 
     @State private var generatedAgentToken: String?
     @State private var agentLabel: String = ""
-    @State private var agentSessionID: String = ""
     @State private var didCopyAgentToken: Bool = false
     @State private var didCopyHumanToken: Bool = false
+    @State private var didCopyRelayURL: Bool = false
     @State private var isTokenVisible: Bool = false
-    @State private var connectError: String?
+    @State private var saveError: String?
 
     public var body: some View {
         NavigationStack {
@@ -137,7 +138,7 @@ public struct OnboardingView: View {
                 header(title: "Connect an agent", subtitle: "Optional — you can skip and add one later.")
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Step 1 — Give your agent a token")
+                    Text("Give your agent a token")
                         .font(.headline)
 
                     TextField("Agent name", text: $agentLabel)
@@ -155,54 +156,25 @@ public struct OnboardingView: View {
 
                     if let token = generatedAgentToken {
                         agentTokenCard(token: token)
-                        // Relay URL copy row
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Relay URL").font(.caption).foregroundStyle(.secondary)
-                                Text("wss://relay.thunderai.us").font(.callout.monospaced()).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button {
-                                UIPasteboard.general.string = "wss://relay.thunderai.us"
-                            } label: { Image(systemName: "doc.on.doc") }
+                        relayURLRow
+                        banner("Give this token and relay URL to your agent.")
+
+                        if let saveError {
+                            Text(saveError)
+                                .font(.caption)
+                                .foregroundStyle(.red)
                         }
+
+                        Button {
+                            saveAgent()
+                        } label: {
+                            Label("Save Agent", systemImage: "checkmark.circle.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
                         .padding(.top, 4)
-                        banner("Share this token AND relay URL with your agent. They need both to connect.")
                     }
-                }
-
-                Divider().padding(.vertical, 6)
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Step 2 — Connect using their session ID")
-                        .font(.headline)
-
-                    Text("Once your agent has the token, paste the session ID they give you back.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    TextField("Agent session ID", text: $agentSessionID)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.callout.monospaced())
-                        .textFieldStyle(.roundedBorder)
-
-                    if let err = connectError {
-                        Text(err)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-
-                    Button {
-                        connectAgent()
-                    } label: {
-                        Label("Connect", systemImage: "link")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .disabled(agentSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || generatedAgentToken == nil)
                 }
 
                 Button("Skip for now") {
@@ -214,6 +186,31 @@ public struct OnboardingView: View {
             }
             .padding()
         }
+    }
+
+    // Build 58 (brief change #3): the relay URL is the second half of what the
+    // user hands to their agent — they need the agent token AND this URL to
+    // connect. Read-only, copy button, no editing path.
+    private var relayURLRow: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Relay URL").font(.caption).foregroundStyle(.secondary)
+                Text(Account.defaultRelayWSURL)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+            Button {
+                UIPasteboard.general.string = Account.defaultRelayWSURL
+                didCopyRelayURL = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { didCopyRelayURL = false }
+            } label: {
+                Image(systemName: didCopyRelayURL ? "checkmark.circle.fill" : "doc.on.doc")
+            }
+            .accessibilityLabel(didCopyRelayURL ? "Copied" : "Copy relay URL")
+        }
+        .padding(.top, 4)
     }
 
     private func agentTokenCard(token: String) -> some View {
@@ -306,22 +303,25 @@ public struct OnboardingView: View {
         guard !trimmed.isEmpty else { return }
         generatedAgentToken = "tc-a-\(UUID().uuidString.lowercased())"
         didCopyAgentToken = false
-        connectError = nil
+        saveError = nil
     }
 
-    private func connectAgent() {
-        connectError = nil
-        let sessionID = agentSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+    // Build 58: replaces the prior session-ID "Connect" step. The agent
+    // connects to the user's relay using the generated tc-a- token plus the
+    // hardcoded relay URL; the iOS side doesn't need a session id back, so
+    // the AgentConnection carries the relay URLs directly.
+    private func saveAgent() {
+        saveError = nil
         let name = agentLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sessionID.isEmpty, !name.isEmpty, let token = generatedAgentToken else {
-            connectError = "Generate a token and paste the agent's session ID first."
+        guard !name.isEmpty, let token = generatedAgentToken else {
+            saveError = "Generate a token first."
             return
         }
         let connection = AgentConnection(
             agentName: name,
             agentEmoji: "⚡",
-            wsURL: sessionID,
-            httpURL: sessionID,
+            wsURL: Account.defaultRelayWSURL,
+            httpURL: Account.defaultRelayHTTPURL,
             kya: nil,
             isDefault: false
         )

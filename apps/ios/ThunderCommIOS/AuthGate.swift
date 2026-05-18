@@ -20,6 +20,7 @@ private let kReAuthAfterSeconds: TimeInterval = 20 * 60
 public struct AuthGate<Content: View>: View {
 
     @StateObject private var store = UserStore.shared
+    @StateObject private var accountStore = AccountStore.shared
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var biometricInProgress = false
@@ -34,7 +35,11 @@ public struct AuthGate<Content: View>: View {
 
     public var body: some View {
         Group {
-            if store.currentUser == nil {
+            // Fresh-install gate: until an AccountStore.Account exists,
+            // DeliveryCore has nothing to authenticate with — Face ID would
+            // unlock a session that can't reach the relay. Drop straight to
+            // signup (Build 58 brief, change #1).
+            if !accountStore.hasAnyAccount || store.currentUser == nil {
                 noAccountView
             } else if !store.isAuthenticated {
                 if needsBiometricUnlock {

@@ -525,7 +525,14 @@ struct ContentView: View {
     private func partitionedRoster(_ participantIDs: [String]) -> (people: [String], agents: [String]) {
         var people: [String] = []
         var agents: [String] = []
+        let me = store.selfParticipantID
         for participantID in participantIDs {
+            // Build 58 (brief Gap C): the local user is always a human, even
+            // when their canonical name isn't in the human lookup table.
+            if !me.isEmpty, participantID == me {
+                people.append(participantID)
+                continue
+            }
             let explicitRole = store.rosterRole(forParticipantID: participantID)
             switch ThunderCommParticipantIdentity.rosterSection(
                 forParticipantID: participantID,

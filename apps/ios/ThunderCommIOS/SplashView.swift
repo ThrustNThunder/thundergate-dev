@@ -33,7 +33,7 @@ struct SplashView: View {
                     .resizable()
                     .interpolation(.high)
                     .scaledToFit()
-                    .frame(width: 260, height: 260)
+                    .frame(width: 340, height: 340)
                     .accessibilityHidden(true)
 
                 Text("ThunderCommo")

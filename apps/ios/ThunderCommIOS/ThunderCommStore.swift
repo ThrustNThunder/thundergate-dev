@@ -824,8 +824,19 @@ import Combine
                 .filter { !Self.placeholderParticipantIDs.contains($0) }
                 .sorted()
             let extras = filteredFallback.filter { !rosterIDs.contains($0) }
-            return rosterIDs + extras
+            let combined = rosterIDs + extras
+            // Build 58 (brief Gap C): pin the local user to the top so a
+            // blank-slate fresh install still shows "You" in the roster —
+            // the relay never sends self-entries.
+            let me = localParticipantID
+            guard !me.isEmpty else { return combined }
+            return [me] + combined.filter { $0 != me }
         }
+
+        // Build 58 (brief Gap C): exposed so ContentView's partitioner can
+        // classify the local user as a human regardless of how the canonical
+        // name table would resolve their display name.
+        var selfParticipantID: String { localParticipantID }
 
         func displayName(forParticipantID participantID: String) -> String {
             let rosterName = rosterByParticipantID[participantID]?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

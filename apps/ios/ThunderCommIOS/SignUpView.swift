@@ -191,6 +191,10 @@ public struct SignUpView: View {
                     displayName: trimmedName,
                     phone: "+1" + digitsOnly
                 )
+                // Build 58: seed the relay Account so DeliveryCore can
+                // connect — UserStore.syncAccountStore only fires when the
+                // server returns agents, and on first signup there are none.
+                seedRelayAccountAfterAuth(displayName: trimmedName)
                 // A fresh signup re-arms the post-signup wizard (Your Token →
                 // Add Agent). ContentView reads this flag from a fullScreenCover
                 // and clears it when the user closes the wizard.
@@ -200,6 +204,32 @@ public struct SignUpView: View {
                 self.error = error.localizedDescription
             }
         }
+    }
+
+    // Build 58 SHIP BLOCKER (brief change #2 + Gap A): after signup the
+    // `tc-h-` token is in the Keychain but AccountStore is empty unless the
+    // server returned agents. DeliveryCore.connectWS() short-circuits when
+    // AccountStore.current is nil — no relay, no roster, no messages. Seed
+    // the default relay Account here and fire the three connection calls in
+    // the order the brief specifies. Idempotent: if an Account already exists
+    // (e.g. a signup retry after a transient error) we update its token in
+    // place rather than appending duplicates.
+    private func seedRelayAccountAfterAuth(displayName: String) {
+        guard let token = AuthManager.shared.peekToken(), !token.isEmpty else { return }
+        if let existing = AccountStore.shared.current {
+            AccountStore.shared.updateToken(token, for: existing.id)
+        } else {
+            let account = Account(
+                name: displayName,
+                wsURL: Account.defaultRelayWSURL,
+                httpURL: Account.defaultRelayHTTPURL,
+                token: token
+            )
+            AccountStore.shared.add(account, makeCurrent: true)
+        }
+        DeliveryCore.shared.handleScenePhase(.active)
+        APNsManager.shared.retryTokenUploadIfNeeded()
+        APNsManager.shared.bootstrap()
     }
 
     // MARK: - Step 3: biometrics
