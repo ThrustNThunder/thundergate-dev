@@ -2765,11 +2765,15 @@ program
   .command('tui')
   .description('Launch ThunderTUI — chat + browser terminal UI')
   .option('--browser', 'Browser-only mode (no chat pane)')
+  .option('--browser-only', 'Browser-only live page panel (for split-pane use)')
   .option('--split', 'Split pane: chat left, browser right (default)')
   .option('--chat', 'Chat-only mode (no browser pane)')
-  .action(async (opts: { browser?: boolean; split?: boolean; chat?: boolean }) => {
-    const mode: 'chat' | 'browser' | 'split' =
-      opts.browser ? 'browser' : opts.chat ? 'chat' : 'split';
+  .action(async (opts: { browser?: boolean; browserOnly?: boolean; split?: boolean; chat?: boolean }) => {
+    const mode: 'chat' | 'browser' | 'browser-only' | 'split' =
+      opts.browserOnly ? 'browser-only'
+        : opts.browser ? 'browser'
+        : opts.chat ? 'chat'
+        : 'split';
     const { launchTui } = await import('../tui/index.js');
     try {
       await launchTui({ mode });

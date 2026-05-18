@@ -34,24 +34,61 @@ const SURFACE_ATTACH_PORT = 8772;
 const TOOL_OUTPUT_MAX_CHARS = 4000;
 
 export interface TuiOptions {
-  mode: 'chat' | 'browser' | 'split';
+  mode: 'chat' | 'browser' | 'browser-only' | 'split';
   /** Override the ThunderCommo URL — defaults to the SurfaceAttach socket. */
   chatUrl?: string;
 }
 
 export async function launchTui(opts: TuiOptions): Promise<void> {
-  if (opts.mode === 'chat' || opts.mode === 'split') {
-    if (opts.mode === 'split') {
-      process.stdout.write(
-        '[note] --split currently runs as --chat-only so the terminal\n' +
-        '       keeps native mouse selection. Use `thundergate tui --browser`\n' +
-        '       in a second terminal for the browser pane.\n\n'
-      );
-    }
+  if (opts.mode === 'split') {
+    await runSplitMode();
+    return;
+  }
+  if (opts.mode === 'chat') {
     await runPlainChat(opts);
     return;
   }
   await runBlessedBrowser(opts);
+}
+
+// ── split mode (tmux) ────────────────────────────────────────────────────
+
+async function runSplitMode(): Promise<void> {
+  const which = spawnSync('sh', ['-c', 'command -v tmux'], { encoding: 'utf8' });
+  if (which.status !== 0 || !which.stdout.trim()) {
+    process.stdout.write(
+      '[note] tmux not found — split mode requires tmux.\n' +
+      '       Falling back to --chat. Install tmux or run\n' +
+      '       `thundergate tui --browser-only` in a second terminal.\n\n'
+    );
+    await runPlainChat({ mode: 'chat' });
+    return;
+  }
+  const { spawn } = await import('child_process');
+  // tmux runs each pane command via /bin/sh, so we hand it a shell-quoted
+  // launcher built from the actual node binary + entry script that started
+  // this process — a dev shell hits the local dist/, not whatever the user
+  // has installed globally as `thundergate`.
+  const argv0 = process.argv[0];
+  const script = process.argv[1];
+  const launcher = script ? `${shellQuote(argv0)} ${shellQuote(script)}` : 'thundergate';
+  const tmuxArgs = [
+    'new-session', '-A', '-s', 'thundertui',
+    `${launcher} tui --chat`,
+    ';',
+    'split-window', '-h', '-p', '40',
+    `${launcher} tui --browser-only`,
+    ';',
+    'select-pane', '-L'
+  ];
+  const child = spawn('tmux', tmuxArgs, { stdio: 'inherit' });
+  await new Promise<void>((resolve) => {
+    child.on('exit', () => resolve());
+  });
+}
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 // ── plain chat ───────────────────────────────────────────────────────────
@@ -60,6 +97,9 @@ interface PlainChatState {
   lastAssistantText: string | undefined;
   rl: readline.Interface;
   thinkingShown: boolean;
+  sessionId: string | null;
+  model: string;
+  menuShown: boolean;
 }
 
 async function runPlainChat(opts: TuiOptions): Promise<void> {
@@ -75,7 +115,10 @@ async function runPlainChat(opts: TuiOptions): Promise<void> {
   const state: PlainChatState = {
     lastAssistantText: undefined,
     rl,
-    thinkingShown: false
+    thinkingShown: false,
+    sessionId: null,
+    model: 'claude-haiku-4-5',
+    menuShown: false
   };
 
   const clearThinking = () => {
@@ -107,6 +150,8 @@ async function runPlainChat(opts: TuiOptions): Promise<void> {
 
   const client = openSurfaceClient(url, {
     onAttached: (sessionId, model, history) => {
+      state.sessionId = sessionId;
+      state.model = model || state.model;
       writeLine(`● attached  session=${sessionId?.slice(0, 8) ?? 'none'} model=${model}`);
       if (history.length === 0) {
         writeLine('(no prior history in this session)');
@@ -116,6 +161,7 @@ async function runPlainChat(opts: TuiOptions): Promise<void> {
         const lastJon = [...history].reverse().find((mm) => mm.sender !== 'Michael');
         if (lastJon) state.lastAssistantText = lastJon.text;
       }
+      writeStatusBar(writeAsync, state);
       rl.prompt();
     },
     onMessage: (m) => {
@@ -126,6 +172,7 @@ async function runPlainChat(opts: TuiOptions): Promise<void> {
         if (calls.length > 0) {
           void runAgentToolCalls(calls, writeLine, client);
         }
+        writeStatusBar(writeAsync, state);
       }
     },
     onThinking: (agentId) => {
@@ -141,9 +188,31 @@ async function runPlainChat(opts: TuiOptions): Promise<void> {
   rl.on('line', (line) => {
     const trimmed = line.trim();
     if (!trimmed) {
+      state.menuShown = false;
       rl.prompt();
       return;
     }
+    if (trimmed === '/') {
+      printSlashMenu(writeLine);
+      state.menuShown = true;
+      rl.prompt();
+      return;
+    }
+    if (state.menuShown && /^\d+$/.test(trimmed)) {
+      const idx = parseInt(trimmed, 10) - 1;
+      if (idx >= 0 && idx < SLASH_COMMANDS.length) {
+        const chosen = SLASH_COMMANDS[idx];
+        state.menuShown = false;
+        if (chosen.takesArgs) {
+          writeLine(`usage: ${chosen.signature}`);
+          rl.prompt();
+          return;
+        }
+        void dispatchPlainSlash(chosen.name, state, client).then(() => rl.prompt());
+        return;
+      }
+    }
+    state.menuShown = false;
     if (trimmed.startsWith('/')) {
       void dispatchPlainSlash(trimmed, state, client).then(() => rl.prompt());
       return;
@@ -168,6 +237,56 @@ async function runPlainChat(opts: TuiOptions): Promise<void> {
 
 function formatPlainMessage(sender: string, text: string): string {
   return `\n[${sender}] ${text}`;
+}
+
+// ── slash menu + status bar (plain mode) ─────────────────────────────────
+
+const DIM_GRAY_ON = '\x1b[2;90m';
+const ANSI_OFF = '\x1b[0m';
+
+function printSlashMenu(writeLine: (s: string) => void): void {
+  writeLine('');
+  writeLine('  Slash commands:');
+  SLASH_COMMANDS.forEach((c, i) => {
+    writeLine(`  ${(i + 1).toString().padStart(2)}. ${c.signature.padEnd(28)} — ${c.description}`);
+  });
+  writeLine('  Press Enter to cancel.');
+}
+
+function writeStatusBar(
+  writeAsync: (chunk: string) => void,
+  state: PlainChatState
+): void {
+  const sessionShort = state.sessionId ? state.sessionId.slice(0, 8) : '–';
+  const score = readLatestWeightedScore();
+  const scoreStr = score === null ? '–' : score.toFixed(3);
+  const browser = readBrowserSnapshot();
+  const browserStr = browser.url ? 'connected' : 'idle';
+  const rule = '─'.repeat(57);
+  const line = `Session: ${sessionShort}  │  Model: ${state.model}  │  Ghost Jon: ${scoreStr}  │  Browser: ${browserStr}`;
+  writeAsync(`${DIM_GRAY_ON}${rule}\n${line}\n${rule}${ANSI_OFF}\n`);
+}
+
+function readLatestWeightedScore(): number | null {
+  try {
+    const cfg = ensureConfig();
+    const raw = readFileSync(cfg.ghost?.scores_file ?? '', 'utf-8');
+    const j = JSON.parse(raw) as {
+      weighted?: number;
+      overall?: number;
+      days?: Array<{ weighted_score?: number; date?: string }>;
+    };
+    if (Array.isArray(j.days) && j.days.length > 0) {
+      const sorted = [...j.days].sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''));
+      const top = sorted[0]?.weighted_score;
+      if (typeof top === 'number') return top;
+    }
+    if (typeof j.weighted === 'number') return j.weighted;
+    if (typeof j.overall === 'number') return j.overall;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ── slash commands (plain mode) ──────────────────────────────────────────
