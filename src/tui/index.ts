@@ -21,6 +21,7 @@ import { WebSocket } from 'ws';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import * as readline from 'node:readline';
+import { spawnSync } from 'child_process';
 import { ensureConfig } from '../config/index.js';
 import { ProvenanceLedger } from '../provenance/ledger.js';
 
@@ -30,6 +31,7 @@ const THUNDERGATE_DIR = join(process.env.HOME || '', '.thundergate');
 const CDP_PORT = 9222;
 const BROWSER_REFRESH_MS = 3000;
 const SURFACE_ATTACH_PORT = 8772;
+const TOOL_OUTPUT_MAX_CHARS = 4000;
 
 export interface TuiOptions {
   mode: 'chat' | 'browser' | 'split';
@@ -118,7 +120,13 @@ async function runPlainChat(opts: TuiOptions): Promise<void> {
     },
     onMessage: (m) => {
       writeLine(formatPlainMessage(m.sender, m.text));
-      if (m.sender !== 'Michael') state.lastAssistantText = m.text;
+      if (m.sender !== 'Michael') {
+        state.lastAssistantText = m.text;
+        const calls = parseToolTags(m.text);
+        if (calls.length > 0) {
+          void runAgentToolCalls(calls, writeLine, client);
+        }
+      }
     },
     onThinking: (agentId) => {
       if (state.thinkingShown) return;
@@ -920,6 +928,112 @@ async function evalOnPageOnce(expression: string): Promise<unknown> {
 
 function escapeTags(s: string): string {
   return s.replace(/[{}]/g, (c) => (c === '{' ? '{open}' : '{close}'));
+}
+
+// ── Ghost Jon tool-tag dispatch (browser only, for now) ──────────────────
+//
+// Assistant messages may contain self-closing tags like:
+//   <tool:browser_navigate url="https://..."/>
+//   <tool:browser_read/>
+//   <tool:browser_extract selector="h1"/>
+//   <tool:browser_eval expression="document.title"/>
+//   <tool:browser_state/>
+//
+// We scan, execute each call by shelling out to `thundergate browser …`
+// with the attribute as an argv element (no shell interpolation, so any
+// quoting in the attribute value is preserved literally), then feed the
+// truncated stdout back into the chat as the next user turn prefixed
+// with `[Browser result: …]` so the agent can keep talking.
+
+interface ToolCall {
+  tool: string;
+  attrs: Record<string, string>;
+  raw: string;
+}
+
+const TOOL_TAG_RE = /<tool:([a-z_][a-z0-9_]*)((?:\s+[a-zA-Z_][\w-]*="[^"]*")*)\s*\/>/g;
+const ATTR_RE = /([a-zA-Z_][\w-]*)="([^"]*)"/g;
+
+function parseToolTags(text: string): ToolCall[] {
+  const out: ToolCall[] = [];
+  for (const m of text.matchAll(TOOL_TAG_RE)) {
+    const tool = m[1];
+    const attrs: Record<string, string> = {};
+    const attrSrc = m[2] ?? '';
+    for (const am of attrSrc.matchAll(ATTR_RE)) {
+      attrs[am[1]] = am[2];
+    }
+    out.push({ tool, attrs, raw: m[0] });
+  }
+  return out;
+}
+
+interface ToolResult {
+  ok: boolean;
+  output: string;
+}
+
+function runBrowserTool(call: ToolCall): ToolResult {
+  let args: string[];
+  switch (call.tool) {
+    case 'browser_navigate': {
+      const url = call.attrs.url;
+      if (!url) return { ok: false, output: 'missing url attribute' };
+      args = ['browser', 'navigate', url];
+      break;
+    }
+    case 'browser_read':
+      args = ['browser', 'read'];
+      break;
+    case 'browser_extract': {
+      const sel = call.attrs.selector;
+      if (!sel) return { ok: false, output: 'missing selector attribute' };
+      args = ['browser', 'extract', sel];
+      break;
+    }
+    case 'browser_eval': {
+      const expr = call.attrs.expression;
+      if (!expr) return { ok: false, output: 'missing expression attribute' };
+      args = ['browser', 'eval', expr];
+      break;
+    }
+    case 'browser_state':
+      args = ['browser', 'state'];
+      break;
+    default:
+      return { ok: false, output: `unknown tool: ${call.tool}` };
+  }
+  const res = spawnSync('thundergate', args, { encoding: 'utf8', timeout: 20000 });
+  if (res.error) return { ok: false, output: res.error.message };
+  const stdout = (res.stdout ?? '').toString().trim();
+  const stderr = (res.stderr ?? '').toString().trim();
+  if (res.status !== 0) {
+    return { ok: false, output: stderr || stdout || `exit ${res.status ?? 'null'}` };
+  }
+  return { ok: true, output: stdout };
+}
+
+function truncateOutput(s: string): string {
+  if (s.length <= TOOL_OUTPUT_MAX_CHARS) return s;
+  return s.slice(0, TOOL_OUTPUT_MAX_CHARS) + `\n…(truncated, ${s.length - TOOL_OUTPUT_MAX_CHARS} more chars)`;
+}
+
+async function runAgentToolCalls(
+  calls: ToolCall[],
+  writeLine: (s: string) => void,
+  client: ChatClient
+): Promise<void> {
+  const pieces: string[] = [];
+  for (const call of calls) {
+    writeLine(`  → running ${call.raw}`);
+    const result = runBrowserTool(call);
+    const body = truncateOutput(result.output || '(no output)');
+    const label = result.ok ? 'Browser result' : 'Browser error';
+    pieces.push(`[${label} for ${call.raw}]\n${body}`);
+    writeLine(`  ← ${result.ok ? 'ok' : 'err'} ${call.tool} (${body.length} chars)`);
+  }
+  const followUp = pieces.join('\n\n');
+  client.send(followUp);
 }
 
 void THUNDERGATE_DIR;

@@ -75,9 +75,10 @@ export function loadIdentity(now: Date = new Date()): IdentityLoadResult {
   }
 
   const header = identityHeader(now);
+  const toolsBlock = toolCapabilitiesBlock();
   const systemPrompt = sections.length > 0
-    ? [header, ...sections].join('\n\n')
-    : header; // Even with all files missing we still ship the framing header.
+    ? [header, ...sections, toolsBlock].join('\n\n')
+    : [header, toolsBlock].join('\n\n'); // Even with all files missing we still ship the framing header.
 
   return {
     systemPrompt,
@@ -107,6 +108,30 @@ function identityHeader(now: Date): string {
 
 function formatSection(name: string, path: string, body: string): string {
   return `# ${name} — ${path}\n\n${body.trim()}`;
+}
+
+/**
+ * Tool-tag instructions for the TUI surface. The TUI scans assistant messages
+ * for these self-closing tags, executes the matching `thundergate browser ...`
+ * subcommand, and feeds the result back into the conversation as the next
+ * user turn prefixed with `[Browser result: ...]`. Anything outside that
+ * exact tag syntax is treated as plain text.
+ */
+function toolCapabilitiesBlock(): string {
+  return [
+    '# TOOLS — ThunderBrowser',
+    '',
+    'You have access to ThunderBrowser. When you need to look something up, check a page, or verify information, use these tool tags in your response:',
+    '- <tool:browser_navigate url="https://example.com"/>',
+    '- <tool:browser_read/>',
+    '- <tool:browser_extract selector="h1"/>',
+    '- <tool:browser_eval expression="document.title"/>',
+    '- <tool:browser_state/>',
+    '',
+    'The TUI will execute these and return results to you as the next turn, prefixed with `[Browser result: ...]`. You can then use the results in your follow-up response.',
+    '',
+    'IMPORTANT: Never access /home/ubuntu/.openclaw/ files. Never modify OpenClaw configuration.'
+  ].join('\n');
 }
 
 function todayStamp(d: Date): string {
